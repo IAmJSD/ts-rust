@@ -38,8 +38,13 @@
 //!   ids.
 //!
 //! The orchestrator uses builders only where the output is the serial
-//! output (`Orchestrator::builders_setting`), and only when every task
-//! that compiles is a light rebuild (`Orchestrator::uses_builders`).
+//! output (`Orchestrator::builders_setting`): for a first task that
+//! compiles as a light rebuild, and for the later ones only when every task
+//! that compiles is a light rebuild (`Orchestrator::first_task_uses_builder`,
+//! `later_tasks_use_builders`). Else the later ones compile on the
+//! orchestrator thread with the parses of the first program, after it is
+//! made (`BuildHost::take_parses_of`). The builder of the first task writes
+//! only when the orchestrator finishes it, so the read rule holds for them.
 
 use crate::execute::build::build_task::*;
 use crate::execute::build::command_line::{ParsedBuildCommandLine, SendBuildCommandLine};
@@ -197,6 +202,18 @@ impl Builders {
         }
         self.builders[builder].busy = true;
         self.builder_of.insert(index, builder);
+    }
+
+    /// True when the task at build order index `index` compiles on a
+    /// builder and is not finished.
+    pub(crate) fn compiles(&self, index: usize) -> bool {
+        self.builder_of.contains_key(&index)
+    }
+
+    /// What the builders share with the build host: for the parses of the
+    /// first program (`BuildHost::take_parses_of`).
+    pub(crate) fn shared(&self) -> &BuilderShared {
+        &self.setup.shared
     }
 
     /// Finishes the task at `index` on its builder, after its index came

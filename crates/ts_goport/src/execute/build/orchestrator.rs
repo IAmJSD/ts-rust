@@ -33,12 +33,14 @@
 //! Outside tests each program is released when its task is built, as Go
 //! drops it there; in tests when its task reports. Its checker threads
 //! free it in the background. In a build where the output does not depend
-//! on it and every task that compiles is a light rebuild
-//! (`uses_builders`), the programs of the started tasks load on builder
-//! threads instead, each on a thread that also checks, emits, writes and
-//! releases it (builders.rs): the first one alone, then the others at the
-//! same time, with the parses of the first one. The schedule above does
-//! not change, and a finish waits for the loads that run. Where Go does task
+//! on it, a first task that compiles as a light rebuild compiles on a
+//! builder thread instead (`first_task_uses_builder`), which also checks,
+//! emits, writes and releases its program (builders.rs). When every task
+//! that compiles is a light rebuild (`later_tasks_use_builders`), the
+//! later ones do too, and load at the same time with the parses of the
+//! first program; else they compile on this thread with those parses. The
+//! schedule above does not change, and a finish waits for the loads that
+//! run on builders. Where Go does task
 //! work on its goroutines that needs no task state, threads do it ahead of
 //! this thread: the file name match of each config (config_prefetch.rs),
 //! and the build info read, its check parts and the source mtimes of each
@@ -866,7 +868,12 @@ impl Orchestrator {
         // PORT: not in Go (perf). Whether the programs can load on builder
         // threads (builders.rs), made when the first task compiles.
         let builders_setting = self.builders_setting(num_routines);
-        let mut builders = None;
+        let mut builders: Option<Builders> = None;
+        // PORT: not in Go (perf). With builders, whether the tasks after the
+        // first one that compiles go to them too, known when the second one
+        // compiles (`later_tasks_use_builders`). With `Some(false)` they
+        // compile on this thread.
+        let mut later_on_builders = None;
         if !clean {
             *self.build_info_prefetch.borrow_mut() =
                 self.start_build_info_prefetch(&paths, builders_setting == BuildersSetting::Light);
@@ -948,20 +955,36 @@ impl Orchestrator {
                         task.build_project_check(self, &paths[index])
                     }
                 };
-                if compiles && !testing && !overlap_checked && num_routines > 1 {
-                    overlap_checked = true;
-                    in_build_order = self.outputs_overlap(&paths);
-                    if !in_build_order && self.uses_builders(builders_setting, &task.borrow()) {
-                        builders = self.start_builders(num_routines, &ready);
-                    }
-                    if let Some(prefetch) = &*self.build_info_prefetch.borrow() {
-                        prefetch.end_forecast();
+                if compiles && !testing && num_routines > 1 {
+                    if !overlap_checked {
+                        overlap_checked = true;
+                        in_build_order = self.outputs_overlap(&paths);
+                        if !in_build_order
+                            && self.first_task_uses_builder(builders_setting, &task.borrow())
+                        {
+                            builders = self.start_builders(num_routines, &ready);
+                        }
+                        if builders.is_none() {
+                            self.end_forecast();
+                        }
+                    } else if let Some(builders) = &builders
+                        && later_on_builders.is_none()
+                    {
+                        let on_builders = self.later_tasks_use_builders(builders_setting);
+                        self.end_forecast();
+                        if !on_builders {
+                            self.host.take_parses_of(builders.shared());
+                        }
+                        later_on_builders = Some(on_builders);
                     }
                 }
                 let mut task = task.borrow_mut();
                 states[index] = if !compiles {
                     State::Done
-                } else if let Some(builders) = &mut builders {
+                } else if let Some(builders) = builders
+                    .as_mut()
+                    .filter(|_| later_on_builders != Some(false))
+                {
                     builders.compile(index, task.compile_job(&paths[index]));
                     signals[index] = 1;
                     State::Compiling
@@ -1021,7 +1044,10 @@ impl Orchestrator {
             };
             let task = self.get_task(&paths[index]);
             let mut task = task.borrow_mut();
-            match &mut builders {
+            match builders
+                .as_mut()
+                .filter(|builders| builders.compiles(index))
+            {
                 Some(builders) => {
                     let compiled = builders.finish(index);
                     task.finish_compile_job(self, &paths[index], compiled);
@@ -1113,12 +1139,33 @@ impl Orchestrator {
         }
     }
 
-    /// PORT: not in Go (perf). True when the tasks of this build compile on
-    /// builder threads, decided when the first task that compiles, `first`,
-    /// has its status. With `BuildersSetting::Light`: when `first` only
-    /// reports the errors of its build info or makes its pending emit, the
-    /// build info threads forecast no heavy rebuild (no task with changed
-    /// inputs), and two or more light ones (`RebuildForecast::light`).
+    /// PORT: not in Go (perf). True when the first task that compiles,
+    /// `first`, compiles on a builder thread (builders.rs). With
+    /// `BuildersSetting::Light`: when it only reports the errors of its
+    /// build info or makes its pending emit. Its program loads alone, so
+    /// the decision for the later tasks waits for the second task that
+    /// compiles (`later_tasks_use_builders`).
+    fn first_task_uses_builder(&self, setting: BuildersSetting, first: &BuildTask) -> bool {
+        match setting {
+            BuildersSetting::Off => false,
+            BuildersSetting::Always => true,
+            BuildersSetting::Light => first.status.as_ref().is_some_and(|status| {
+                matches!(
+                    status.kind,
+                    UpToDateStatusType::OutOfDateBuildInfoWithErrors
+                        | UpToDateStatusType::OutOfDateBuildInfoWithPendingEmit
+                )
+            }),
+        }
+    }
+
+    /// PORT: not in Go (perf). True when the tasks that compile after the
+    /// first one compile on builder threads too, decided when the second
+    /// one has its status. With `BuildersSetting::Light`: when the build
+    /// info threads forecast no heavy rebuild (no task with changed inputs)
+    /// and two or more light ones (`RebuildForecast::light`). Else they
+    /// compile on this thread, with the parses of the first program
+    /// (`BuildHost::take_parses_of`), as in a serial build.
     // PERF (tscbpar1, stable bins): parallel loads cut hono-b noop (3 light
     // rebuilds) from about 122 to 101 ms on the minis. Where a task checks,
     // the checkers keep the cores busy, and before the builders shared the
@@ -1128,30 +1175,33 @@ impl Orchestrator {
     // builders after a light first compile only, a hono-b rebuild after an
     // edit of a test file of one later project used 50% to 90% more CPU and
     // 20% to 45% more memory, for the same time or 1% to 2% more. One light
-    // task alone gains nothing.
-    fn uses_builders(&self, setting: BuildersSetting, first: &BuildTask) -> bool {
+    // task alone gains nothing. Before the decision waited for the
+    // second task that compiles (tscbpar1 round c), it waited at the first
+    // one for the forecast: about 1 ms in wide-1err.
+    fn later_tasks_use_builders(&self, setting: BuildersSetting) -> bool {
         match setting {
             BuildersSetting::Off => false,
             BuildersSetting::Always => true,
-            BuildersSetting::Light => {
-                first.status.as_ref().is_some_and(|status| {
-                    matches!(
-                        status.kind,
-                        UpToDateStatusType::OutOfDateBuildInfoWithErrors
-                            | UpToDateStatusType::OutOfDateBuildInfoWithPendingEmit
-                    )
-                }) && self
-                    .build_info_prefetch
-                    .borrow()
-                    .as_ref()
-                    .is_some_and(BuildInfoPrefetch::light_rebuilds)
-            }
+            BuildersSetting::Light => self
+                .build_info_prefetch
+                .borrow()
+                .as_ref()
+                .is_some_and(BuildInfoPrefetch::light_rebuilds),
+        }
+    }
+
+    /// PORT: not in Go (perf). The builders are decided: the build info
+    /// threads forecast nothing more (`RebuildForecast::end`).
+    fn end_forecast(&self) {
+        if let Some(prefetch) = &*self.build_info_prefetch.borrow() {
+            prefetch.end_forecast();
         }
     }
 
     /// PORT: not in Go (perf). The builder threads of a parallel build
     /// (builders.rs), at most `num_routines`, which send the index of each
-    /// task whose check and emit are done to `ready` (`uses_builders`).
+    /// task whose check and emit are done to `ready`
+    /// (`first_task_uses_builder`).
     /// None when a config cannot go to a builder (`BuildHost::builder_shared`).
     /// The output is the same with or without builders.
     /// This thread then publishes the stores of the configs that it parsed,
@@ -1542,8 +1592,10 @@ struct BuildInfoRead {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum BuildersSetting {
     Off,
-    /// Only when every task that compiles is a light rebuild
-    /// (`Orchestrator::uses_builders`).
+    /// For a first task that compiles as a light rebuild
+    /// (`Orchestrator::first_task_uses_builder`), and for the later ones
+    /// when every task that compiles is a light rebuild
+    /// (`Orchestrator::later_tasks_use_builders`).
     Light,
     /// In every build that can (`GOPORT_TSCB_BUILDERS=1`).
     Always,
@@ -1568,7 +1620,7 @@ enum Rebuild {
 
 /// PORT: not in Go (perf). The rebuilds that the build info threads
 /// forecast for the tasks of a build (`Rebuild`), for
-/// `Orchestrator::uses_builders`. Builders gain only where the loads of
+/// `Orchestrator::later_tasks_use_builders`. Builders gain only where the loads of
 /// two or more tasks run at the same time and little is checked. A changed
 /// input shows in the mtimes alone (`unchanged_inputs`), so it is known
 /// before a large build info is parsed.

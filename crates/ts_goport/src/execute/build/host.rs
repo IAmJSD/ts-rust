@@ -362,9 +362,17 @@ impl BuildHost {
     /// shared its parses (`share_parses`), and puts them into this host's
     /// cache where it has no entry.
     pub(crate) fn take_shared_parses(&self) {
-        let Some(shared) = &self.builder else {
-            return;
-        };
+        if let Some(shared) = &self.builder {
+            self.take_parses_of(shared);
+        }
+    }
+
+    /// Waits until the first program of the build of `shared` has shared
+    /// its parses (`share_parses`), and puts them into this host's cache
+    /// where it has no entry. The build host takes them before it compiles
+    /// a task beside the first one (orchestrator.rs
+    /// `later_tasks_use_builders`).
+    pub(crate) fn take_parses_of(&self, shared: &BuilderShared) {
         let mut parses = lock(&shared.parses.parses);
         let parses = loop {
             if let Some(parses) = &*parses {
