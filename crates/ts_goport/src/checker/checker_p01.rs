@@ -1044,7 +1044,7 @@ pub struct Checker {
     // Arenas (PORTING.md "Checker data"). Index 0 of each is a dummy entry
     // so handle value 0 stays nil.
     pub symbols: SymbolArena,
-    pub types: ReservedArena<Type>,
+    pub types: ChunkedArena<Type>,
     /// PORT: Go `ObjectType.instantiations` of the object types that are
     /// not interfaces or tuples, at `ObjectType::instantiations` (see
     /// `ObjectType`). Index 0 is a dummy, so `InstantiationMapId::NIL` is 0.
@@ -1170,11 +1170,6 @@ impl Checker {
         let bound_symbols = crate::program::bound_symbols().for_checker();
         let compiler_options = &program.options;
         let files: Vec<Node> = program.source_files().map(|f| f.root).collect();
-        // PERF: the reserved room of the type arena (`ReservedArena`), one
-        // type for each node of the program. In `--singleThreaded` hono makes
-        // 0.39 types a node, effect 0.33 and zod 0.65; elysia makes 7.1, and
-        // its arena doubles after the room.
-        let type_reserve: usize = program.source_files().map(|f| f.parser_flags.len()).sum();
         let file_index_map = create_file_index_map(&files);
         let mut c = Checker {
             id: u32::try_from(checker_index + 1).expect("checker id overflow"),
@@ -1511,7 +1506,7 @@ impl Checker {
             matching_reference_memo: Default::default(),
             merge_version: 0,
             symbols: bound_symbols,
-            types: ReservedArena::with_nil(Type::default(), type_reserve),
+            types: ChunkedArena::with_nil(Type::default()),
             object_type_instantiations: vec![InstantiationMap::default()],
             signatures: vec![Signature::default()],
             index_infos: vec![IndexInfo::default()],
