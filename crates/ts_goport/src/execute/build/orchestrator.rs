@@ -57,7 +57,7 @@ use crate::execute::build::command_line::ParsedBuildCommandLine;
 use crate::execute::build::config_prefetch::{ConfigPrefetch, PrefetchPool};
 use crate::execute::build::host::BuildHost;
 use crate::execute::build::shared_outputs::{PathKeys, outputs_overlap};
-use crate::execute::build::up_to_date_status::{UpToDateStatus, UpToDateStatusType};
+use crate::execute::build::up_to_date_status::UpToDateStatusType;
 use crate::execute::incremental::build_info::{BuildInfo, is_build_info_file_name_default_library};
 use crate::execute::incremental::incremental::{new_build_info_reader, parse_build_info};
 use crate::execute::tsc::compile::{
@@ -942,7 +942,7 @@ impl Orchestrator {
                         (false, false)
                     } else {
                         let compiles = task.build_project_check(self, &paths[index]);
-                        (compiles, task.status.as_ref().is_some_and(is_light_rebuild))
+                        (compiles, compiles && self.is_light_rebuild(&task))
                     }
                 };
                 if compiles && !testing && !overlap_checked && num_routines > 1 {
@@ -1065,6 +1065,44 @@ impl Orchestrator {
         // each lookup for the whole build, and this one looks up output
         // directories that do not exist yet.
         outputs_overlap(&configs, &self.opts.sys.fs(), &self.compare_paths_options)
+    }
+
+    /// PORT: not in Go (perf). True for a task that compiles whose rebuild
+    /// only reports the errors of its build info or makes its pending emit,
+    /// and whose root files are not newer than its build info: its program
+    /// loads, and there is little to check. A build whose first compile is
+    /// such a rebuild loads its programs on builder threads
+    /// (`start_builders`). The mtimes come from the file system without the
+    /// build host's caches, so this changes no later check.
+    // PERF (tscbpar1, stable bins): parallel loads cut hono-b noop (3 such
+    // rebuilds) from 122 to 101 ms on mini-743d. In the builds that check,
+    // the checkers keep the cores busy, and each builder parses the shared
+    // `.d.ts` files of its loads again (its own parse cache): hono-b cold
+    // was 6.5% and wide cold 4% slower, and the hono-b body and API edits
+    // used 20% to 75% more CPU and 12% to 49% more memory for the same time.
+    fn is_light_rebuild(&self, task: &BuildTask) -> bool {
+        let light = task.status.as_ref().is_some_and(|status| {
+            matches!(
+                status.kind,
+                UpToDateStatusType::OutOfDateBuildInfoWithErrors
+                    | UpToDateStatusType::OutOfDateBuildInfoWithPendingEmit
+            )
+        });
+        let (Some(resolved), Some(build_info_time)) = (
+            &task.resolved,
+            task.build_info_entry
+                .as_ref()
+                .and_then(|entry| entry.m_time),
+        ) else {
+            return false;
+        };
+        let fs = self.opts.sys.fs();
+        light
+            && resolved.file_names().iter().all(|file| {
+                fs.stat(file)
+                    .and_then(|info| info.mod_time())
+                    .is_some_and(|m_time| m_time <= build_info_time)
+            })
     }
 
     /// PORT: not in Go (perf). The builder threads of a parallel build
@@ -1482,23 +1520,6 @@ fn is_typescript_source(file_name: &str) -> bool {
         file_name,
         &[EXTENSION_TS, EXTENSION_TSX, EXTENSION_MTS, EXTENSION_CTS],
     ) && !is_declaration_file_name(file_name)
-}
-
-/// PORT: not in Go (perf). True for a task whose rebuild only reports the
-/// errors of its build info or makes its pending emit: its program loads,
-/// and there is little to check. A build whose first compile is such a
-/// rebuild loads its programs on builder threads (`start_builders`).
-// PERF (tscbpar1, mini-743d, stable bins): parallel loads cut hono-b noop
-// (3 such rebuilds) from 122 to 101 ms, but made the builds that check
-// slower (hono-b cold +6.5%, wide cold +4%, the body edits +1.5 to 2%).
-// There the checkers keep the cores busy, and each builder parses the
-// shared `.d.ts` files of its loads again (its own parse cache).
-fn is_light_rebuild(status: &UpToDateStatus) -> bool {
-    matches!(
-        status.kind,
-        UpToDateStatusType::OutOfDateBuildInfoWithErrors
-            | UpToDateStatusType::OutOfDateBuildInfoWithPendingEmit
-    )
 }
 
 /// The most released programs that `Orchestrator::released` keeps.
