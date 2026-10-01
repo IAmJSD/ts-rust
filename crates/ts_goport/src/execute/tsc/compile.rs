@@ -51,7 +51,7 @@ pub fn write_go_output(out: &mut dyn std::io::Write, bytes: &[u8]) -> std::io::R
 }
 
 /// Go `os.Stdout` as the system writer: it writes the Go bytes of each port
-/// form write (see `write_go_output`) through `stdio::LineStdout`, which
+/// form write (see `write_go_output`) through `stdio::CliStdout`, which
 /// waits on a non-blocking pipe and ends the process by SIGPIPE when the
 /// reader is gone, as Go does. `write_str` writes whole strings, so a write
 /// never splits a unit.
@@ -59,12 +59,17 @@ pub struct GoOutput;
 
 impl std::io::Write for GoOutput {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        write_go_output(&mut stdio::LineStdout, buf)?;
+        write_go_output(&mut stdio::CliStdout, buf)?;
         Ok(buf.len())
     }
 
+    // One write also for an empty `buf`, as Go `fmt.Fprint`.
+    fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
+        write_go_output(&mut stdio::CliStdout, buf)
+    }
+
     fn flush(&mut self) -> std::io::Result<()> {
-        stdio::LineStdout.flush()
+        stdio::CliStdout.flush()
     }
 }
 
@@ -524,7 +529,7 @@ pub fn spawn_process(
             cmd.stderr(Stdio::null());
         }
     }
-    let spawned = cmd.spawn();
+    let spawned = crate::gostd::rlimit::spawn(&mut cmd);
     // The command holds the child's ends; drop them so that a read sees the
     // end of the stream when the child exits.
     drop(cmd);

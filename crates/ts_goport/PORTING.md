@@ -551,11 +551,13 @@ process (bin/tsgo.rs `go_runtime_start`).
   none: its `arg0` names the launcher, and at exit it opens the launcher's
   end of the pipe through /proc.
 - Open files (Go syscall/rlimit.go): the soft RLIMIT_NOFILE goes up to one
-  below the hard limit. `gostd::rlimit::restore_open_file_limit` gives a
-  started child the original limit back. PORT: Go does this between fork
-  and exec; the port does it right after the start. PORT: the content
-  mapper and npm starts (execute/tsc/compile.rs, cmd/tsgo/lsp.rs) do not
-  call it yet.
+  below the hard limit. The content mapper and npm starts
+  (execute/tsc/compile.rs, cmd/tsgo/lsp.rs) go through
+  `gostd::rlimit::spawn`, so the child gets the original limit, as from
+  Go. PORT: Go sets it in the child between fork and exec, which needs
+  `unsafe`; the port sets its own soft limit back for the length of the
+  start (Linux only; see there). The launcher does not raise its limit,
+  so its worker starts with the original limit, as a Go child does.
 - `GOMAXPROCS` (`gostd::runtime::gomaxprocs`): the variable, else the CPUs
   of the affinity mask, lowered to the CPU limit of the process's cgroup
   (rounded up, at least 2), as in Go 1.25 and later. It sizes the parse,

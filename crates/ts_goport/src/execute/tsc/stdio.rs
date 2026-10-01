@@ -14,12 +14,11 @@
 //! PORT: Go waits on EAGAIN only for an fd that was non-blocking at start
 //! (`NewFile` gives only such an fd to the poller). Here every EAGAIN waits,
 //! also when a parent sets O_NONBLOCK later; Go then returns the EAGAIN
-//! error, which `fmt.Fprint` ignores (`LineStdout` keeps the Go rule). Rust
+//! error, which `fmt.Fprint` ignores (`CliStdout` keeps the Go rule). Rust
 //! ignores SIGPIPE, so a write here gets EPIPE and raises the signal as Go
 //! does. A write that writes 0 bytes gives `WriteZero` (Go
-//! `io.ErrUnexpectedEOF`). Go does not buffer these files; `LineStdout`
-//! keeps std's line buffer (see there). On Windows these are the std
-//! handles, as before.
+//! `io.ErrUnexpectedEOF`). As in Go, none of these files has a buffer. On
+//! Windows these are the std handles, as before.
 
 use std::io;
 
@@ -31,21 +30,26 @@ pub struct Stdin;
 /// `bufio.Writer` of their base protocol.
 pub struct Stdout;
 
-/// Go `os.Stdout` through std's line-buffered stdout, with the error
-/// handling of `Stdout`. The tsc system writer uses it.
-/// PORT: Go writes each `fmt.Fprint` at once, and a pretty diagnostic is
-/// many short pieces per line: in a run with 5,000 errors Go makes 37 writes
-/// per diagnostic, this 5 (8 on a non-blocking fd 1). Other port code (the
-/// trace output, the watch manager) writes whole lines to std's stdout, so
-/// both keep their order. As in Go, only an fd 1 that was non-blocking at
-/// start waits on EAGAIN; a later EAGAIN is the write's error, which the
-/// tsc writer ignores as Go does. tsgo flushes the system writer at the end
-/// (`--showConfig` has no trailing newline); other text without a newline
-/// at exit goes out in std's flush at exit, which ignores errors.
-pub struct LineStdout;
+/// Go `os.Stdout` as the tsc system writer uses it: each write is one
+/// write of fd 1 (Go `fmt.Fprint` on the unbuffered `os.Stdout`; an empty
+/// one too), so the output goes out in Go's pieces (the help, a
+/// diagnostic). Only an fd 1 that was non-blocking at start waits on
+/// EAGAIN; a later EAGAIN is the write's error, which the tsc writer
+/// ignores as Go does. Other port code (the trace output, the watch
+/// manager) writes whole lines to std's stdout, which writes a line at
+/// once, so the two keep their order.
+pub struct CliStdout;
 
 /// Go `os.Stderr`.
 pub struct Stderr;
+
+// Go: os/file.go:73 `Stdout = NewFile(...)`, at package init (go1.27.1)
+/// Reads whether fd 1 is non-blocking (see `CliStdout`). tsgo calls it at
+/// start, as Go makes `os.Stdout` before `main`; without the call the first
+/// write of `CliStdout` reads it.
+pub fn init() {
+    sys::init();
+}
 
 impl io::Read for Stdin {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
@@ -73,18 +77,18 @@ impl io::Write for Stdout {
     }
 }
 
-impl io::Write for LineStdout {
+impl io::Write for CliStdout {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        sys::write_line_stdout(buf)?;
+        sys::write_cli_stdout(buf)?;
         Ok(buf.len())
     }
 
     fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
-        sys::write_line_stdout(buf)
+        sys::write_cli_stdout(buf)
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        sys::flush_line_stdout()
+        sys::flush_cli_stdout()
     }
 }
 
@@ -114,7 +118,7 @@ mod sys {
     use rustix::fd::BorrowedFd;
     use rustix::fs::OFlags;
     use rustix::io::Errno;
-    use std::io::{self, Write};
+    use std::io;
     use std::sync::OnceLock;
 
     pub fn read_stdin(buf: &mut [u8]) -> io::Result<usize> {
@@ -154,8 +158,12 @@ mod sys {
         Ok(())
     }
 
-    /// Go `NewFile`: fd 1 was non-blocking at start (checked at the first
-    /// write here), so its writes wait in the poller on EAGAIN.
+    pub fn init() {
+        stdout_nonblocking();
+    }
+
+    /// Go `NewFile`: fd 1 was non-blocking at start (`init`), so its writes
+    /// wait in the poller on EAGAIN.
     fn stdout_nonblocking() -> bool {
         static NONBLOCKING: OnceLock<bool> = OnceLock::new();
         *NONBLOCKING.get_or_init(|| {
@@ -164,35 +172,23 @@ mod sys {
         })
     }
 
-    // A blocking fd 1 takes std's `write_all`, which joins the buffered text
-    // and the new lines in one write and tries again after EINTR itself. Its
-    // error does not say how much it wrote, so a non-blocking fd 1 takes
-    // `write`: a failed `write` of std's line writer consumed nothing of
-    // `buf`, and a failed flush keeps the bytes it did not write, so both
-    // try again after EAGAIN.
-    pub fn write_line_stdout(mut buf: &[u8]) -> io::Result<()> {
-        let mut out = io::stdout().lock();
-        if !stdout_nonblocking() {
-            return match out.write_all(buf) {
-                Err(err) if Errno::from_io_error(&err) == Some(Errno::PIPE) => sigpipe(),
-                result => result,
-            };
-        }
-        while !buf.is_empty() {
-            match out.write(buf) {
+    // Go: internal/poll/fd_unix.go FD.Write and os/file.go File.Write
+    // (`epipecheck`). The first write runs also for an empty `buf`. EAGAIN
+    // waits only when fd 1 was non-blocking at start.
+    pub fn write_cli_stdout(mut buf: &[u8]) -> io::Result<()> {
+        let fd = rustix::stdio::stdout();
+        loop {
+            match rustix::io::write(fd, buf) {
+                Ok(n) if n == buf.len() => return Ok(()),
                 Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
                 Ok(n) => buf = &buf[n..],
-                Err(err) => after_write_error(rustix::stdio::stdout(), err)?,
+                Err(Errno::AGAIN) if !stdout_nonblocking() => return Err(Errno::AGAIN.into()),
+                Err(err) => after_write_error(fd, err.into())?,
             }
         }
-        Ok(())
     }
 
-    pub fn flush_line_stdout() -> io::Result<()> {
-        let mut out = io::stdout().lock();
-        while let Err(err) = out.flush() {
-            after_write_error(rustix::stdio::stdout(), err)?;
-        }
+    pub fn flush_cli_stdout() -> io::Result<()> {
         Ok(())
     }
 
@@ -233,6 +229,8 @@ mod sys {
 mod sys {
     use std::io::{self, Read, Write};
 
+    pub fn init() {}
+
     pub fn read_stdin(buf: &mut [u8]) -> io::Result<usize> {
         io::stdin().read(buf)
     }
@@ -245,11 +243,11 @@ mod sys {
         io::stdout().flush()
     }
 
-    pub fn write_line_stdout(buf: &[u8]) -> io::Result<()> {
+    pub fn write_cli_stdout(buf: &[u8]) -> io::Result<()> {
         io::stdout().write_all(buf)
     }
 
-    pub fn flush_line_stdout() -> io::Result<()> {
+    pub fn flush_cli_stdout() -> io::Result<()> {
         io::stdout().flush()
     }
 

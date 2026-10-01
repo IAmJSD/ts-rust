@@ -33,8 +33,6 @@ Run from the repository root. --extra is a JSON object merged into the batch (e.
 import argparse, datetime, glob, hashlib, json, os, re, subprocess, sys, tempfile
 
 ROOT = os.getcwd()  # the repository root (run from there)
-AUDITOR = 'aae6dbb734c07335a'
-REVIEWER = 'a0bc38f3370585da3'
 RULE = 'goport-protected-set'
 
 
@@ -170,6 +168,10 @@ def main():
     now = datetime.datetime.now(datetime.timezone.utc).isoformat()
     s = export()
     b = s['batch']
+    # Each batch has its own auditor and reviewer (AGENTS.md): use the agents the batch names.
+    auditor, reviewer = ((b.get(k) or {}).get('agent') or '' for k in ('auditor', 'reviewer'))
+    if not auditor or not reviewer or auditor.startswith('pending') or reviewer.startswith('pending'):
+        sys.exit('record the batch auditor and reviewer agent ids first (scripts/state record current)')
     row = b['recoveryHistory'][-1]
     if row['revision'] != a.revision or b['recoveryRevision'] != a.revision:
         sys.exit(f'current revision is R{row["revision"]}, not R{a.revision}')
@@ -270,8 +272,8 @@ def main():
               'oracleAnswersSha256': sorted(r['sha256'] for r in b['oracleAnswers'])}
     verdict = lambda role, agent: {'role': role, 'agent': agent, 'verdict': 'PASS', 'batchId': b['id'], 'sourceFingerprint': fp,
                                    **hashes, 'utc': now}
-    b['auditor'] = verdict('audit_accepted_roster', AUDITOR)
-    b['reviewer'] = verdict('independent_reviewer', REVIEWER)
+    b['auditor'] = verdict('audit_accepted_roster', auditor)
+    b['reviewer'] = verdict('independent_reviewer', reviewer)
     b.setdefault('verdictHistory', []).extend([b['auditor'], b['reviewer']])
     row.update({**hashes, 'status': 'full_measured', 'outcome': a.outcome,
                 'ordinaryQuery': 'complete, 0 diagnostics, matches tsgo-oracle', 'hono': 'complete, 0 diagnostics, matches tsgo-oracle'})

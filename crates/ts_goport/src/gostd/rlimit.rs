@@ -1,7 +1,7 @@
 //! Go `syscall` RLIMIT_NOFILE handling (syscall/rlimit.go, go1.27.1). A Go
 //! process raises its soft open-file limit to one below the hard limit at
 //! start, and a process that it starts gets the original limit back
-//! (syscall/exec_linux.go forkAndExecInChild1).
+//! (syscall/exec_linux.go forkAndExecInChild1; `spawn` here).
 
 #[cfg(unix)]
 use std::sync::OnceLock;
@@ -38,22 +38,48 @@ pub fn raise_open_file_limit() {
     }
 }
 
-// Go: exec_linux.go:644 "Restore original rlimit."
-/// Gives `child`, which this process started, the open-file limit that
-/// this process had before `raise_open_file_limit`, unless another process
-/// changed this process's limit since then.
-/// PORT: Go sets it between fork and exec. Without `unsafe` (no
-/// `pre_exec`) the port sets it on the started child (`prlimit`), so the
-/// child's first steps run with the raised limit.
-#[cfg(target_os = "linux")]
-pub fn restore_open_file_limit(child: &std::process::Child) {
-    use rustix::process::{Pid, Resource, getrlimit, prlimit};
-    let Some(&original) = ORIGINAL.get() else {
-        return;
-    };
-    let now = getrlimit(Resource::Nofile);
-    let max = original.maximum;
-    if now.maximum == max && now.current == max.map(|max| max - 1) {
-        let _ = prlimit(Some(Pid::from_child(child)), Resource::Nofile, original);
+// Go: exec_linux.go:644 "Restore original rlimit." (go1.27.1)
+/// Starts `cmd` (Go `os/exec` `Start`) with the soft open-file limit that
+/// this process had before `raise_open_file_limit`, as Go gives it to each
+/// process that it starts. When another process changed this process's
+/// limit since then (`prlimit`), the child gets the changed limit, as in Go.
+/// PORT: Go sets the limit in the child between fork and exec. That needs
+/// `pre_exec`, which is `unsafe`. So the soft limit of this process goes
+/// back for the length of the start and up again after it. Starts wait for
+/// each other here. In that time, another thread of this process that
+/// opens a file with more files open than the original limit gets EMFILE.
+/// When the start itself fails at the original limit (EMFILE for its pipes,
+/// or EBADF when an fd it passes is above that limit), it runs again with the
+/// raised limit, and the child keeps that limit.
+/// PORT: Linux only. Other systems start the child with the raised limit:
+/// there a kqueue watcher holds a file per watched path, more than the
+/// original limit (256 on macOS) can hold.
+pub fn spawn(cmd: &mut std::process::Command) -> std::io::Result<std::process::Child> {
+    #[cfg(target_os = "linux")]
+    if let Some(&original) = ORIGINAL.get() {
+        use rustix::io::Errno;
+        use rustix::process::{Resource, getrlimit, setrlimit};
+        static STARTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _start = STARTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = getrlimit(Resource::Nofile);
+        let max = original.maximum;
+        if now.maximum == max
+            && now.current == max.map(|max| max - 1)
+            && setrlimit(Resource::Nofile, original).is_ok()
+        {
+            let child = cmd.spawn();
+            let _ = setrlimit(Resource::Nofile, now);
+            return match child {
+                Err(err)
+                    if matches!(Errno::from_io_error(&err), Some(Errno::MFILE | Errno::BADF)) =>
+                {
+                    cmd.spawn()
+                }
+                child => child,
+            };
+        }
     }
+    cmd.spawn()
 }

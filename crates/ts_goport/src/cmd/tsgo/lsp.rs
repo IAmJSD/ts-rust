@@ -79,10 +79,17 @@ pub fn run_lsp(args: &[String]) -> i32 {
         npm_install: Some(Box::new(|cwd: &str, args: &[String]| {
             // Go: cmd := exec.Command("npm", args...); cmd.Dir = cwd; return cmd.Output()
             // PORT: Go error texts are approximated (ATA only logs them).
-            match std::process::Command::new("npm")
-                .args(args)
+            // `Output` reads stdin from the null device and keeps stdout and
+            // stderr; `rlimit::spawn` gives npm the open-file limit as Go
+            // does.
+            let mut npm = std::process::Command::new("npm");
+            npm.args(args)
                 .current_dir(cwd)
-                .output()
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped());
+            match crate::gostd::rlimit::spawn(&mut npm)
+                .and_then(std::process::Child::wait_with_output)
             {
                 Ok(output) => {
                     if output.status.success() {

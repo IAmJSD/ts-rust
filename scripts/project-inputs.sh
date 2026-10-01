@@ -11,13 +11,15 @@ inputs="$(realpath -- "$inputs")"
 action="${1:-status}"
 shift || true
 if (($# == 0)); then
-  mapfile -t projects < <(find "$inputs" -mindepth 2 -maxdepth 2 -name source -type d -printf '%h\n' | xargs -rn1 basename | sort)
+  mapfile -t projects < <(find "$inputs" -mindepth 2 -maxdepth 2 \( -name source -o -name project \) -type d -printf '%h\n' | xargs -rn1 basename | sort -u)
 else
   projects=("$@")
 fi
 
 for project in "${projects[@]}"; do
+  # Most inputs keep their files in source/; the wave202 inputs use project/.
   source_dir="$inputs/$project/source"
+  [[ -d "$source_dir" ]] || source_dir="$inputs/$project/project"
   if [[ ! -d "$source_dir" ]]; then
     echo "No prepared source: $source_dir" >&2
     exit 2
