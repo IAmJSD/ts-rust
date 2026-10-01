@@ -32,7 +32,11 @@
 //! `.json` files, configs, the cached file system, the mtimes), as in Go.
 //! Outside tests each program is released when its task is built, as Go
 //! drops it there; in tests when its task reports. Its checker threads
-//! free it in the background. Where Go does task work on its goroutines
+//! free it in the background. In a build where the output does not depend
+//! on it (`start_builders`), the programs of the started tasks load at the
+//! same time instead, each on a builder thread that also checks, emits,
+//! writes and releases it (builders.rs); the schedule above does not
+//! change, and a finish waits for the loads that run. Where Go does task work on its goroutines
 //! that needs no task state, threads do it ahead of this thread: the file
 //! name match of each config (config_prefetch.rs), and the build info
 //! read, its check parts and the source mtimes of each task
@@ -48,6 +52,7 @@
 
 use crate::contentmapper;
 use crate::execute::build::build_task::*;
+use crate::execute::build::builders::{BuilderSetup, Builders};
 use crate::execute::build::command_line::ParsedBuildCommandLine;
 use crate::execute::build::config_prefetch::{ConfigPrefetch, PrefetchPool};
 use crate::execute::build::host::BuildHost;
@@ -889,6 +894,9 @@ impl Orchestrator {
         // was done when it started. With one builder the order is the same.
         let mut in_build_order = false;
         let mut overlap_checked = false;
+        // PORT: not in Go (perf). The builder threads of a parallel build
+        // (builders.rs), made when the first task compiles.
+        let mut builders = None;
         // Tasks taken (Go `currentTaskIndex`), taken and not built, and
         // reported. The tasks before `next_report` are built.
         let mut next_take = 0;
@@ -922,15 +930,32 @@ impl Orchestrator {
                         continue;
                     }
                 }
+                let compiles = {
+                    let mut task = task.borrow_mut();
+                    task.result = Some(TaskResult::new(
+                        self.create_task_builder_status_reporter(),
+                        self.create_task_diagnostic_reporter(),
+                    ));
+                    if clean {
+                        task.clean_project(self, &paths[index]);
+                        false
+                    } else {
+                        task.build_project_check(self, &paths[index])
+                    }
+                };
+                if compiles && !overlap_checked && num_routines > 1 {
+                    overlap_checked = true;
+                    in_build_order = self.outputs_overlap(&paths);
+                    builders = self.start_builders(num_routines, in_build_order, &ready);
+                }
                 let mut task = task.borrow_mut();
-                task.result = Some(TaskResult::new(
-                    self.create_task_builder_status_reporter(),
-                    self.create_task_diagnostic_reporter(),
-                ));
-                states[index] = if clean {
-                    task.clean_project(self, &paths[index]);
+                states[index] = if !compiles {
                     State::Done
-                } else if !task.build_project_start(self, &paths[index]) {
+                } else if let Some(builders) = &mut builders {
+                    builders.compile(index, task.compile_job(self));
+                    signals[index] = 1;
+                    State::Compiling
+                } else if !task.build_project_compile(self, &paths[index]) {
                     State::Done
                 } else if testing {
                     task.build_project_finish(self, &paths[index]);
@@ -949,11 +974,6 @@ impl Orchestrator {
                     self.task_built(&mut task);
                     in_flight -= 1;
                     progressed = true;
-                }
-                drop(task);
-                if states[index] == State::Compiling && !overlap_checked && num_routines > 1 {
-                    overlap_checked = true;
-                    in_build_order = self.outputs_overlap(&paths);
                 }
             }
             // Tasks report in order, each when it is built.
@@ -991,11 +1011,20 @@ impl Orchestrator {
             };
             let task = self.get_task(&paths[index]);
             let mut task = task.borrow_mut();
-            task.build_project_finish(self, &paths[index]);
+            match &mut builders {
+                Some(builders) => {
+                    let compiled = builders.finish(index);
+                    task.finish_compile_job(self, &paths[index], compiled);
+                }
+                None => task.build_project_finish(self, &paths[index]),
+            }
             states[index] = State::Done;
             self.task_built(&mut task);
             in_flight -= 1;
         }
+        // The builders end; they free their programs unless the process
+        // ends after this build.
+        drop(builders);
         // The kept released programs free now, unless the process ends
         // after this build (`start_exported`).
         if !self.ends_process.get() {
@@ -1034,6 +1063,63 @@ impl Orchestrator {
         // each lookup for the whole build, and this one looks up output
         // directories that do not exist yet.
         outputs_overlap(&configs, &self.opts.sys.fs(), &self.compare_paths_options)
+    }
+
+    /// PORT: not in Go (perf). The builder threads of a parallel build
+    /// (builders.rs), at most `num_routines`, which send the index of each
+    /// task whose check and emit are done to `ready`. None where the
+    /// output of builders could differ from the output of this thread
+    /// alone, which then builds every program:
+    /// - one routine, or tasks that can see each other's writes
+    ///   (`overlap`, see `in_build_order` in `build_all_tasks`);
+    /// - tests, watch mode, `--clean`, and content mappers;
+    /// - a file system other than the OS one, or writes that only this
+    ///   thread can make (`System::emit_writes_through_osvfs`);
+    /// - a build host that keeps parses of an earlier build;
+    /// - `GOPORT_TSCB_BUILDERS=0` (for A/B runs, and as a fallback).
+    /// This thread then publishes the stores of the configs that it parsed,
+    /// so the builders can read them, and takes its file ids in runs
+    /// (`ast::reserve_file_ids`) from now on, as the builders do.
+    fn start_builders(
+        &self,
+        num_routines: usize,
+        overlap: bool,
+        ready: &std::sync::mpsc::Sender<usize>,
+    ) -> Option<Builders> {
+        let options = &self.opts.command.compiler_options;
+        let mut host_has_parses = false;
+        self.host
+            .source_files
+            .for_each_stored(|_, _| host_has_parses = true);
+        if overlap
+            || num_routines < 2
+            || self.opts.testing.is_some()
+            || options.watch.is_true()
+            || self.opts.command.build_options.clean.is_true()
+            || self.content_mapper_host.is_some()
+            || !is_wrapped_os_fs(&self.opts.sys.fs())
+            || !self.opts.sys.emit_writes_through_osvfs()
+            || host_has_parses
+            || std::env::var_os("GOPORT_TSCB_BUILDERS").is_some_and(|value| value == "0")
+        {
+            return None;
+        }
+        let shared = self.host.builder_shared()?;
+        let cwd = self.opts.sys.get_current_directory();
+        crate::program::publish_parsed_files(&cwd);
+        crate::ast::reserve_file_ids();
+        let setup = BuilderSetup {
+            shared,
+            command: self.opts.command.to_send(),
+            compare_paths_options: self.compare_paths_options.clone(),
+            cwd,
+            default_library_path: self.opts.sys.default_library_path(),
+            start: std::time::Instant::now()
+                .checked_sub(self.opts.sys.since_start())
+                .unwrap_or_else(std::time::Instant::now),
+            ends_process: self.ends_process.get(),
+        };
+        Some(Builders::new(setup, num_routines, ready.clone()))
     }
 
     /// PORT: not in Go (perf). Keeps `released` to free later (see
@@ -1240,7 +1326,9 @@ impl Orchestrator {
 // `TaskDiagnosticReporter` gets the builder on each call instead (see
 // build_task.rs), so the tsc reporter writes into its own buffer, and the
 // buffer moves into the builder after each call.
-fn task_reporter(make: impl FnOnce(Writer) -> DiagnosticReporter) -> TaskDiagnosticReporter {
+pub(crate) fn task_reporter(
+    make: impl FnOnce(Writer) -> DiagnosticReporter,
+) -> TaskDiagnosticReporter {
     let buffer: Rc<RefCell<Vec<u8>>> = Rc::new(RefCell::new(Vec::new()));
     let reporter = make(buffer.clone());
     Box::new(move |builder: &mut String, diagnostic: &Diagnostic| {
@@ -1291,7 +1379,7 @@ impl BuildTaskOrchestrator for Orchestrator {
         self.host.store_m_time(file, Some(m_time));
     }
 
-    fn read_build_info_file(&self, config: &ParsedCommandLine) -> Option<Rc<BuildInfo>> {
+    fn read_build_info_file(&self, config: &ParsedCommandLine) -> Option<Arc<BuildInfo>> {
         let name = config.get_build_info_file_name();
         let prefetched = self
             .build_info_prefetch
@@ -1300,11 +1388,11 @@ impl BuildTaskOrchestrator for Orchestrator {
             .and_then(|prefetch| prefetch.take(&name));
         if let Some((build_info, status_prefetch)) = prefetched {
             *self.status_prefetch.borrow_mut() = status_prefetch.map(|status| (name, status));
-            return build_info.map(Rc::new);
+            return build_info.map(Arc::new);
         }
         new_build_info_reader(self.host.clone() as Rc<dyn CompilerHost>)
             .read_build_info(config)
-            .map(Rc::new)
+            .map(Arc::new)
     }
 
     fn take_status_prefetch(&self, build_info_file_name: &str) -> Option<StatusPrefetch> {

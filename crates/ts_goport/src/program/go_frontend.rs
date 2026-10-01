@@ -412,10 +412,10 @@ fn go_files_of_unpublished_stores(
     use_case_sensitive_file_names: bool,
 ) -> Vec<GoFile> {
     let outside = PARSED_UNPUBLISHED.with(|outside| std::mem::take(&mut *outside.borrow_mut()));
-    // `files[i]` is the GoFile of store `unpublished_file_ids().start + i`.
+    // `files[i]` is the GoFile of the `i`-th store of `unpublished_file_ids()`.
     let stores = unpublished_file_ids();
-    let mut files = Vec::with_capacity(stores.len());
-    for store in stores {
+    let mut files = Vec::with_capacity(stores.iter().map(ExactSizeIterator::len).sum());
+    for store in stores.into_iter().flatten() {
         if !parsed.contains_key(&store)
             && let Some(file) = outside.get(&store)
         {
@@ -626,7 +626,7 @@ fn build_program(
     ) -> FxHashMap<usize, &'a Rc<ParsedSourceFile>> {
         let unpublished = unpublished_file_ids();
         files
-            .filter(|file| unpublished.contains(&file.store))
+            .filter(|file| unpublished.iter().any(|ids| ids.contains(&file.store)))
             .map(|file| (file.store, file))
             .collect()
     }

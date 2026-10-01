@@ -354,6 +354,23 @@ impl OsSystem {
         self.start = start;
         self
     }
+
+    /// PORT: not in Go (perf). The OS system of a `tsc -b` builder thread
+    /// (build/builders.rs), whose orchestrator system is the OS system with
+    /// `cwd`, `default_library_path` and `start`.
+    pub(crate) fn for_thread(
+        cwd: String,
+        default_library_path: String,
+        start: std::time::Instant,
+    ) -> OsSystem {
+        OsSystem {
+            cwd,
+            fs: crate::frontend::bundled::wrap_fs(crate::frontend::vfs::osvfs_fs()),
+            default_library_path,
+            writer: Rc::new(RefCell::new(GoOutput)),
+            start,
+        }
+    }
 }
 
 impl System for OsSystem {

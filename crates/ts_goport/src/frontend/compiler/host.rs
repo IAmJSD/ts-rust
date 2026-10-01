@@ -254,7 +254,7 @@ impl CompilerHost for CompilerHostImpl {
             // Another file system can show other bytes than the worker's
             // OS file system, so a worker result is used only for the same
             // text.
-            match take_prefetched(opts, script_kind, Some(text.as_str())) {
+            match take_prefetched(opts, script_kind, Some(&text)) {
                 Prefetched::Parse(file) => return Some(Rc::new(file)),
                 Prefetched::Text(worker_text) => worker_text.into(),
                 Prefetched::Nothing => FileText::new(text, freeable),
@@ -317,6 +317,26 @@ impl CompilerHost for CompilerHostImpl {
     fn is_plain_os_fs(&self) -> bool {
         self.plain_os_fs
     }
+}
+
+/// PORT: not in Go (perf). The parse of the file of `opts` from `text`, as
+/// `CompilerHostImpl::get_source_file` makes it after its read: a `tsc -b`
+/// builder thread parses a `.d.ts` or `.json` file from the text that the
+/// build read first (execute/build/host.rs `BuilderShared`). A parse
+/// worker's parse of the same text is used.
+pub fn parse_source_file_text(
+    opts: &SourceFileParseOptions,
+    text: FileText,
+) -> Rc<ParsedSourceFile> {
+    let script_kind = ensure_script_kind_from_file_name(&opts.file_name);
+    let text = match take_prefetched(opts, script_kind, Some(&text)) {
+        Prefetched::Parse(file) => return Rc::new(file),
+        Prefetched::Text(worker_text) => worker_text.into(),
+        Prefetched::Nothing => text,
+    };
+    let _owned_nodes =
+        crate::ast::freeable_path(&opts.path.0).then(crate::ast::enter_freeable_parse);
+    Rc::new(parse_source_file(opts, text, script_kind))
 }
 
 // PORT: Go passes the `*compilerHost` as a `tsoptions.ParseConfigHost`

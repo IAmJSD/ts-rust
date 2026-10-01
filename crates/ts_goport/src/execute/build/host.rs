@@ -17,6 +17,7 @@ use crate::execute::build::orchestrator::MTimePrefetch;
 use crate::execute::build::parse_cache::ParseCache;
 use crate::execute::incremental::incremental;
 use crate::execute::tsc::compile::System;
+use crate::frontend::compiler::host::parse_source_file_text;
 use crate::frontend::prelude::*;
 use crate::gostd::GoError;
 use std::hash::{Hash, Hasher};
@@ -96,12 +97,17 @@ impl Hash for SourceFileCacheKey {
 // update it (cachedvfs.go:144), so a later program can find a lookup here
 // that an earlier program made before the build wrote that path. It holds
 // only the lookups that Go makes: the workers' own lookups stay out of it
-// unless the loader uses them (see `BuildStatCache`).
+// unless the loader uses them (see `BuildStatCache`). The builder threads
+// of a parallel build (builders.rs) each have a `BuildCachedFs` over the
+// same caches.
 pub struct BuildCachedFs {
     fs: Rc<dyn Fs>,
     stats: Arc<BuildStatCache>,
-    stat_cache: RefCell<FxHashMap<String, Option<FileInfo>>>,
+    stat_cache: StatResults,
 }
+
+/// The `Stat` results of a `BuildCachedFs`, by path.
+type StatResults = Arc<Mutex<FxHashMap<String, Option<FileInfo>>>>;
 
 impl BuildCachedFs {
     // Go: cachedvfs.go:24 From
@@ -109,15 +115,19 @@ impl BuildCachedFs {
         BuildCachedFs {
             fs,
             stats: Arc::default(),
-            stat_cache: RefCell::default(),
+            stat_cache: Arc::default(),
         }
     }
 
     // Go: cachedvfs.go:40 ClearCache
     pub fn clear_cache(&self) {
         self.stats.clear();
-        self.stat_cache.borrow_mut().clear();
+        lock(&self.stat_cache).clear();
     }
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 impl Fs for BuildCachedFs {
@@ -165,14 +175,14 @@ impl Fs for BuildCachedFs {
     }
 
     fn stat(&self, path: &str) -> Option<FileInfo> {
-        if let Some(ret) = self.stat_cache.borrow().get(path) {
+        if let Some(ret) = lock(&self.stat_cache).get(path) {
             return ret.clone();
         }
         let ret = self.fs.stat(path);
-        self.stat_cache
-            .borrow_mut()
-            .insert(path.to_string(), ret.clone());
-        ret
+        lock(&self.stat_cache)
+            .entry(path.to_string())
+            .or_insert(ret)
+            .clone()
     }
 
     fn realpath(&self, path: &str) -> String {
@@ -214,6 +224,33 @@ pub struct BuildHost {
     // `BuildInfoPrefetch`). `load_or_store_m_time` takes one where it would
     // read the file system.
     pub m_time_prefetch: RefCell<Option<MTimePrefetch>>,
+    // PORT: not in Go (perf). On a builder thread (builders.rs), what it
+    // shares with the build host and the other builders (`BuilderShared`).
+    builder: Option<BuilderShared>,
+}
+
+/// PORT: not in Go (perf). What the host of a builder thread of a parallel
+/// `tsc -b` (builders.rs) shares with the build host and the other
+/// builders, so the builds of the tasks read as if they used one host, as
+/// in Go:
+/// - the cached lookups and `Stat` results of the file system and the
+///   mtimes (`BuildCachedFs`, `m_times`);
+/// - the text of each `.d.ts` and `.json` file that a load of the build
+///   read first (`first_reads`). Go keeps the first parse of these files
+///   for the whole build (`host.sourceFiles`). Each builder parses its
+///   own, from that text, so a later load gets the text that Go's cache
+///   would give it, also after the build wrote the file. No task writes
+///   while a load runs (the read rule of builders.rs), so two loads that
+///   read a file first at the same time read the same text;
+/// - the configs of the build (`configs`), each with its parse time: the
+///   build host parsed them all when it made the graph.
+#[derive(Clone)]
+pub struct BuilderShared {
+    stats: Arc<BuildStatCache>,
+    stat_cache: StatResults,
+    m_times: Arc<Mutex<FxHashMap<Path, Option<SystemTime>>>>,
+    first_reads: Arc<Mutex<FxHashMap<SourceFileCacheKey, FileText>>>,
+    configs: Arc<FxHashMap<Path, (Option<SendParsedCommandLine>, Duration)>>,
 }
 
 impl BuildHost {
@@ -252,7 +289,97 @@ impl BuildHost {
             config_prefetch: RefCell::new(None),
             m_times: Arc::default(),
             m_time_prefetch: RefCell::new(None),
+            builder: None,
         }
+    }
+
+    /// What the hosts of builder threads share with this host
+    /// (`BuilderShared`), with the configs that it parsed. None when a
+    /// config has content mappers.
+    pub(crate) fn builder_shared(&self) -> Option<BuilderShared> {
+        let mut configs = FxHashMap::default();
+        let times = self.config_times.borrow();
+        let mut sendable = true;
+        self.resolved_references.for_each_entry(|path, config| {
+            let config = config.map(|config| config.to_send());
+            sendable &= !matches!(config, Some(None));
+            let time = times.get(path).copied().unwrap_or_default();
+            configs.insert(path.clone(), (config.flatten(), time));
+        });
+        sendable.then(|| BuilderShared {
+            stats: self.cached_fs.stats.clone(),
+            stat_cache: self.cached_fs.stat_cache.clone(),
+            m_times: self.m_times.clone(),
+            first_reads: Arc::default(),
+            configs: Arc::new(configs),
+        })
+    }
+
+    /// The host of a builder thread (builders.rs) on `sys`, a system of
+    /// that thread, over the parts in `shared`.
+    pub(crate) fn new_builder(
+        sys: Rc<dyn System>,
+        command: Rc<ParsedBuildCommandLine>,
+        compare_paths_options: ComparePathsOptions,
+        shared: BuilderShared,
+    ) -> BuildHost {
+        let base = sys.fs();
+        let cached_fs = Rc::new(BuildCachedFs {
+            fs: base.clone(),
+            stats: shared.stats.clone(),
+            stat_cache: shared.stat_cache.clone(),
+        });
+        let host = new_compiler_host_over(
+            &sys.get_current_directory(),
+            cached_fs.clone(),
+            &base,
+            &sys.default_library_path(),
+        );
+        BuildHost {
+            sys,
+            command,
+            compare_paths_options,
+            host,
+            cached_fs,
+            extended_config_cache: TscExtendedConfigCache::default(),
+            source_files: ParseCache::default(),
+            cached_refs: RefCell::default(),
+            config_times: RefCell::default(),
+            resolved_references: ParseCache::default(),
+            config_prefetch: RefCell::new(None),
+            m_times: shared.m_times.clone(),
+            m_time_prefetch: RefCell::new(None),
+            builder: Some(shared),
+        }
+    }
+
+    /// The parse of the `.d.ts` or `.json` file of `opts` for the cache
+    /// (`get_source_file`). On a builder thread it is made from the text
+    /// that the first load of the build read (`BuilderShared`), and a first
+    /// read keeps its text there.
+    fn parse_for_cache(&self, opts: &SourceFileParseOptions) -> Option<Rc<ParsedSourceFile>> {
+        let Some(shared) = &self.builder else {
+            return self.host.get_source_file(opts);
+        };
+        let key = SourceFileCacheKey(opts.clone());
+        let first = lock(&shared.first_reads).get(&key).cloned();
+        if let Some(text) = first {
+            return Some(parse_source_file_text(opts, text));
+        }
+        let file = self.host.get_source_file(opts)?;
+        let first = match lock(&shared.first_reads).entry(key) {
+            std::collections::hash_map::Entry::Occupied(first) => first.get().clone(),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(file.text.clone());
+                return Some(file);
+            }
+        };
+        // Another builder read the file first, at the same time.
+        Some(if first == file.text {
+            file
+        } else {
+            parse_source_file_text(opts, first)
+        })
     }
 
     // Go: build/host.go:72, the raw command line options of
@@ -426,7 +553,7 @@ impl CompilerHost for BuildHost {
             return self.source_files.load_or_store(
                 SourceFileCacheKey(opts.clone()),
                 |key| {
-                    let file = self.host.get_source_file(&key.0);
+                    let file = self.parse_for_cache(&key.0);
                     if let Some(file) = &file {
                         crate::program::note_parsed_source_file(file);
                     }
@@ -492,6 +619,15 @@ impl CompilerHost for BuildHost {
         self.resolved_references.load_or_store(
             path.clone(),
             |path| {
+                // PORT: a builder thread takes the build host's parse.
+                if let Some((config, time)) = self
+                    .builder
+                    .as_ref()
+                    .and_then(|shared| shared.configs.get(path))
+                {
+                    self.config_times.borrow_mut().insert(path.clone(), *time);
+                    return config.as_ref().map(|config| Rc::new(config.to_local()));
+                }
                 let config_start = self.sys.now();
                 // Wrap command line options in "compilerOptions" key to match tsconfig.json structure
                 let command_line_raw = self.command_line_raw();

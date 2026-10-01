@@ -504,6 +504,81 @@ impl ParsedCommandLine {
     }
 }
 
+/// PORT: not in Go (perf). A `ParsedCommandLine` that can go to another
+/// thread: each `tsc -b` builder thread (execute/build/builders.rs) makes
+/// its own copy of each config of the build (`to_local`). It keeps what the
+/// parse made; the caches of the copy fill again when they are read, with
+/// the same values, as in `with_file_names`. The nodes of the config file
+/// must be published (`program::publish_parsed_files`), so that the other
+/// thread can read them.
+pub struct SendParsedCommandLine {
+    compiler_options: CompilerOptions,
+    type_acquisition: Option<TypeAcquisition>,
+    file_names: Vec<String>,
+    project_references: Option<Vec<ProjectReference>>,
+    config_file: Option<TsConfigSourceFile>,
+    errors: Vec<Diagnostic>,
+    raw: CompilerOptionsValue,
+    compile_on_save: Option<bool>,
+    compare_paths_options: ComparePathsOptions,
+    literal_file_names_len: i32,
+}
+
+impl ParsedCommandLine {
+    /// The copy of this config for another thread, or `None` when it has
+    /// content mappers (they are `Rc`s of this thread).
+    #[must_use]
+    pub fn to_send(&self) -> Option<SendParsedCommandLine> {
+        let ParsedOptions {
+            compiler_options,
+            type_acquisition,
+            file_names,
+            project_references,
+            content_mappers,
+        } = &self.parsed_config;
+        content_mappers.is_empty().then(|| SendParsedCommandLine {
+            compiler_options: (**compiler_options).clone(),
+            type_acquisition: type_acquisition.clone(),
+            file_names: file_names.clone(),
+            project_references: project_references.clone(),
+            config_file: self.config_file.as_deref().cloned(),
+            errors: self.errors.clone(),
+            raw: self.raw.clone(),
+            compile_on_save: self.compile_on_save,
+            compare_paths_options: self.compare_paths_options.clone(),
+            literal_file_names_len: self.literal_file_names_len,
+        })
+    }
+}
+
+impl SendParsedCommandLine {
+    /// The config as a `ParsedCommandLine` of this thread.
+    #[must_use]
+    pub fn to_local(&self) -> ParsedCommandLine {
+        ParsedCommandLine {
+            parsed_config: ParsedOptions {
+                compiler_options: Rc::new(self.compiler_options.clone()),
+                type_acquisition: self.type_acquisition.clone(),
+                file_names: self.file_names.clone(),
+                project_references: self.project_references.clone(),
+                content_mappers: Vec::new(),
+            },
+            config_file: self.config_file.clone().map(Rc::new),
+            errors: self.errors.clone(),
+            raw: self.raw.clone(),
+            compile_on_save: self.compile_on_save,
+            compare_paths_options: self.compare_paths_options.clone(),
+            literal_file_names_len: self.literal_file_names_len,
+            ..Default::default()
+        }
+    }
+}
+
+const _: () = {
+    const fn send_and_sync<T: Send + Sync>() {}
+    send_and_sync::<SendParsedCommandLine>();
+};
+
 // Go: tsoptions/parsedcommandline.go:74 SourceOutputAndProjectReference
 // PORT: Go `Resolved *ParsedCommandLine` points back at the command line
 // that owns the map. An `Rc` would make a reference cycle, so this is a

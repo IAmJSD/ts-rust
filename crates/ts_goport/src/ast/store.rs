@@ -25,8 +25,10 @@
 //!   finishes the file (`finishNode`, parent setting, JSDoc flags,
 //!   reparser.go writes). Then the parser freezes the file, which also
 //!   builds the per-store tables that a publish puts in the registry. The
-//!   build stores of a thread get consecutive ids from `BuildStores::base`,
-//!   the published count when its first store was made. The last store
+//!   build stores of a thread get consecutive ids from the next unused id
+//!   (`NEXT_ID`) when its first store was made. A `tsc -b` builder thread,
+//!   which loads beside other builders, reserves its ids in runs instead
+//!   (`reserve_file_ids`). The last store
 //!   made on a thread is its `ACTIVE` store: the parser reads and writes it
 //!   without a store lookup.
 //! - Detached: a parse worker (`files_parser.rs` prefetch) parses one file
@@ -1073,30 +1075,105 @@ fn flow_node_weight(kind: SyntaxKind) -> usize {
 /// thread that made it, so `ACTIVE` can keep a plain reference to it.
 type StoreCell = &'static RefCell<FileStore>;
 
-/// The build stores of one thread. `stores[i]` has file id `base + i`.
+/// The build stores of one thread, in the order they were made, and their
+/// file ids: the stores take the ids of `runs` in order.
 #[derive(Default)]
 struct BuildStores {
-    /// `PUBLISHED` when the first of `stores` was made.
-    base: usize,
+    /// The runs of consecutive ids, as (first id, index in `stores` of the
+    /// store with that id). Ids grow from run to run. A thread that does
+    /// not reserve ids (`RESERVE_IDS`) has at most one run.
+    runs: Vec<(usize, usize)>,
+    /// The end of the ids that this thread reserved for its last run
+    /// (`RESERVE_IDS`).
+    reserved_end: usize,
     stores: Vec<StoreCell>,
 }
 
+/// The ids that a thread that reserves ids (`RESERVE_IDS`) takes at once.
+const ID_RUN: usize = 256;
+
 impl BuildStores {
-    /// The file id of the next store of this thread. Only a publish changes
-    /// `PUBLISHED`, so the ids of one build are consecutive.
+    /// The file id of the next store of this thread.
+    /// - A thread that does not reserve ids takes the ids from `NEXT_ID`
+    ///   on, and only its publish moves `NEXT_ID`. So the ids of one load
+    ///   are consecutive, and another thread must not take ids meanwhile.
+    /// - A thread that reserves ids (a `tsc -b` builder) takes them from
+    ///   runs of `ID_RUN` ids that it reserves in `NEXT_ID`. It grows its
+    ///   run in place while no other thread reserved after it, so a lone
+    ///   builder gets the ids of a thread that does not reserve.
     fn next_id(&mut self) -> usize {
-        let published = PUBLISHED.load(Ordering::Acquire);
-        if self.stores.is_empty() {
-            self.base = published;
+        let index = self.stores.len();
+        let id = if RESERVE_IDS.get() {
+            match self.runs.last() {
+                Some(&(first, start)) if first + (index - start) < self.reserved_end => {
+                    first + (index - start)
+                }
+                last => {
+                    let end = self.reserved_end;
+                    if last.is_some()
+                        && NEXT_ID
+                            .compare_exchange(
+                                end,
+                                end + ID_RUN,
+                                Ordering::AcqRel,
+                                Ordering::Acquire,
+                            )
+                            .is_ok()
+                    {
+                        self.reserved_end = end + ID_RUN;
+                        end
+                    } else {
+                        let first = NEXT_ID.fetch_add(ID_RUN, Ordering::AcqRel);
+                        self.runs.push((first, index));
+                        self.reserved_end = first + ID_RUN;
+                        first
+                    }
+                }
+            }
         } else {
-            assert_eq!(
-                self.base, published,
-                "another thread published node stores while this thread built stores"
-            );
-        }
-        let id = self.base + self.stores.len();
+            let next = NEXT_ID.load(Ordering::Acquire);
+            match self.runs.first() {
+                None => {
+                    self.runs.push((next, 0));
+                    next
+                }
+                Some(&(base, _)) => {
+                    assert_eq!(
+                        base, next,
+                        "another thread took file ids while this thread built stores"
+                    );
+                    base + index
+                }
+            }
+        };
         assert!(id < FILE_ID_LIMIT, "too many file ids");
         id
+    }
+
+    /// The index in `stores` of the store with id `file`.
+    #[inline]
+    fn index_of(&self, file: usize) -> Option<usize> {
+        let mut end = self.stores.len();
+        for &(first, start) in self.runs.iter().rev() {
+            if file >= first {
+                let index = start + (file - first);
+                return (index < end).then_some(index);
+            }
+            end = start;
+        }
+        None
+    }
+
+    /// The ids of `stores`, as runs of consecutive ids.
+    fn id_runs(&self) -> Vec<std::ops::Range<usize>> {
+        let mut ends = self.runs.iter().skip(1).map(|&(_, start)| start);
+        self.runs
+            .iter()
+            .map(|&(first, start)| {
+                let end = ends.next().unwrap_or(self.stores.len());
+                first..first + (end - start)
+            })
+            .collect()
     }
 }
 
@@ -1104,10 +1181,14 @@ thread_local! {
     /// The stores of this thread, while the parser runs.
     static BUILD: RefCell<BuildStores> = const {
         RefCell::new(BuildStores {
-            base: 0,
+            runs: Vec::new(),
+            reserved_end: 0,
             stores: Vec::new(),
         })
     };
+    /// True on a thread that reserves its file ids in runs (`ID_RUN`), so
+    /// it can load beside other such threads (`reserve_file_ids`).
+    static RESERVE_IDS: Cell<bool> = const { Cell::new(false) };
     /// The detached store of a parse worker and its provisional id.
     static DETACHED: Cell<Option<(usize, StoreCell)>> = const { Cell::new(None) };
     /// The emptied cell of the last detached store of this thread. The next
@@ -1128,7 +1209,8 @@ thread_local! {
     // `publish_file_stores` and `take_detached_file_store` clear it before
     // they empty its cell, and a thread publishes only its own build
     // stores, so an active store is never published. (One loading thread
-    // builds at a time: `BuildStores::next_id` and the publish check it.)
+    // builds at a time unless the threads reserve their ids:
+    // `BuildStores::next_id` and the publish check it.)
     static ACTIVE: Cell<Option<(usize, StoreCell)>> = const { Cell::new(None) };
 }
 
@@ -1161,8 +1243,20 @@ fn inactive_build_store(file: usize) -> Option<StoreCell> {
     }
     BUILD.with(|b| {
         let b = b.borrow();
-        b.stores.get(file.wrapping_sub(b.base)).copied()
+        b.index_of(file).map(|index| b.stores[index])
     })
+}
+
+/// Makes this thread reserve its file ids in runs (a `tsc -b` builder
+/// thread, build/builders.rs), so it can load and publish programs while
+/// other such threads do. Call it before the thread makes a store. The ids
+/// of a load are then not consecutive, and they depend on the timing of
+/// the other threads; the output does not depend on them. A thread that
+/// does not reserve must not build stores while one that does runs: its
+/// next store or its publish panics then.
+pub fn reserve_file_ids() {
+    BUILD.with(|b| assert!(b.borrow().stores.is_empty(), "this thread has stores"));
+    RESERVE_IDS.set(true);
 }
 
 /// File index that marks a parent in the same store inside a stored
@@ -1281,8 +1375,13 @@ static HIGH_BLOCKS: [OnceLock<Box<[BlockEntry; HIGH_CHUNK]>>;
     (FILE_ID_LIMIT - LOW_BLOCKS) / HIGH_CHUNK] =
     [const { OnceLock::new() }; (FILE_ID_LIMIT - LOW_BLOCKS) / HIGH_CHUNK];
 
-/// The next unused file id. Only `publish_file_stores` changes it.
+/// One more than the highest published file id.
 static PUBLISHED: AtomicUsize = AtomicUsize::new(0);
+
+/// The next file id that no thread has taken. A publish moves it past the
+/// ids that it published, and a thread that reserves ids moves it when it
+/// reserves (`BuildStores::next_id`).
+static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
 
 /// Marks the `HIGH_BLOCKS` part of `file_block` as cold. It does nothing.
 // PERF: rustc gives a branch into a block that calls a `#[cold]` function
@@ -3281,17 +3380,11 @@ pub fn is_published(file: usize) -> bool {
 }
 
 /// Ids of the stores that this thread built and did not publish, in id
-/// order. The next publish of this thread gives them their `GoFile`s.
+/// order, as runs of consecutive ids. The next publish of this thread gives
+/// them their `GoFile`s.
 #[must_use]
-pub fn unpublished_file_ids() -> std::ops::Range<usize> {
-    BUILD.with(|b| {
-        let b = b.borrow();
-        if b.stores.is_empty() {
-            let next = PUBLISHED.load(Ordering::Acquire);
-            return next..next;
-        }
-        b.base..b.base + b.stores.len()
-    })
+pub fn unpublished_file_ids() -> Vec<std::ops::Range<usize>> {
+    BUILD.with(|b| b.borrow().id_runs())
 }
 
 /// True when file `file` was parsed by the ported parser.
@@ -3733,7 +3826,7 @@ pub fn file_store_parser_flags(file: usize) -> Vec<NodeFlags> {
 }
 
 /// Publishes the build stores of this thread: `go_files[i]` is the
-/// `GoFile` of id `unpublished_file_ids().start + i`. The loader calls this
+/// `GoFile` of the `i`-th id of `unpublished_file_ids()`. The loader calls this
 /// once per program, before `core::set_prog`. The stores are then
 /// read-only, and any thread can read them through the block of their id
 /// (`file_block`). A freeable file version (lsshells M3b) owns its store
@@ -3745,36 +3838,54 @@ pub fn publish_file_stores(go_files: Vec<GoFile>) {
     // The cells stay leaked and empty. Nothing reads them after this, and
     // the next build stores of this thread reuse them (`build_store_cell`).
     ACTIVE.set(None);
-    let BuildStores {
-        base,
-        stores: cells,
-    } = BUILD.with(|b| std::mem::take(&mut *b.borrow_mut()));
-    let base = if cells.is_empty() {
-        PUBLISHED.load(Ordering::Acquire)
-    } else {
-        base
-    };
+    let (ids, reserved_end, cells) = BUILD.with(|b| {
+        let mut b = b.borrow_mut();
+        let ids = b.id_runs();
+        let BuildStores {
+            reserved_end,
+            stores,
+            ..
+        } = std::mem::take(&mut *b);
+        (ids, reserved_end, stores)
+    });
     assert!(
         go_files.len() == cells.len(),
         "a publish needs one GoFile per store ({} stores, {} GoFiles)",
         cells.len(),
         go_files.len()
     );
-    let count = cells.len();
-    if count == 0 {
+    let Some(end) = ids.last().map(|run| run.end) else {
         return;
-    }
-    assert!(base + count <= FILE_ID_LIMIT, "too many file ids");
-    if let Err(published) =
-        PUBLISHED.compare_exchange(base, base + count, Ordering::AcqRel, Ordering::Acquire)
+    };
+    assert!(end <= FILE_ID_LIMIT, "too many file ids");
+    if RESERVE_IDS.get() {
+        // The unused ids of the last run go back when no thread reserved
+        // after them.
+        let _ = NEXT_ID.compare_exchange(reserved_end, end, Ordering::AcqRel, Ordering::Acquire);
+    } else if let Err(next) =
+        NEXT_ID.compare_exchange(ids[0].start, end, Ordering::AcqRel, Ordering::Acquire)
     {
         panic!(
-            "another thread published file ids while this thread built ids {base}.. (now {published})"
+            "another thread took file ids while this thread built ids {}.. (now {next})",
+            ids[0].start
         );
     }
-    let mut stores: Vec<FileStore> = cells.iter().map(|cell| cell.take()).collect();
+    PUBLISHED.fetch_max(end, Ordering::AcqRel);
+    let mut stores = cells.iter().map(|cell| cell.take());
+    let mut go_files = go_files.into_iter();
+    for run in ids {
+        let mut run_stores: Vec<FileStore> = stores.by_ref().take(run.len()).collect();
+        let run_files: Vec<GoFile> = go_files.by_ref().take(run.len()).collect();
+        publish_stores(&mut run_stores, run.start);
+        publish_id_run(run.start, run_stores, run_files);
+    }
     SPARE_BUILD_CELLS.with(|spare| spare.borrow_mut().extend(cells));
-    publish_stores(&mut stores, base);
+}
+
+/// Puts the published `stores` and `go_files` of consecutive ids from
+/// `base` on into the registry.
+fn publish_id_run(base: usize, stores: Vec<FileStore>, go_files: Vec<GoFile>) {
+    let count = stores.len();
     // lsshells M3b: a freeable file version (a live `FileVersion` of the
     // id, made by the language server parse cache) takes its store and
     // `GoFile`, and the block of its id is its node shell. The other files

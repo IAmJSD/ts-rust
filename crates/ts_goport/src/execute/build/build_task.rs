@@ -1,5 +1,6 @@
 use crate::contentmapper;
 use crate::emitter::program_emit::{EmitOptions, WriteFile, WriteFileData};
+use crate::execute::build::builders::LoadGate;
 use crate::execute::build::command_line::ParsedBuildCommandLine;
 use crate::execute::build::host::{BuildCompilerHost, BuildHost};
 use crate::execute::build::up_to_date_status::*;
@@ -42,7 +43,9 @@ use std::time::SystemTime;
 // goroutines still runs at the same time: each program checks on its own
 // checker threads from `build_project_start` on (`start_check`), emits on
 // them when the check ends (the writes wait for `build_project_finish`),
-// and frees them in the background (`release_task_program`).
+// and frees them in the background (`release_task_program`). In a
+// parallel build a builder thread runs the program part of a task on its
+// own copy of the task (builders.rs, `compile_job`, `finish_compile_job`).
 //
 // PORT: the watch-only `updateWatch` and `resetConfig` are in
 // orchestrator_watch.rs, with the orchestrator watch code.
@@ -73,10 +76,10 @@ pub struct UpstreamTask {
 // Go: build/buildtask.go:37 buildInfoEntry
 // PORT: Go `*time.Time` is `Option<Option<SystemTime>>` (nil pointer vs a
 // pointer to a possibly zero time). Go `*incremental.BuildInfo` is
-// `Option<Rc<BuildInfo>>`.
+// `Option<Arc<BuildInfo>>`, so a builder thread (builders.rs) can have it.
 #[derive(Clone)]
 pub struct BuildInfoEntry {
-    pub build_info: Option<Rc<BuildInfo>>,
+    pub build_info: Option<Arc<BuildInfo>>,
     pub path: Path,
     pub m_time: Option<SystemTime>,
     pub dts_time: Option<Option<SystemTime>>,
@@ -382,7 +385,7 @@ pub trait BuildTaskOrchestrator {
     fn store_m_time(&self, file: &str, m_time: SystemTime);
     // Go: `incremental.NewBuildInfoReader(o.host).ReadBuildInfo(config)`
     // (uncached read from disk).
-    fn read_build_info_file(&self, config: &ParsedCommandLine) -> Option<Rc<BuildInfo>>;
+    fn read_build_info_file(&self, config: &ParsedCommandLine) -> Option<Arc<BuildInfo>>;
 
     /// PORT: not in Go (perf). What a build info thread made for the check
     /// from the build info that `read_build_info_file` just gave for
@@ -401,6 +404,12 @@ pub trait BuildTaskOrchestrator {
     }
     // Go: `o.contentMapperHost` (tsgo#4712)
     fn content_mapper_host(&self) -> Option<Rc<dyn contentmapper::Host>>;
+    /// PORT: not in Go (perf). On a builder thread of a parallel build, the
+    /// loads of the build (builders.rs `LoadGate`): a task waits for them
+    /// before it writes a file other than its build info.
+    fn load_gate(&self) -> Option<Arc<LoadGate>> {
+        None
+    }
 }
 
 // Go: build/buildtask.go:55 BuildTask
@@ -451,6 +460,39 @@ enum TaskGoPanic {
     /// An upstream task panicked. Go's builder of this task waits on it
     /// (`waitOnUpstream`) until the process ends, so the task does nothing.
     Upstream,
+}
+
+/// PORT: not in Go (perf). What a builder thread (builders.rs) needs to
+/// compile a task (`BuildTask::compile_job`).
+pub(crate) struct CompileJob {
+    pub(crate) config: String,
+    pub(crate) path: Path,
+    status: Option<UpToDateStatus>,
+    build_info_entry: Option<BuildInfoEntry>,
+}
+
+/// PORT: not in Go (perf). What the compile of a task on a builder thread
+/// set in its copy of the task (`BuildTask::into_compile_result`).
+pub(crate) struct CompileResult {
+    builder: String,
+    exit_status: ExitStatus,
+    statistics: Option<Statistics>,
+    has_changed_dts_file: bool,
+    build_kind: BuildKind,
+    errors: Vec<Diagnostic>,
+    status: Option<UpToDateStatus>,
+    build_info_entry: Option<BuildInfoEntry>,
+    package_jsons: Vec<String>,
+}
+
+/// PORT: not in Go (perf). How the compile of a task on a builder thread
+/// ended (`BuildTask::finish_compile_job`).
+pub(crate) enum CompiledTask {
+    Done(Box<CompileResult>),
+    /// `compile_and_emit_start` panicked with this payload.
+    StartPanicked(Box<dyn std::any::Any + Send>),
+    /// `compile_and_emit_finish` panicked with this payload.
+    FinishPanicked(Box<dyn std::any::Any + Send>),
 }
 
 // The state of Go `compileAndEmit` from `NewProgram` to
@@ -598,10 +640,24 @@ impl BuildTask {
     // orchestrator.rs), so `buildProject` is split here. It returns true
     // when the task compiles: then the caller must call
     // `build_project_finish`. When it returns false the task is done
-    // (downstream unblocked).
+    // (downstream unblocked). It is `build_project_check`, then
+    // `build_project_compile`.
+    pub fn build_project_start(
+        &mut self,
+        orchestrator: &dyn BuildTaskOrchestrator,
+        path: &Path,
+    ) -> bool {
+        self.build_project_check(orchestrator, path)
+            && self.build_project_compile(orchestrator, path)
+    }
+
+    /// The part of `build_project_start` before the program: the
+    /// up-to-date check. True when the task compiles: then the caller
+    /// calls `build_project_compile`, or a builder thread compiles it
+    /// (`compile_job`). False when the task is done (downstream unblocked).
     // PORT: a `go_panic` in the task is kept for `report` (see
     // `TaskGoPanic`). Other panics are port gaps and continue.
-    pub fn build_project_start(
+    pub fn build_project_check(
         &mut self,
         orchestrator: &dyn BuildTaskOrchestrator,
         path: &Path,
@@ -614,12 +670,43 @@ impl BuildTask {
             self.go_panic = Some(TaskGoPanic::Upstream);
             return false;
         }
-        let mut payload = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.build_project_start_task(orchestrator, path)
-        })) {
-            Ok(compiles) => return compiles,
-            Err(payload) => payload,
-        };
+        self.catch_go_panic(orchestrator, |task| {
+            task.build_project_check_task(orchestrator, path)
+        })
+    }
+
+    /// The part of `build_project_start` from the program on
+    /// (`compile_and_emit_start`), after `build_project_check` returned
+    /// true.
+    pub fn build_project_compile(
+        &mut self,
+        orchestrator: &dyn BuildTaskOrchestrator,
+        path: &Path,
+    ) -> bool {
+        self.catch_go_panic(orchestrator, |task| {
+            if task.compile_and_emit_start(orchestrator, path) {
+                return true;
+            }
+            // Go `compileAndEmit` returned before the program (the
+            // content mapper project failed); then `updateDownstream`.
+            task.update_downstream(orchestrator, path);
+            task.unblock_downstream();
+            false
+        })
+    }
+
+    /// Runs `step` of `build_project_start`, and keeps a `go_panic` in it
+    /// for `report` (false: the task is done).
+    fn catch_go_panic(
+        &mut self,
+        orchestrator: &dyn BuildTaskOrchestrator,
+        step: impl FnOnce(&mut Self) -> bool,
+    ) -> bool {
+        let mut payload =
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| step(&mut *self))) {
+                Ok(compiles) => return compiles,
+                Err(payload) => payload,
+            };
         let Some(panic) = payload.downcast_mut::<crate::core::GoPanic>() else {
             std::panic::resume_unwind(payload);
         };
@@ -638,7 +725,7 @@ impl BuildTask {
         false
     }
 
-    fn build_project_start_task(
+    fn build_project_check_task(
         &mut self,
         orchestrator: &dyn BuildTaskOrchestrator,
         path: &Path,
@@ -649,21 +736,15 @@ impl BuildTask {
             self.status = Some(self.get_up_to_date_status(orchestrator, path));
             self.report_up_to_date_status(orchestrator);
             if !self.handle_status_that_doesnt_require_build(orchestrator) {
-                if self.compile_and_emit_start(orchestrator, path) {
-                    return true;
+                return true;
+            }
+            if let Some(resolved) = self.resolved.clone() {
+                for diagnostic in resolved.get_config_file_parsing_diagnostics() {
+                    self.report_diagnostic(diagnostic);
                 }
-                // Go `compileAndEmit` returned before the program (the
-                // content mapper project failed); then `updateDownstream`.
-                self.update_downstream(orchestrator, path);
-            } else {
-                if let Some(resolved) = self.resolved.clone() {
-                    for diagnostic in resolved.get_config_file_parsing_diagnostics() {
-                        self.report_diagnostic(diagnostic);
-                    }
-                }
-                if !self.errors.is_empty() {
-                    self.result_mut().exit_status = ExitStatus::DiagnosticsPresentOutputsSkipped;
-                }
+            }
+            if !self.errors.is_empty() {
+                self.result_mut().exit_status = ExitStatus::DiagnosticsPresentOutputsSkipped;
             }
         } else if !self.errors.is_empty() {
             self.report_up_to_date_status(orchestrator);
@@ -675,6 +756,102 @@ impl BuildTask {
         }
         self.unblock_downstream();
         false
+    }
+
+    /// PORT: not in Go (perf). The compile of this task for a builder
+    /// thread (builders.rs), after `build_project_check` returned true:
+    /// what `compile_and_emit_start` and `compile_and_emit_finish` read
+    /// from the task. The builder makes its own copy of the task from it
+    /// (`from_compile_job`).
+    pub(crate) fn compile_job(&self, orchestrator: &dyn BuildTaskOrchestrator) -> CompileJob {
+        CompileJob {
+            config: self.config.clone(),
+            path: orchestrator.to_path(&self.config),
+            status: self.status.clone(),
+            build_info_entry: self.build_info_entry.clone().map(|entry| BuildInfoEntry {
+                // Only the up-to-date check reads it.
+                status_prefetch: None,
+                ..entry
+            }),
+        }
+    }
+
+    /// PORT: not in Go (perf). The copy of the task of `job` on a builder
+    /// thread, with the reporters of that thread.
+    pub(crate) fn from_compile_job(
+        job: CompileJob,
+        resolved: Option<Rc<ParsedCommandLine>>,
+        result: TaskResult,
+    ) -> BuildTask {
+        let mut task = BuildTask::new(job.config, false);
+        task.resolved = resolved;
+        task.status = job.status;
+        task.build_info_entry = job.build_info_entry;
+        task.result = Some(result);
+        task
+    }
+
+    /// PORT: not in Go (perf). What a builder copy of the task made: the
+    /// parts of the task that `compile_and_emit_start` and
+    /// `compile_and_emit_finish` set.
+    pub(crate) fn into_compile_result(mut self) -> CompileResult {
+        let result = self.result.take().expect("task result is set");
+        CompileResult {
+            builder: result.builder,
+            exit_status: result.exit_status,
+            statistics: result.statistics,
+            has_changed_dts_file: result.has_changed_dts_file,
+            build_kind: result.build_kind,
+            errors: self.errors,
+            status: self.status,
+            build_info_entry: self.build_info_entry,
+            package_jsons: self.package_jsons,
+        }
+    }
+
+    /// PORT: not in Go (perf). `build_project_finish` for a task that a
+    /// builder thread compiled: the task takes what the builder's copy of
+    /// it made (`compiled`), after what the task wrote to its builder
+    /// itself. A Go panic in the builder's compile start is kept for
+    /// `report`, as in `build_project_start`; one in its finish is raised
+    /// here, as in `build_project_finish`.
+    pub(crate) fn finish_compile_job(
+        &mut self,
+        orchestrator: &dyn BuildTaskOrchestrator,
+        path: &Path,
+        compiled: CompiledTask,
+    ) {
+        let compiled = match compiled {
+            CompiledTask::Done(compiled) => compiled,
+            CompiledTask::StartPanicked(payload) => {
+                self.catch_go_panic(orchestrator, |_| std::panic::resume_unwind(payload));
+                return;
+            }
+            CompiledTask::FinishPanicked(payload) => std::panic::resume_unwind(payload),
+        };
+        let CompileResult {
+            builder,
+            exit_status,
+            statistics,
+            has_changed_dts_file,
+            build_kind,
+            errors,
+            status,
+            build_info_entry,
+            package_jsons,
+        } = *compiled;
+        self.errors = errors;
+        self.status = status;
+        self.build_info_entry = build_info_entry;
+        self.package_jsons = package_jsons;
+        let result = self.result_mut();
+        result.builder.push_str(&builder);
+        result.exit_status = exit_status;
+        result.statistics = statistics;
+        result.has_changed_dts_file = has_changed_dts_file;
+        result.build_kind = build_kind;
+        self.update_downstream(orchestrator, path);
+        self.unblock_downstream();
     }
 
     /// PORT: not in Go (perf). After `build_project_start` returned true:
@@ -886,6 +1063,7 @@ impl BuildTask {
             self.store_output_time_stamp(orchestrator),
             host.m_times.clone(),
             orchestrator.compare_paths_options().clone(),
+            orchestrator.load_gate(),
         );
         let emit_started = testing.is_none();
         let changes_compute_start = sys.now();
@@ -1044,11 +1222,10 @@ impl BuildTask {
             .unwrap_or_else(PoisonError::into_inner)
             .take();
         if let Some((build_info_file_name, build_info, m_time)) = written {
-            let build_info = Arc::try_unwrap(build_info).unwrap_or_else(|shared| (*shared).clone());
             self.on_build_info_emit(
                 orchestrator,
                 &build_info_file_name,
-                Some(Rc::new(build_info)),
+                Some(build_info),
                 has_changed_dts_file,
                 m_time,
             );
@@ -1937,7 +2114,7 @@ impl BuildTask {
         orchestrator: &dyn BuildTaskOrchestrator,
         config_path: &Path,
         build_info_file_name: &str,
-    ) -> (Option<Rc<BuildInfo>>, Option<SystemTime>) {
+    ) -> (Option<Arc<BuildInfo>>, Option<SystemTime>) {
         let path = orchestrator.to_path(build_info_file_name);
         if let Some(entry) = &self.build_info_entry {
             if entry.path == path {
@@ -1971,7 +2148,7 @@ impl BuildTask {
         &mut self,
         orchestrator: &dyn BuildTaskOrchestrator,
         build_info_file_name: &str,
-        build_info: Option<Rc<BuildInfo>>,
+        build_info: Option<Arc<BuildInfo>>,
         has_changed_dts_file: bool,
         m_time: SystemTime,
     ) {
@@ -2101,15 +2278,24 @@ type WrittenBuildInfo = Arc<Mutex<Option<(String, Arc<BuildInfo>, SystemTime)>>>
 // once (Go `SyncMap`), before the test `OnEmittedFiles` reads it.
 // With `deferred` (`System::emit_writes_through_osvfs` is false) it writes
 // through the system file system instead (see `DeferredWrites`).
+// PORT: not in Go (perf). With `load_gate` (a builder thread of a parallel
+// build), a write of a file other than the build info waits until no load
+// of the build runs (builders.rs).
 fn new_task_write_file(
     written: WrittenBuildInfo,
     deferred: Option<DeferredWrites>,
     store_output_time_stamp: bool,
     m_times: Arc<Mutex<FxHashMap<Path, Option<SystemTime>>>>,
     compare_paths_options: ComparePathsOptions,
+    load_gate: Option<Arc<LoadGate>>,
 ) -> WriteFile {
     Arc::new(
         move |file_name: &str, text: &str, data: &mut WriteFileData| -> Result<(), String> {
+            if let Some(gate) = &load_gate
+                && data.build_info.is_none()
+            {
+                gate.wait_for_loads();
+            }
             match &deferred {
                 None => osvfs_fs()
                     .write_file(file_name, text)

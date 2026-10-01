@@ -62,6 +62,15 @@ impl<K: Clone + Eq + Hash, V: Clone> ParseCache<K, V> {
         }
     }
 
+    /// Calls `f` with each key and its entry: `None` for a parse that gave
+    /// no value.
+    // PORT: not in Go (perf, builders.rs).
+    pub fn for_each_entry(&self, mut f: impl FnMut(&K, Option<&V>)) {
+        for (key, value) in self.entries.borrow().iter() {
+            f(key, value.as_ref());
+        }
+    }
+
     // Go: build/parseCache.go:34 (*parseCache).store
     pub fn store(&self, key: K, value: Option<V>) {
         self.entries.borrow_mut().insert(key, value);

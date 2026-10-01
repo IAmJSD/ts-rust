@@ -1,6 +1,7 @@
 //! Go `internal/execute/build` (`tsc --build`), with watch mode in orchestrator_watch.rs.
 
 pub mod build_task;
+pub mod builders;
 pub mod command_line;
 pub mod config_prefetch;
 pub mod host;

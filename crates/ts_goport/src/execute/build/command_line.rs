@@ -126,6 +126,48 @@ impl ParsedBuildCommandLine {
     }
 }
 
+/// PORT: not in Go (perf). A `ParsedBuildCommandLine` that can go to a
+/// `tsc -b` builder thread (builders.rs), which makes its own copy
+/// (`to_local`).
+pub struct SendBuildCommandLine {
+    build_options: BuildOptions,
+    compiler_options: CompilerOptions,
+    projects: Vec<String>,
+    errors: Vec<Diagnostic>,
+    raw: CompilerOptionsValue,
+    compare_paths_options: ComparePathsOptions,
+}
+
+impl ParsedBuildCommandLine {
+    /// The copy of this command line for another thread.
+    pub fn to_send(&self) -> SendBuildCommandLine {
+        SendBuildCommandLine {
+            build_options: self.build_options.clone(),
+            compiler_options: (*self.compiler_options).clone(),
+            projects: self.projects.clone(),
+            errors: self.errors.clone(),
+            raw: self.raw.clone(),
+            compare_paths_options: self.compare_paths_options.clone(),
+        }
+    }
+}
+
+impl SendBuildCommandLine {
+    /// The command line as a `ParsedBuildCommandLine` of this thread.
+    pub fn to_local(&self) -> ParsedBuildCommandLine {
+        ParsedBuildCommandLine {
+            build_options: self.build_options.clone(),
+            compiler_options: Rc::new(self.compiler_options.clone()),
+            projects: self.projects.clone(),
+            errors: self.errors.clone(),
+            raw: self.raw.clone(),
+            compare_paths_options: self.compare_paths_options.clone(),
+            resolved_project_paths: OnceCell::new(),
+            locale: OnceCell::new(),
+        }
+    }
+}
+
 // Go: tsoptions/commandlineparser.go:63 ParseBuildCommandLine
 // PORT: Go nil `commandLine` is an empty slice here already. The
 // `WatchOptions` conversion is left out (see `ParsedBuildCommandLine`).
