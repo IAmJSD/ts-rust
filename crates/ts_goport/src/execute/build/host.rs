@@ -234,7 +234,8 @@ pub struct BuildHost {
 /// builders, so the builds of the tasks read as if they used one host, as
 /// in Go:
 /// - the cached lookups and `Stat` results of the file system and the
-///   mtimes (`BuildCachedFs`, `m_times`);
+///   mtimes (`BuildCachedFs`, `m_times`); each builder keeps the lookups of
+///   its own load apart (`BuildStatCache::for_builder`);
 /// - the text of each `.d.ts` and `.json` file that a load of the build
 ///   read first (`first_reads`). Go keeps the first parse of these files
 ///   for the whole build (`host.sourceFiles`). Each builder parses its
@@ -326,7 +327,7 @@ impl BuildHost {
         let base = sys.fs();
         let cached_fs = Rc::new(BuildCachedFs {
             fs: base.clone(),
-            stats: shared.stats.clone(),
+            stats: Arc::new(shared.stats.for_builder()),
             stat_cache: shared.stat_cache.clone(),
         });
         let host = new_compiler_host_over(

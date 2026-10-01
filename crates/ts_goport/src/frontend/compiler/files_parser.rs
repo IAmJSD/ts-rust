@@ -2495,8 +2495,9 @@ impl StatCache {
 ///   orchestrator (`add`).
 #[derive(Default)]
 pub struct BuildStatCache {
-    /// Go `cachedvfs`: kept for the whole build.
-    cached: StatCache,
+    /// Go `cachedvfs`: kept for the whole build. The builder threads of a
+    /// parallel `tsc -b` share it (`for_builder`).
+    cached: Arc<StatCache>,
     /// The lookups of the parse workers of the load that runs now, which
     /// `cached` did not have.
     load: StatCache,
@@ -2575,6 +2576,19 @@ impl BuildStatCache {
     /// Starts a program load whose parse workers use this cache.
     fn start_load(&self) {
         self.load.clear();
+    }
+
+    /// PORT: not in Go (perf). The cache of a `tsc -b` builder thread
+    /// (execute/build/builders.rs): `cached` of this cache, and a `load` of
+    /// its own, so the loads of builders that run at the same time keep
+    /// their worker lookups apart. They read and add the same lookups as
+    /// one load at a time would: the build writes nothing while a load
+    /// runs.
+    pub fn for_builder(&self) -> BuildStatCache {
+        BuildStatCache {
+            cached: self.cached.clone(),
+            load: StatCache::default(),
+        }
     }
 
     /// Ends a program load, after its parse workers ended: adds to `cached`

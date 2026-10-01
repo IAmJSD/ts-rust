@@ -57,6 +57,7 @@ use crate::execute::build::command_line::ParsedBuildCommandLine;
 use crate::execute::build::config_prefetch::{ConfigPrefetch, PrefetchPool};
 use crate::execute::build::host::BuildHost;
 use crate::execute::build::shared_outputs::{PathKeys, outputs_overlap};
+use crate::execute::build::up_to_date_status::{UpToDateStatus, UpToDateStatusType};
 use crate::execute::incremental::build_info::{BuildInfo, is_build_info_file_name_default_library};
 use crate::execute::incremental::incremental::{new_build_info_reader, parse_build_info};
 use crate::execute::tsc::compile::{
@@ -930,7 +931,7 @@ impl Orchestrator {
                         continue;
                     }
                 }
-                let compiles = {
+                let (compiles, light) = {
                     let mut task = task.borrow_mut();
                     task.result = Some(TaskResult::new(
                         self.create_task_builder_status_reporter(),
@@ -938,15 +939,16 @@ impl Orchestrator {
                     ));
                     if clean {
                         task.clean_project(self, &paths[index]);
-                        false
+                        (false, false)
                     } else {
-                        task.build_project_check(self, &paths[index])
+                        let compiles = task.build_project_check(self, &paths[index]);
+                        (compiles, task.status.as_ref().is_some_and(is_light_rebuild))
                     }
                 };
                 if compiles && !testing && !overlap_checked && num_routines > 1 {
                     overlap_checked = true;
                     in_build_order = self.outputs_overlap(&paths);
-                    builders = self.start_builders(num_routines, in_build_order, &ready);
+                    builders = self.start_builders(num_routines, in_build_order, light, &ready);
                 }
                 let mut task = task.borrow_mut();
                 states[index] = if !compiles {
@@ -1067,9 +1069,11 @@ impl Orchestrator {
 
     /// PORT: not in Go (perf). The builder threads of a parallel build
     /// (builders.rs), at most `num_routines`, which send the index of each
-    /// task whose check and emit are done to `ready`. None where the
-    /// output of builders could differ from the output of this thread
-    /// alone, which then builds every program:
+    /// task whose check and emit are done to `ready`. `light`: the first
+    /// task that compiles is a light rebuild (`is_light_rebuild`). None
+    /// when that task is not, unless `GOPORT_TSCB_BUILDERS=1`, and where
+    /// the output of builders could differ from the output of this thread
+    /// alone; this thread then builds every program:
     /// - one routine, or tasks that can see each other's writes
     ///   (`overlap`, see `in_build_order` in `build_all_tasks`);
     /// - tests, watch mode, `--clean`, and content mappers;
@@ -1077,6 +1081,7 @@ impl Orchestrator {
     ///   thread can make (`System::emit_writes_through_osvfs`);
     /// - a build host that keeps parses of an earlier build;
     /// - `GOPORT_TSCB_BUILDERS=0` (for A/B runs, and as a fallback).
+    /// The output is the same with or without builders.
     /// This thread then publishes the stores of the configs that it parsed,
     /// so the builders can read them, and takes its file ids in runs
     /// (`ast::reserve_file_ids`) from now on, as the builders do.
@@ -1084,8 +1089,10 @@ impl Orchestrator {
         &self,
         num_routines: usize,
         overlap: bool,
+        light: bool,
         ready: &std::sync::mpsc::Sender<usize>,
     ) -> Option<Builders> {
+        let setting = std::env::var_os("GOPORT_TSCB_BUILDERS");
         let options = &self.opts.command.compiler_options;
         let mut host_has_parses = false;
         self.host
@@ -1100,7 +1107,8 @@ impl Orchestrator {
             || !is_wrapped_os_fs(&self.opts.sys.fs())
             || !self.opts.sys.emit_writes_through_osvfs()
             || host_has_parses
-            || std::env::var_os("GOPORT_TSCB_BUILDERS").is_some_and(|value| value == "0")
+            || setting.as_ref().is_some_and(|value| value == "0")
+            || !(light || setting.is_some_and(|value| value == "1"))
         {
             return None;
         }
@@ -1474,6 +1482,23 @@ fn is_typescript_source(file_name: &str) -> bool {
         file_name,
         &[EXTENSION_TS, EXTENSION_TSX, EXTENSION_MTS, EXTENSION_CTS],
     ) && !is_declaration_file_name(file_name)
+}
+
+/// PORT: not in Go (perf). True for a task whose rebuild only reports the
+/// errors of its build info or makes its pending emit: its program loads,
+/// and there is little to check. A build whose first compile is such a
+/// rebuild loads its programs on builder threads (`start_builders`).
+// PERF (tscbpar1, mini-743d, stable bins): parallel loads cut hono-b noop
+// (3 such rebuilds) from 122 to 101 ms, but made the builds that check
+// slower (hono-b cold +6.5%, wide cold +4%, the body edits +1.5 to 2%).
+// There the checkers keep the cores busy, and each builder parses the
+// shared `.d.ts` files of its loads again (its own parse cache).
+fn is_light_rebuild(status: &UpToDateStatus) -> bool {
+    matches!(
+        status.kind,
+        UpToDateStatusType::OutOfDateBuildInfoWithErrors
+            | UpToDateStatusType::OutOfDateBuildInfoWithPendingEmit
+    )
 }
 
 /// The most released programs that `Orchestrator::released` keeps.
