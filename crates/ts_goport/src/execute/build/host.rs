@@ -236,13 +236,16 @@ pub struct BuildHost {
 /// - the cached lookups and `Stat` results of the file system and the
 ///   mtimes (`BuildCachedFs`, `m_times`); each builder keeps the lookups of
 ///   its own load apart (`BuildStatCache::for_builder`);
-/// - the text of each `.d.ts` and `.json` file that a load of the build
-///   read first (`first_reads`). Go keeps the first parse of these files
-///   for the whole build (`host.sourceFiles`). Each builder parses its
-///   own, from that text, so a later load gets the text that Go's cache
-///   would give it, also after the build wrote the file. No task writes
-///   while a load runs (the read rule of builders.rs), so two loads that
-///   read a file first at the same time read the same text;
+/// - the `.d.ts` and `.json` parses of the first program of the build
+///   (`parses`, `SharedParses`). Go keeps the first parse of these files
+///   for the whole build (`host.sourceFiles`), and so does each builder
+///   that takes them;
+/// - the text of each other `.d.ts` and `.json` file that a load of the
+///   build read first (`first_reads`). Each builder parses its own, from
+///   that text, so a later load gets the text that Go's cache would give
+///   it, also after the build wrote the file. No task writes while a load
+///   runs (the read rule of builders.rs), so two loads that read a file
+///   first at the same time read the same text;
 /// - the configs of the build (`configs`), each with its parse time: the
 ///   build host parsed them all when it made the graph.
 #[derive(Clone)]
@@ -250,8 +253,24 @@ pub struct BuilderShared {
     stats: Arc<BuildStatCache>,
     stat_cache: StatResults,
     m_times: Arc<Mutex<FxHashMap<Path, Option<SystemTime>>>>,
+    parses: Arc<SharedParses>,
     first_reads: Arc<Mutex<FxHashMap<SourceFileCacheKey, FileText>>>,
     configs: Arc<FxHashMap<Path, (Option<SendParsedCommandLine>, Duration)>>,
+}
+
+/// PORT: not in Go (perf). The cached `.d.ts` and `.json` parses of the
+/// first program that a builder of a parallel build makes (the lib files
+/// and the shared declaration files), for the other builders. Their stores
+/// are published, so any thread reads their nodes, and their binds join
+/// the lineage of the process once (`program::bind_all`). A builder that
+/// takes them parses and binds none of them again: without them each
+/// builder parsed and bound its own lib files, which cost a wide build
+/// with 4 light rebuilds about 2x CPU and 45% more memory.
+#[derive(Default)]
+pub(crate) struct SharedParses {
+    /// None until the first program shares its parses (`share`).
+    parses: Mutex<Option<Vec<(SourceFileCacheKey, ParsedSourceFile)>>>,
+    shared: std::sync::Condvar,
 }
 
 impl BuildHost {
@@ -311,9 +330,56 @@ impl BuildHost {
             stats: self.cached_fs.stats.clone(),
             stat_cache: self.cached_fs.stat_cache.clone(),
             m_times: self.m_times.clone(),
+            parses: Arc::default(),
             first_reads: Arc::default(),
             configs: Arc::new(configs),
         })
+    }
+
+    /// On a builder thread, shares the published parses of this host's
+    /// cache with the other builders (`SharedParses`), once per build: the
+    /// first program of the build calls it when it is made. A later call
+    /// shares nothing.
+    pub(crate) fn share_parses(&self) {
+        let Some(shared) = &self.builder else {
+            return;
+        };
+        let mut parses = lock(&shared.parses.parses);
+        if parses.is_some() {
+            return;
+        }
+        let mut files = Vec::new();
+        self.source_files.for_each_stored(|key, file| {
+            if crate::ast::is_published(file.store) {
+                files.push((key.clone(), ParsedSourceFile::clone(file)));
+            }
+        });
+        *parses = Some(files);
+        shared.parses.shared.notify_all();
+    }
+
+    /// On a builder thread, waits until the first program of the build has
+    /// shared its parses (`share_parses`), and puts them into this host's
+    /// cache where it has no entry.
+    pub(crate) fn take_shared_parses(&self) {
+        let Some(shared) = &self.builder else {
+            return;
+        };
+        let mut parses = lock(&shared.parses.parses);
+        let parses = loop {
+            if let Some(parses) = &*parses {
+                break parses;
+            }
+            parses = shared
+                .parses
+                .shared
+                .wait(parses)
+                .unwrap_or_else(PoisonError::into_inner);
+        };
+        for (key, file) in parses {
+            self.source_files
+                .load_or_store(key.clone(), |_| Some(Rc::new(file.clone())), false);
+        }
     }
 
     /// The host of a builder thread (builders.rs) on `sys`, a system of

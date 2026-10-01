@@ -17,6 +17,13 @@
 //!   cached `.d.ts` and `.json` file and the configs with the build host
 //!   (host.rs `BuilderShared`), so the tasks read the file system as through
 //!   Go's one host.
+//! - The first task of the build loads alone. Its program shares its
+//!   cached `.d.ts` and `.json` parses (the lib files and the shared
+//!   declaration files) when it is made (`BuildHost::share_parses`). The
+//!   other builders wait for them before they load, and take them into
+//!   their parse caches (`BuildHost::take_shared_parses`), so they parse
+//!   and bind none of these files again. Their loads run beside the rest
+//!   of the first task.
 //! - A task gets a copy of what its compile reads from the orchestrator's
 //!   task (`CompileJob`), and the orchestrator's task takes what the
 //!   compile set (`CompileResult`).
@@ -46,6 +53,7 @@ use crate::execute::tsc::diagnostics::{
     create_builder_status_reporter, create_diagnostic_reporter,
 };
 use crate::frontend::prelude::*;
+use std::cell::Cell;
 use std::collections::VecDeque;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
@@ -115,8 +123,9 @@ pub(crate) struct BuilderSetup {
 }
 
 enum Message {
-    /// Compile the task at this build order index.
-    Compile(usize, CompileJob),
+    /// Compile the task at this build order index. True for the first task
+    /// of the build, whose program shares its parses.
+    Compile(usize, CompileJob, bool),
     /// Finish the task that the builder compiles.
     Finish,
 }
@@ -134,6 +143,8 @@ pub(crate) struct Builders {
     setup: Arc<BuilderSetup>,
     max: usize,
     builders: Vec<Builder>,
+    /// A task was sent (the first one shares its parses).
+    sent: bool,
     gate: Arc<LoadGate>,
     /// Gets the build order index of a task when its check and emit are
     /// done (`build_all_tasks`).
@@ -154,6 +165,7 @@ impl Builders {
             setup: Arc::new(setup),
             max,
             builders: Vec::new(),
+            sent: false,
             gate: Arc::default(),
             ready,
             finished,
@@ -175,9 +187,10 @@ impl Builders {
             }
         };
         self.gate.start();
+        let first = !std::mem::replace(&mut self.sent, true);
         if self.builders[builder]
             .messages
-            .send(Message::Compile(index, job))
+            .send(Message::Compile(index, job, first))
             .is_err()
         {
             panic!("builder {builder} ended");
@@ -256,6 +269,8 @@ fn run_builder(
         sys,
         host,
         gate,
+        shares: Cell::new(false),
+        took_parses: Cell::new(false),
     };
     // The released programs of the finished tasks. They free when the
     // builder has nothing else to do, as the orchestrator frees its own.
@@ -274,9 +289,10 @@ fn run_builder(
             }
             Err(TryRecvError::Disconnected) => break,
         };
-        let Message::Compile(index, job) = message else {
+        let Message::Compile(index, job, first) = message else {
             panic!("a builder got a finish with no task");
         };
+        builder.shares.set(first);
         let compiled = builder.compile(job, || {
             let _ = ready.send(index);
             matches!(messages.recv(), Ok(Message::Finish))
@@ -308,6 +324,11 @@ struct BuilderContext {
     sys: Rc<dyn System>,
     host: Rc<BuildHost>,
     gate: Arc<LoadGate>,
+    /// The task is the first of the build: its program shares its parses
+    /// (`program_made`).
+    shares: Cell<bool>,
+    /// The host took the parses of the first program (or made them).
+    took_parses: Cell<bool>,
 }
 
 impl BuilderContext {
@@ -324,6 +345,9 @@ impl BuilderContext {
     ) -> Option<(CompiledTask, Option<IncrementalProgram>)> {
         let path = job.path.clone();
         let load = LoadEnd(&self.gate);
+        if !self.shares.get() && !self.took_parses.replace(true) {
+            self.host.take_shared_parses();
+        }
         let started = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let resolved = self.host.get_resolved_project_reference(&job.config, &path);
             let mut task = BuildTask::from_compile_job(job, resolved, self.task_result());
@@ -331,6 +355,9 @@ impl BuilderContext {
             (task, compiles)
         }));
         drop(load);
+        // A first task that made no program shares what it has, so the
+        // other builders do not wait for good.
+        self.program_made();
         let (mut task, compiles) = match started {
             Ok(started) => started,
             Err(payload) => {
@@ -454,5 +481,12 @@ impl BuildTaskOrchestrator for BuilderContext {
 
     fn load_gate(&self) -> Option<Arc<LoadGate>> {
         Some(self.gate.clone())
+    }
+
+    fn program_made(&self) {
+        if self.shares.replace(false) {
+            self.took_parses.set(true);
+            self.host.share_parses();
+        }
     }
 }

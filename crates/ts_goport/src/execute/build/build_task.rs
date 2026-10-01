@@ -430,6 +430,11 @@ pub trait BuildTaskOrchestrator {
     fn load_gate(&self) -> Option<Arc<LoadGate>> {
         None
     }
+    /// PORT: not in Go (perf). Called when the program of a task is made,
+    /// before its check starts. On a builder thread the first program of
+    /// the build shares its parses with the other builders then
+    /// (`BuildHost::share_parses`).
+    fn program_made(&self) {}
 }
 
 // Go: build/buildtask.go:55 BuildTask
@@ -1075,6 +1080,7 @@ impl BuildTask {
         // Go: compiler.NewProgram(compiler.ProgramOptions{Config, Host})
         let program = crate::execute::execute_tsc::new_program_version(compiler_host, resolved);
         compile_times.borrow_mut().parse_time = elapsed(&*sys, parse_start);
+        orchestrator.program_made();
         let written_build_info: WrittenBuildInfo = Arc::default();
         let deferred_writes = (!sys.emit_writes_through_osvfs()).then(DeferredWrites::default);
         let write_file = new_task_write_file(

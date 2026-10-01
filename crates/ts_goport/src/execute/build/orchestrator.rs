@@ -34,10 +34,11 @@
 //! drops it there; in tests when its task reports. Its checker threads
 //! free it in the background. In a build where the output does not depend
 //! on it and every task that compiles is a light rebuild
-//! (`uses_builders`), the programs of the started tasks load at the
-//! same time instead, each on a builder thread that also checks, emits,
-//! writes and releases it (builders.rs); the schedule above does not
-//! change, and a finish waits for the loads that run. Where Go does task
+//! (`uses_builders`), the programs of the started tasks load on builder
+//! threads instead, each on a thread that also checks, emits, writes and
+//! releases it (builders.rs): the first one alone, then the others at the
+//! same time, with the parses of the first one. The schedule above does
+//! not change, and a finish waits for the loads that run. Where Go does task
 //! work on its goroutines that needs no task state, threads do it ahead of
 //! this thread: the file name match of each config (config_prefetch.rs),
 //! and the build info read, its check parts and the source mtimes of each
@@ -953,6 +954,9 @@ impl Orchestrator {
                     if !in_build_order && self.uses_builders(builders_setting, &task.borrow()) {
                         builders = self.start_builders(num_routines, &ready);
                     }
+                    if let Some(prefetch) = &*self.build_info_prefetch.borrow() {
+                        prefetch.end_forecast();
+                    }
                 }
                 let mut task = task.borrow_mut();
                 states[index] = if !compiles {
@@ -1117,8 +1121,9 @@ impl Orchestrator {
     /// inputs), and two or more light ones (`RebuildForecast::light`).
     // PERF (tscbpar1, stable bins): parallel loads cut hono-b noop (3 light
     // rebuilds) from about 122 to 101 ms on the minis. Where a task checks,
-    // the checkers keep the cores busy, and each builder parses the shared
-    // `.d.ts` files of its loads again (its own parse cache). With builders
+    // the checkers keep the cores busy, and before the builders shared the
+    // parses of the first program (tscbpar1 round c) each builder parsed the
+    // shared `.d.ts` files of its loads again. With builders
     // in every build, hono-b cold was 6.5% and wide cold 4% slower. With
     // builders after a light first compile only, a hono-b rebuild after an
     // edit of a test file of one later project used 50% to 90% more CPU and
@@ -1570,12 +1575,17 @@ enum Rebuild {
 struct RebuildForecast {
     state: Mutex<ForecastState>,
     changed: Condvar,
+    /// The orchestrator made its decision (`end`): the mtimes jobs that
+    /// have not started read nothing.
+    ended: std::sync::atomic::AtomicBool,
 }
 
 struct ForecastState {
     /// The reads whose mtimes are not read yet.
     unstated: usize,
-    /// The reads whose build info is not parsed yet.
+    /// The reads whose build info is not parsed yet (`add_class`).
+    unclassed: usize,
+    /// The reads whose rebuild is not known yet (`add_parse`).
     unparsed: usize,
     /// The light rebuilds.
     light: usize,
@@ -1588,12 +1598,23 @@ impl RebuildForecast {
         RebuildForecast {
             state: Mutex::new(ForecastState {
                 unstated: reads,
+                unclassed: reads,
                 unparsed: reads,
                 light: 0,
                 heavy: false,
             }),
             changed: Condvar::new(),
+            ended: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// The decision is made: the mtimes jobs that have not started stop.
+    fn end(&self) {
+        self.ended.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn ended(&self) -> bool {
+        self.ended.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// The mtimes of a read (`unchanged_inputs`).
@@ -1604,33 +1625,47 @@ impl RebuildForecast {
         self.changed.notify_all();
     }
 
-    /// The rebuild of a read, from its build info.
+    /// Whether the build info of a read makes a light rebuild, as soon as
+    /// it is parsed: before the thread reads the source mtimes of a check
+    /// that reads them (`forecast_rebuild` tells the rest).
+    fn add_class(&self, light: bool) {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state.unclassed -= 1;
+        state.light += usize::from(light);
+        self.changed.notify_all();
+    }
+
+    /// The rebuild of a read, from its build info (`add_class` counted a
+    /// light one).
     fn add_parse(&self, rebuild: Rebuild) {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         state.unparsed -= 1;
-        match rebuild {
-            Rebuild::None => {}
-            Rebuild::Light => state.light += 1,
-            Rebuild::Heavy => state.heavy = true,
-        }
+        state.heavy |= rebuild == Rebuild::Heavy;
         self.changed.notify_all();
     }
 
     /// True when no rebuild is heavy and two or more are light. Waits
-    /// until a rebuild is heavy, or until the mtimes of every read are
-    /// read and two rebuilds are light or every build info is parsed.
+    /// until a rebuild is heavy, until every build info is parsed with
+    /// fewer than two light rebuilds, or until two rebuilds are light and
+    /// the mtimes of every read are read. So a build with fewer than two
+    /// light rebuilds waits for no mtime.
     /// A heavy rebuild that only a later parse shows (another version or
     /// options with no newer config file) is missed; that task compiles on
     /// a builder thread with the same output.
     fn light(&self) -> bool {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        while !state.heavy && (state.unstated > 0 || (state.light < 2 && state.unparsed > 0)) {
+        loop {
+            if state.heavy || (state.light < 2 && state.unclassed == 0) {
+                return false;
+            }
+            if state.light >= 2 && state.unstated == 0 {
+                return true;
+            }
             state = self
                 .changed
                 .wait(state)
                 .unwrap_or_else(PoisonError::into_inner);
         }
-        !state.heavy && state.light >= 2
     }
 }
 
@@ -1729,14 +1764,15 @@ impl BuildInfoPrefetch {
                         thread_forecast.as_deref(),
                     ),
                     Some(PrefetchJob::Mtimes(read)) => {
-                        let unchanged =
-                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let Some(forecast) = &thread_forecast else {
+                            continue;
+                        };
+                        let unchanged = forecast.ended()
+                            || std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                                 unchanged_inputs(&*fs, &read)
                             }))
                             .unwrap_or(false);
-                        if let Some(forecast) = &thread_forecast {
-                            forecast.add_mtimes(unchanged);
-                        }
+                        forecast.add_mtimes(unchanged);
                     }
                 }
             }
@@ -1769,6 +1805,14 @@ impl BuildInfoPrefetch {
         self.forecast
             .as_ref()
             .is_some_and(|forecast| forecast.light())
+    }
+
+    /// The orchestrator made its decision: the forecast reads nothing more
+    /// (`RebuildForecast::end`).
+    fn end_forecast(&self) {
+        if let Some(forecast) = &self.forecast {
+            forecast.end();
+        }
     }
 }
 
@@ -1811,6 +1855,9 @@ fn parse_build_info_job(
         let early = build_info
             .as_ref()
             .map(|build_info| read.check.early_return(build_info));
+        if let Some(forecast) = forecast {
+            forecast.add_class(early == Some(EarlyReturn::ErrorsOrPendingEmit));
+        }
         // A check that returns before the input mtimes reads neither the
         // check parts nor the mtimes.
         let mut sources = None;
@@ -2068,9 +2115,10 @@ mod tests {
             mtimes
                 .iter()
                 .for_each(|&unchanged| forecast.add_mtimes(unchanged));
-            parses
-                .iter()
-                .for_each(|&rebuild| forecast.add_parse(rebuild));
+            for &rebuild in parses {
+                forecast.add_class(rebuild == Rebuild::Light);
+                forecast.add_parse(rebuild);
+            }
             forecast.light()
         };
         let unchanged = [true; 3];
@@ -2083,5 +2131,10 @@ mod tests {
         assert!(!forecast(&unchanged, &[Rebuild::Light, Rebuild::Heavy]));
         // A changed input decides before any parse.
         assert!(!forecast(&[true, false], &[]));
+        // Fewer than two light rebuilds decide without the mtimes.
+        assert!(!forecast(
+            &[],
+            &[Rebuild::Light, Rebuild::None, Rebuild::None]
+        ));
     }
 }
