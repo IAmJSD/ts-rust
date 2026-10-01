@@ -23,14 +23,123 @@
 //! when the orchestrator takes the match, they go into the host's cache
 //! (`BuildStatCache::add`), as if the orchestrator had made them. The
 //! thread made them before the build wrote anything, as Go does.
+//!
+//! The config threads are the threads of a `PrefetchPool`. When the graph
+//! is made, the same threads read the build info files ahead of the
+//! up-to-date checks (orchestrator.rs `BuildInfoPrefetch`), so a build
+//! starts its prefetch threads once.
 
 use crate::execute::build::host::TscExtendedConfigCache;
 use crate::frontend::prelude::*;
 use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 
-/// The most threads that parse configs ahead of the orchestrator.
-const MAX_CONFIG_THREADS: usize = 8;
+/// The most threads of a `PrefetchPool`.
+const MAX_PREFETCH_THREADS: usize = 8;
+
+/// A job of a `PrefetchPool` thread.
+type PoolJob = Box<dyn FnOnce() + Send>;
+
+struct PoolQueue {
+    jobs: VecDeque<PoolJob>,
+    /// Set when the `PrefetchPool` drops: then a thread with no job ends.
+    closed: bool,
+}
+
+struct PoolShared {
+    queue: Mutex<PoolQueue>,
+    ready: Condvar,
+}
+
+/// PORT: not in Go (perf). The threads that read ahead of the
+/// orchestrator: the config parses (`ConfigPrefetch`), then the build info
+/// reads (orchestrator.rs `BuildInfoPrefetch`). Each thread runs the queued
+/// jobs in order. Dropping the pool lets each thread end when the queue is
+/// empty; the queued jobs still run.
+// PERF (perfplan4 build fix 2b): one set of threads instead of one per
+// prefetch saves up to 8 thread starts (about 72 µs each on the
+// orchestrator thread).
+pub struct PrefetchPool {
+    shared: Arc<PoolShared>,
+    threads: usize,
+}
+
+impl PrefetchPool {
+    /// Starts up to `MAX_PREFETCH_THREADS` threads (at most the cores).
+    /// None when no thread starts.
+    pub fn start() -> Option<Self> {
+        let shared = Arc::new(PoolShared {
+            queue: Mutex::new(PoolQueue {
+                jobs: VecDeque::new(),
+                closed: false,
+            }),
+            ready: Condvar::new(),
+        });
+        let mut threads = 0;
+        for _ in 0..MAX_PREFETCH_THREADS.min(crate::program::available_cores()) {
+            let shared = shared.clone();
+            // A config parse and the JSON parse of a build info file are
+            // recursive (nested JSON values, `extends` chains), so the
+            // thread gets the Go stack size, as a parse worker does.
+            let spawned = std::thread::Builder::new()
+                .name("goport-prefetch".to_string())
+                .stack_size(crate::gostd::stack::max_stack_size())
+                .spawn(move || run_pool_thread(&shared));
+            threads += usize::from(spawned.is_ok());
+        }
+        (threads > 0).then_some(PrefetchPool { shared, threads })
+    }
+
+    /// The number of threads.
+    pub fn threads(&self) -> usize {
+        self.threads
+    }
+
+    /// Queues `count` runs of `job`. A job that is to run on every thread
+    /// at once (a loop over a shared queue) is queued `threads()` times.
+    pub fn run(&self, count: usize, job: impl Fn() + Send + Sync + 'static) {
+        let job = Arc::new(job);
+        let mut queue = lock(&self.shared.queue);
+        for _ in 0..count {
+            let job = job.clone();
+            queue.jobs.push_back(Box::new(move || job()));
+        }
+        drop(queue);
+        for _ in 0..count {
+            self.shared.ready.notify_one();
+        }
+    }
+}
+
+impl Drop for PrefetchPool {
+    fn drop(&mut self) {
+        lock(&self.shared.queue).closed = true;
+        self.shared.ready.notify_all();
+    }
+}
+
+/// A `PrefetchPool` thread: runs the queued jobs until the pool drops and
+/// the queue is empty.
+fn run_pool_thread(shared: &PoolShared) {
+    loop {
+        let job = {
+            let mut queue = lock(&shared.queue);
+            loop {
+                if let Some(job) = queue.jobs.pop_front() {
+                    break job;
+                }
+                if queue.closed {
+                    return;
+                }
+                queue = shared
+                    .ready
+                    .wait(queue)
+                    .unwrap_or_else(PoisonError::into_inner);
+            }
+        };
+        job();
+    }
+}
 
 /// What `get_file_names_from_config_specs` reads, other than the file
 /// system: two matches with equal inputs give the same file names.
@@ -126,21 +235,21 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// The threads that parse the configs of one graph ahead of the
-/// orchestrator. Dropping it closes the queue; the threads end after the
-/// config they parse.
+/// The config parses of one graph ahead of the orchestrator, on the
+/// threads of a `PrefetchPool`. Dropping it closes the queue; each thread
+/// takes its next pool job after the config it parses.
 pub struct ConfigPrefetch {
     shared: Arc<Shared>,
 }
 
 impl ConfigPrefetch {
-    /// Starts up to `MAX_CONFIG_THREADS` threads (at most the cores). None
-    /// when no thread starts.
+    /// Starts the config parses on every thread of `pool`.
     pub fn start(
+        pool: &PrefetchPool,
         compiler_options: CompilerOptions,
         command_line_raw: Option<IndexMap<String, CompilerOptionsValue>>,
         compare_paths_options: &ComparePathsOptions,
-    ) -> Option<Self> {
+    ) -> Self {
         let shared = Arc::new(Shared {
             queue: Mutex::new(Queue {
                 pending: VecDeque::new(),
@@ -155,21 +264,9 @@ impl ConfigPrefetch {
                 use_case_sensitive_file_names: compare_paths_options.use_case_sensitive_file_names,
             },
         });
-        let threads = MAX_CONFIG_THREADS.min(crate::program::available_cores());
-        let mut started = 0;
-        for _ in 0..threads {
-            let shared = shared.clone();
-            // A thread that cannot start leaves its configs to the others.
-            // A config parse is recursive (nested JSON values, `extends`
-            // chains), so the thread gets the Go stack size, as a parse
-            // worker does.
-            let spawned = std::thread::Builder::new()
-                .name("goport-config".to_string())
-                .stack_size(crate::gostd::stack::max_stack_size())
-                .spawn(move || run_config_thread(&shared));
-            started += usize::from(spawned.is_ok());
-        }
-        (started > 0).then_some(ConfigPrefetch { shared })
+        let thread_shared = shared.clone();
+        pool.run(pool.threads(), move || run_config_thread(&thread_shared));
+        ConfigPrefetch { shared }
     }
 
     /// Queues the parse of each config in `configs` that was not queued
@@ -280,8 +377,8 @@ fn queue_configs(shared: &Shared, configs: &[String]) {
     }
 }
 
-/// A config thread: parses queued configs in order until the queue
-/// closes, and queues the references of each.
+/// The config job of a pool thread: parses queued configs in order until
+/// the queue closes, and queues the references of each.
 fn run_config_thread(shared: &Shared) {
     // Go: sys.FS() is bundled.WrapFS(osvfs.FS()), and the build host
     // caches it (`cachedvfs.From`).

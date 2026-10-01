@@ -49,7 +49,7 @@
 use crate::contentmapper;
 use crate::execute::build::build_task::*;
 use crate::execute::build::command_line::ParsedBuildCommandLine;
-use crate::execute::build::config_prefetch::ConfigPrefetch;
+use crate::execute::build::config_prefetch::{ConfigPrefetch, PrefetchPool};
 use crate::execute::build::host::BuildHost;
 use crate::execute::build::shared_outputs::{PathKeys, outputs_overlap};
 use crate::execute::incremental::build_info::{BuildInfo, is_build_info_file_name_default_library};
@@ -186,6 +186,10 @@ pub struct Orchestrator {
     // PORT: not in Go (perf). The build info files that threads read ahead
     // of the up-to-date checks of this build cycle (`BuildInfoPrefetch`).
     build_info_prefetch: RefCell<Option<BuildInfoPrefetch>>,
+    // PORT: not in Go (perf). The threads that parsed the configs of the
+    // graph (`start_config_prefetch`), until the build info reads take them
+    // (`start_build_info_prefetch`) or the build ends.
+    prefetch_pool: RefCell<Option<PrefetchPool>>,
     // PORT: not in Go (perf). The released programs of built tasks whose
     // frontend programs are not freed yet (`release_task_program`), oldest
     // first. Go's GC frees them in the background. Their `Rc` data frees on
@@ -382,15 +386,18 @@ impl Orchestrator {
         {
             return;
         }
+        let Some(pool) = PrefetchPool::start() else {
+            return;
+        };
         let prefetch = ConfigPrefetch::start(
+            &pool,
             (**options).clone(),
             self.host.command_line_raw(),
             &self.compare_paths_options,
         );
-        if let Some(prefetch) = &prefetch {
-            prefetch.queue(references);
-        }
-        *self.host.config_prefetch.borrow_mut() = prefetch;
+        prefetch.queue(references);
+        *self.host.config_prefetch.borrow_mut() = Some(prefetch);
+        *self.prefetch_pool.borrow_mut() = Some(pool);
     }
 
     // Go: build/orchestrator.go:210 (*Orchestrator).setupBuildTask
@@ -851,6 +858,9 @@ impl Orchestrator {
         if !clean {
             *self.build_info_prefetch.borrow_mut() = self.start_build_info_prefetch(&paths);
         }
+        // The threads of the config parses end once their queued reads
+        // are done.
+        self.prefetch_pool.borrow_mut().take();
         let index_of: FxHashMap<Path, usize> = paths
             .iter()
             .enumerate()
@@ -1046,7 +1056,8 @@ impl Orchestrator {
 
     /// PORT: not in Go (perf). Starts reading the build info files that the
     /// up-to-date checks of the tasks at `paths` will read (see
-    /// `BuildInfoPrefetch`), on up to `MAX_BUILD_INFO_THREADS` threads. None
+    /// `BuildInfoPrefetch`), on the threads of the config parses
+    /// (`prefetch_pool`), or on new ones when there are none. None
     /// when there is nothing to gain or the read could differ from the task's
     /// own read: one routine (`--singleThreaded` or `--builders 1`: Go
     /// checks one task at a time), `--force` (no check reads the build
@@ -1122,8 +1133,17 @@ impl Orchestrator {
             .unwrap_or_else(PoisonError::into_inner)
             .reserve(inputs);
         let m_times: MTimePrefetch = Arc::default();
-        let prefetch =
-            BuildInfoPrefetch::start(reads, self.compare_paths_options.clone(), m_times.clone())?;
+        let pool = match self.prefetch_pool.borrow_mut().take() {
+            Some(pool) => pool,
+            None => PrefetchPool::start()?,
+        };
+        let prefetch = BuildInfoPrefetch::start(
+            &pool,
+            reads,
+            self.compare_paths_options.clone(),
+            m_times.clone(),
+        );
+        drop(pool);
         *self.host.m_time_prefetch.borrow_mut() = Some(m_times);
         Some(prefetch)
     }
@@ -1384,85 +1404,65 @@ impl Drop for ReadySignal {
     }
 }
 
-/// The most threads that read build info files. The count is not Go's
-/// `numRoutines`: the threads only read, so their count changes no output,
-/// and a build info takes the port longer to parse than to check.
-const MAX_BUILD_INFO_THREADS: usize = 8;
-
 impl BuildInfoPrefetch {
-    /// Starts the threads that read and parse the files of `reads`, in
-    /// order, at most `MAX_BUILD_INFO_THREADS` and the cores, and put the
-    /// mtimes they read into `m_times`. None when no thread starts.
+    /// Starts reading and parsing the files of `reads`, in order, on the
+    /// threads of `pool` (at most one per file), and puts the mtimes they
+    /// read into `m_times`.
+    // PORT: the threads only read, so their count changes no output; it
+    // is not Go's `numRoutines`.
     fn start(
+        pool: &PrefetchPool,
         reads: Vec<BuildInfoRead>,
         compare_paths_options: ComparePathsOptions,
         m_times: MTimePrefetch,
-    ) -> Option<Self> {
+    ) -> Self {
         let slots: Vec<(String, Arc<BuildInfoSlot>)> = reads
             .iter()
             .map(|read| (read.name.clone(), Arc::default()))
             .collect();
-        let queue = Arc::new(Mutex::new(
+        let queue = Mutex::new(
             reads
                 .into_iter()
                 .zip(slots.iter().map(|(_, slot)| slot.clone()))
                 .collect::<Vec<_>>()
                 .into_iter(),
-        ));
-        let compare_paths_options = Arc::new(compare_paths_options);
-        let threads = MAX_BUILD_INFO_THREADS
-            .min(crate::program::available_cores())
-            .min(slots.len());
-        let mut started = 0;
-        for _ in 0..threads {
-            let queue = queue.clone();
-            let compare_paths_options = compare_paths_options.clone();
-            let m_times = m_times.clone();
-            // A thread that cannot start leaves its files to the others.
-            // The JSON parse of a build info file is recursive, so the
-            // thread gets the Go stack size.
-            let spawned = std::thread::Builder::new()
-                .name("goport-buildinfo".to_string())
-                .stack_size(crate::gostd::stack::max_stack_size())
-                .spawn(move || {
-                    let fs = crate::frontend::bundled::wrap_fs(crate::frontend::vfs::osvfs_fs());
-                    loop {
-                        let next = queue.lock().unwrap_or_else(PoisonError::into_inner).next();
-                        let Some((read, slot)) = next else {
-                            break;
-                        };
-                        // A read that panics is left to the task, which
-                        // panics on it too.
-                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            let (data, ok) = fs.read_file(&read.name);
-                            let build_info = if ok { parse_build_info(&data) } else { None };
-                            // A check that returns before the input mtimes
-                            // reads neither the check parts nor the mtimes.
-                            let status = build_info
-                                .as_ref()
-                                .filter(|build_info| read.check.reads_input_times(build_info))
-                                .map(|build_info| {
-                                    let status = StatusPrefetch::new(
-                                        build_info,
-                                        &read.name,
-                                        &read.input_files,
-                                        &compare_paths_options,
-                                    );
-                                    prefetch_m_times(&*fs, &read, &status, &m_times);
-                                    status
-                                });
-                            (build_info, status)
-                        }));
-                        *slot.result.lock().unwrap_or_else(PoisonError::into_inner) =
-                            Some(result.ok());
-                        slot.done.notify_all();
-                    }
-                });
-            started += usize::from(spawned.is_ok());
-        }
-        (started > 0).then(|| BuildInfoPrefetch {
+        );
+        pool.run(pool.threads().min(slots.len()), move || {
+            let fs = crate::frontend::bundled::wrap_fs(crate::frontend::vfs::osvfs_fs());
+            loop {
+                let next = queue.lock().unwrap_or_else(PoisonError::into_inner).next();
+                let Some((read, slot)) = next else {
+                    break;
+                };
+                // A read that panics is left to the task, which panics on
+                // it too.
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let (data, ok) = fs.read_file(&read.name);
+                    let build_info = if ok { parse_build_info(&data) } else { None };
+                    // A check that returns before the input mtimes reads
+                    // neither the check parts nor the mtimes.
+                    let status = build_info
+                        .as_ref()
+                        .filter(|build_info| read.check.reads_input_times(build_info))
+                        .map(|build_info| {
+                            let status = StatusPrefetch::new(
+                                build_info,
+                                &read.name,
+                                &read.input_files,
+                                &compare_paths_options,
+                            );
+                            prefetch_m_times(&*fs, &read, &status, &m_times);
+                            status
+                        });
+                    (build_info, status)
+                }));
+                *slot.result.lock().unwrap_or_else(PoisonError::into_inner) = Some(result.ok());
+                slot.done.notify_all();
+            }
+        });
+        BuildInfoPrefetch {
             slots: slots.into_iter().collect(),
-        })
+        }
     }
 
     /// The build info of `name` that a thread read, and its check parts,
@@ -1542,6 +1542,7 @@ pub fn new_orchestrator(opts: Options) -> Orchestrator {
         schedule_order: Vec::new(),
         graph_generated: false,
         build_info_prefetch: RefCell::new(None),
+        prefetch_pool: RefCell::new(None),
         released: RefCell::default(),
         ends_process: std::cell::Cell::new(false),
         status_prefetch: RefCell::new(None),
