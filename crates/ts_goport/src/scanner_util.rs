@@ -70,7 +70,12 @@ fn unicode_is(table: &[(u32, u32, u32)], ch: u32) -> bool {
 /// Go `unicode.ToLower(ch)` (simple case mapping).
 // PORT: Rust only exposes full case mapping; when it yields several chars
 // (only U+0130) Go's simple mapping equals the first one.
+// PERF: an ASCII char maps with a table-free test; `to_lowercase` looks up
+// the Unicode tables.
 fn unicode_to_lower(ch: char) -> char {
+    if ch.is_ascii() {
+        return ch.to_ascii_lowercase();
+    }
     ch.to_lowercase().next().unwrap_or(ch)
 }
 
@@ -581,6 +586,10 @@ fn get_spelling_suggestion_unexported<T: Clone + Default, S: AsRef<str>>(
     let mut best_candidate = T::default();
     let mut has_best = false;
     let mut checked_candidates = 0;
+    // PERF: one rune buffer and one Levenshtein buffer pair for the whole
+    // call, as Go's `levenshteinBuffersPool`, not 3 `Vec`s per candidate.
+    let mut candidate_runes: Vec<char> = Vec::new();
+    let mut buffers = LevenshteinBuffers::default();
     for candidate in candidates {
         checked_candidates += 1;
         if max_candidates > 0 && checked_candidates > max_candidates {
@@ -596,13 +605,19 @@ fn get_spelling_suggestion_unexported<T: Clone + Default, S: AsRef<str>>(
             if candidate_name == name {
                 continue;
             }
-            let candidate_runes: Vec<char> = go_runes(candidate_name);
+            candidate_runes.clear();
+            if contains_go_string_marker(candidate_name) {
+                candidate_runes.extend(go_runes(candidate_name));
+            } else {
+                candidate_runes.extend(candidate_name.chars());
+            }
             // Only consider candidates less than 3 characters long when they differ by case.
             // Otherwise, don't bother, since a user would usually notice differences of a 2-character name.
             if candidate_len < 3 && !equal_fold(&candidate_runes, &rune_name) {
                 continue;
             }
-            let distance = levenshtein_with_max(&rune_name, &candidate_runes, best_distance);
+            let distance =
+                levenshtein_with_max(&mut buffers, &rune_name, &candidate_runes, best_distance);
             if distance < 0.0 {
                 continue;
             }
@@ -637,12 +652,28 @@ pub fn get_spelling_suggestion_for_strings(
     )
 }
 
-// Go: core/core.go:613 levenshteinWithMax
-// PORT: the Go `sync.Pool` buffers are replaced by local vectors.
-fn levenshtein_with_max(s1: &[char], s2: &[char], max_value: f64) -> f64 {
+// Go: core/core.go:639 levenshteinBuffers
+// PORT: Go keeps them in a `sync.Pool`; one `get_spelling_suggestion` call
+// owns one.
+#[derive(Default)]
+struct LevenshteinBuffers {
+    previous: Vec<f64>,
+    current: Vec<f64>,
+}
+
+// Go: core/core.go:650 levenshteinWithMax
+fn levenshtein_with_max(
+    buffers: &mut LevenshteinBuffers,
+    s1: &[char],
+    s2: &[char],
+    max_value: f64,
+) -> f64 {
     let buffer_size = s2.len() + 1;
-    let mut previous = vec![0f64; buffer_size];
-    let mut current = vec![0f64; buffer_size];
+    // Each row writes every slot of `current`, so old values are never read.
+    buffers.previous.resize(buffer_size, 0.0);
+    buffers.current.resize(buffer_size, 0.0);
+    let mut previous = &mut buffers.previous[..];
+    let mut current = &mut buffers.current[..];
 
     let big = max_value + 0.01;
     for (i, slot) in previous.iter_mut().enumerate() {
@@ -650,6 +681,7 @@ fn levenshtein_with_max(s1: &[char], s2: &[char], max_value: f64) -> f64 {
     }
     for i in 1..=s1.len() {
         let c1 = s1[i - 1];
+        let c1_lower = unicode_to_lower(c1);
         let min_j = ((i as f64 - max_value).ceil() as i64).max(1) as usize;
         let max_j = ((max_value + i as f64).floor() as i64).min(s2.len() as i64);
         let mut col_min = i as f64;
@@ -660,12 +692,11 @@ fn levenshtein_with_max(s1: &[char], s2: &[char], max_value: f64) -> f64 {
         let mut j = min_j as i64;
         while j <= max_j {
             let ju = j as usize;
-            let substitution_distance =
-                if unicode_to_lower(s1[i - 1]) == unicode_to_lower(s2[ju - 1]) {
-                    previous[ju - 1] + 0.1
-                } else {
-                    previous[ju - 1] + 2.0
-                };
+            let substitution_distance = if c1_lower == unicode_to_lower(s2[ju - 1]) {
+                previous[ju - 1] + 0.1
+            } else {
+                previous[ju - 1] + 2.0
+            };
             let dist = if c1 == s2[ju - 1] {
                 previous[ju - 1]
             } else {
@@ -23468,6 +23499,7 @@ mod tests {
         go_unit_cut_at, go_value, go_value_from_bytes, is_line_break, port_byte_offset, utf16_len,
         utf16_len_of_range,
     };
+    use super::{LevenshteinBuffers, levenshtein_with_max};
 
     /// Go (WTF-8) bytes of a rune, as Go `EncodeJSStringRune` writes it.
     fn go_bytes(ch: u32) -> Vec<u8> {
@@ -23859,6 +23891,36 @@ mod tests {
                 line_starts_by_char(&text),
                 "{text:?}"
             );
+        }
+    }
+
+    /// One buffer pair used for many pairs, longer then shorter, gives the
+    /// distances that new buffers give.
+    #[test]
+    fn levenshtein_reused_buffers_match_new_buffers() {
+        let words = [
+            "getSpellingSuggestion",
+            "getSpelingSugestion",
+            "GETSPELLINGSUGGESTION",
+            "spelling",
+            "Spellings",
+            "x",
+            "",
+            "\u{c9}t\u{e9}",
+            "\u{e9}t\u{c9}s",
+        ];
+        let mut reused = LevenshteinBuffers::default();
+        for a in words {
+            for b in words {
+                let a: Vec<char> = a.chars().collect();
+                let b: Vec<char> = b.chars().collect();
+                for max_value in [0.9, 2.9, 8.9, 30.0] {
+                    let fresh =
+                        levenshtein_with_max(&mut LevenshteinBuffers::default(), &a, &b, max_value);
+                    let again = levenshtein_with_max(&mut reused, &a, &b, max_value);
+                    assert_eq!(fresh.to_bits(), again.to_bits(), "{a:?} {b:?} {max_value}");
+                }
+            }
         }
     }
 }
