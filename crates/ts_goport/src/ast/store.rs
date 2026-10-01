@@ -6946,6 +6946,53 @@ mod tests {
         assert!(file_block(FILE_ID_LIMIT).is_none(), "no file id");
     }
 
+    // tscbpar1 (D4): two `tsc -b` builder threads build stores at the same
+    // time, each in its own run of ids, and both publish. The thread that
+    // reserved last gives back the unused ids of its run, so the next
+    // builder continues after the highest published id. It publishes, so no
+    // other test may build or publish stores while it runs (the runner uses
+    // one thread).
+    #[test]
+    fn builder_threads_publish_disjoint_id_runs() {
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let builder = |a_name: &'static str, b_name: &'static str| {
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                reserve_file_ids();
+                let a = new_file_store(a_name, "a;");
+                freeze_file_store(a);
+                // Both threads hold a run before either makes its next store.
+                barrier.wait();
+                let b = new_file_store(b_name, "b;");
+                freeze_file_store(b);
+                barrier.wait();
+                crate::program::publish_parsed_files("/");
+                (a, b)
+            })
+        };
+        let x = builder("/runs/xa.ts", "/runs/xb.ts");
+        let y = builder("/runs/ya.ts", "/runs/yb.ts");
+        let (xa, xb) = x.join().unwrap();
+        let (ya, yb) = y.join().unwrap();
+        assert_eq!(
+            (xb, yb),
+            (xa + 1, ya + 1),
+            "a builder's ids are consecutive"
+        );
+        assert!(xa.abs_diff(ya) >= ID_RUN, "the runs do not overlap");
+        for (file, text) in [(xa, "a;"), (xb, "b;"), (ya, "a;"), (yb, "b;")] {
+            assert!(is_published(file), "file {file} is published");
+            assert_eq!(file_store_text(file), text);
+        }
+        let next = std::thread::spawn(|| {
+            reserve_file_ids();
+            new_file_store("/runs/next.ts", "c;")
+        })
+        .join()
+        .unwrap();
+        assert_eq!(next, xb.max(yb) + 1, "the unused ids went back");
+    }
+
     // textleak1 A1: a publish keeps the emptied cells of its build stores,
     // and the next build store of the thread reuses one, so a language
     // server edit leaks no store cell in the AST arena.
