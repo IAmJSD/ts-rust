@@ -1170,9 +1170,10 @@ impl Checker {
         let bound_symbols = crate::program::bound_symbols().for_checker();
         let compiler_options = &program.options;
         let files: Vec<Node> = program.source_files().map(|f| f.root).collect();
-        // PERF: the room of the reserved type arena head (`ReservedArena`),
-        // one type for each node of the program. Hono makes 0.39 types a
-        // node in `--singleThreaded`, effect 0.33 and zod 0.65.
+        // PERF: the reserved room of the type arena (`ReservedArena`), one
+        // type for each node of the program. In `--singleThreaded` hono makes
+        // 0.39 types a node, effect 0.33 and zod 0.65; elysia makes 7.1, and
+        // its arena doubles after the room.
         let type_reserve: usize = program.source_files().map(|f| f.parser_flags.len()).sum();
         let file_index_map = create_file_index_map(&files);
         let mut c = Checker {
