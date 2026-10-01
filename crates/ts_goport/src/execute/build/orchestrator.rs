@@ -75,7 +75,7 @@ use crate::gostd::Context;
 // PORT: testing
 use crate::execute::tsc::compile::CommandLineTesting;
 use std::collections::VecDeque;
-use std::sync::{Arc, Condvar, Mutex, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError};
 use std::time::SystemTime;
 
 // Go: build/orchestrator.go:27 Options
@@ -1564,9 +1564,9 @@ enum Rebuild {
 /// PORT: not in Go (perf). The rebuilds that the build info threads
 /// forecast for the tasks of a build (`Rebuild`), for
 /// `Orchestrator::uses_builders`. Builders gain only where the loads of
-/// two or more tasks run at the same time and little is checked. A thread
-/// reads the mtimes of a task's files before the parse of its build info,
-/// so a changed input is known early (`unchanged_inputs`).
+/// two or more tasks run at the same time and little is checked. A changed
+/// input shows in the mtimes alone (`unchanged_inputs`), so it is known
+/// before a large build info is parsed.
 struct RebuildForecast {
     state: Mutex<ForecastState>,
     changed: Condvar,
@@ -1596,8 +1596,7 @@ impl RebuildForecast {
         }
     }
 
-    /// The mtimes of a read: `unchanged` when no input is newer than its
-    /// build info.
+    /// The mtimes of a read (`unchanged_inputs`).
     fn add_mtimes(&self, unchanged: bool) {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         state.unstated -= 1;
@@ -1682,10 +1681,10 @@ impl Drop for ReadySignal {
 impl BuildInfoPrefetch {
     /// Starts reading and parsing the files of `reads`, in order, on the
     /// threads of `pool` (at most one per file), and puts the mtimes they
-    /// read into `m_times`. With `forecast`, each thread also forecasts the
-    /// rebuild of the task of each file it reads: it reads the mtimes of
-    /// the task's files before the parse (`unchanged_inputs`), and the
-    /// build info then tells the rest (`forecast_rebuild`).
+    /// read into `m_times`. With `forecast`, the threads also forecast the
+    /// rebuild of each task: after the parses, a second job per file reads
+    /// the mtimes of its task's files (`unchanged_inputs`), and each parse
+    /// tells the rest (`forecast_rebuild`).
     // PORT: the threads only read, so their count changes no output; it
     // is not Go's `numRoutines`.
     fn start(
@@ -1695,87 +1694,54 @@ impl BuildInfoPrefetch {
         m_times: MTimePrefetch,
         forecast: Option<Arc<RebuildForecast>>,
     ) -> Self {
-        let slots: Vec<(String, Arc<BuildInfoSlot>)> = reads
-            .iter()
-            .map(|read| (read.name.clone(), Arc::default()))
+        let reads: Vec<Arc<PrefetchRead>> = reads
+            .into_iter()
+            .map(|read| {
+                Arc::new(PrefetchRead {
+                    read,
+                    slot: Arc::default(),
+                    roots: OnceLock::new(),
+                })
+            })
             .collect();
-        let queue = Mutex::new(
-            reads
-                .into_iter()
-                .zip(slots.iter().map(|(_, slot)| slot.clone()))
-                .collect::<Vec<_>>()
-                .into_iter(),
-        );
+        let slots = reads
+            .iter()
+            .map(|read| (read.read.name.clone(), read.slot.clone()))
+            .collect();
+        let mut jobs: Vec<PrefetchJob> = reads.iter().cloned().map(PrefetchJob::Parse).collect();
+        if forecast.is_some() {
+            jobs.extend(reads.iter().cloned().map(PrefetchJob::Mtimes));
+        }
+        let threads = pool.threads().min(reads.len());
+        let queue = Mutex::new(jobs.into_iter());
         let thread_forecast = forecast.clone();
-        pool.run(pool.threads().min(slots.len()), move || {
+        pool.run(threads, move || {
             let fs = crate::frontend::bundled::wrap_fs(crate::frontend::vfs::osvfs_fs());
             loop {
                 let next = queue.lock().unwrap_or_else(PoisonError::into_inner).next();
-                let Some((read, slot)) = next else {
-                    break;
-                };
-                // With a forecast, the mtimes of the task's files come
-                // first, so a changed input is known early.
-                let inputs = thread_forecast.as_ref().map(|forecast| {
-                    let inputs = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        unchanged_inputs(&*fs, &read)
-                    }))
-                    .ok()
-                    .flatten();
-                    forecast.add_mtimes(inputs.is_some());
-                    inputs
-                });
-                let root_times = inputs
-                    .as_ref()
-                    .and_then(Option::as_ref)
-                    .map(|inputs| inputs.roots.as_slice());
-                // A read that panics is left to the task, which panics on
-                // it too.
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    let (data, ok) = fs.read_file(&read.name);
-                    let build_info = if ok { parse_build_info(&data) } else { None };
-                    let early = build_info
-                        .as_ref()
-                        .map(|build_info| read.check.early_return(build_info));
-                    // A check that returns before the input mtimes reads
-                    // neither the check parts nor the mtimes.
-                    let mut sources = None;
-                    let status = build_info
-                        .as_ref()
-                        .filter(|_| early == Some(EarlyReturn::No))
-                        .map(|build_info| {
-                            let status = StatusPrefetch::new(
-                                build_info,
-                                &read.name,
-                                &read.input_files,
-                                &compare_paths_options,
-                            );
-                            sources =
-                                Some(prefetch_m_times(&*fs, &read, &status, &m_times, root_times));
-                            status
-                        });
-                    ((build_info, status), early, sources)
-                }));
-                let (result, rebuild) = match result {
-                    Ok((result, early, sources)) => {
-                        let rebuild = inputs.flatten().map_or(Rebuild::Heavy, |inputs| {
-                            forecast_rebuild(early, sources, inputs.build_info_time)
-                        });
-                        (Some(result), rebuild)
+                match next {
+                    None => break,
+                    Some(PrefetchJob::Parse(read)) => parse_build_info_job(
+                        &*fs,
+                        &read,
+                        &compare_paths_options,
+                        &m_times,
+                        thread_forecast.as_deref(),
+                    ),
+                    Some(PrefetchJob::Mtimes(read)) => {
+                        let unchanged =
+                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                unchanged_inputs(&*fs, &read)
+                            }))
+                            .unwrap_or(false);
+                        if let Some(forecast) = &thread_forecast {
+                            forecast.add_mtimes(unchanged);
+                        }
                     }
-                    Err(_) => (None, Rebuild::Heavy),
-                };
-                *slot.result.lock().unwrap_or_else(PoisonError::into_inner) = Some(result);
-                slot.done.notify_all();
-                if let Some(forecast) = &thread_forecast {
-                    forecast.add_parse(rebuild);
                 }
             }
         });
-        BuildInfoPrefetch {
-            slots: slots.into_iter().collect(),
-            forecast,
-        }
+        BuildInfoPrefetch { slots, forecast }
     }
 
     /// The build info of `name` that a thread read, and its check parts,
@@ -1806,6 +1772,109 @@ impl BuildInfoPrefetch {
     }
 }
 
+/// One build info file of a `BuildInfoPrefetch`, and what its two jobs
+/// share.
+struct PrefetchRead {
+    read: BuildInfoRead,
+    slot: Arc<BuildInfoSlot>,
+    /// With a forecast: the mtimes of the root files, in order, read once
+    /// by the first of the two jobs that needs them (`root_m_times`).
+    roots: OnceLock<Vec<Option<SystemTime>>>,
+}
+
+/// A job of the build info threads. The parses come first, in build order,
+/// so a forecast does not delay them.
+enum PrefetchJob {
+    /// Read and parse the build info, make its check parts and read the
+    /// mtimes that the check reads; with a forecast, then forecast the
+    /// rebuild from the build info (`forecast_rebuild`).
+    Parse(Arc<PrefetchRead>),
+    /// For a forecast: read the mtimes of the build info, config and root
+    /// files (`unchanged_inputs`).
+    Mtimes(Arc<PrefetchRead>),
+}
+
+/// The parse job of `read` (`PrefetchJob::Parse`).
+fn parse_build_info_job(
+    fs: &dyn Fs,
+    read: &PrefetchRead,
+    compare_paths_options: &ComparePathsOptions,
+    m_times: &MTimePrefetch,
+    forecast: Option<&RebuildForecast>,
+) {
+    let roots = forecast.map(|_| read.roots_cell());
+    // A read that panics is left to the task, which panics on it too.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let read = &read.read;
+        let (data, ok) = fs.read_file(&read.name);
+        let build_info = if ok { parse_build_info(&data) } else { None };
+        let early = build_info
+            .as_ref()
+            .map(|build_info| read.check.early_return(build_info));
+        // A check that returns before the input mtimes reads neither the
+        // check parts nor the mtimes.
+        let mut sources = None;
+        let status = build_info
+            .as_ref()
+            .filter(|_| early == Some(EarlyReturn::No))
+            .map(|build_info| {
+                let status = StatusPrefetch::new(
+                    build_info,
+                    &read.name,
+                    &read.input_files,
+                    compare_paths_options,
+                );
+                sources = Some(prefetch_m_times(fs, read, &status, m_times, roots));
+                status
+            });
+        let rebuild = forecast.map(|_| forecast_rebuild(fs, read, early, sources));
+        ((build_info, status), rebuild)
+    }));
+    let (result, rebuild) = match result {
+        Ok((result, rebuild)) => (Some(result), rebuild),
+        Err(_) => (None, Some(Rebuild::Heavy)),
+    };
+    *read
+        .slot
+        .result
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner) = Some(result);
+    read.slot.done.notify_all();
+    if let Some(forecast) = forecast {
+        forecast.add_parse(rebuild.unwrap_or(Rebuild::Heavy));
+    }
+}
+
+impl PrefetchRead {
+    /// The shared root mtimes, for `root_m_times`.
+    fn roots_cell(&self) -> RootTimes<'_> {
+        RootTimes {
+            files: &self.read.input_files,
+            times: &self.roots,
+        }
+    }
+}
+
+/// The root files of a read and their shared mtimes (`PrefetchRead::roots`).
+#[derive(Clone, Copy)]
+struct RootTimes<'a> {
+    files: &'a [String],
+    times: &'a OnceLock<Vec<Option<SystemTime>>>,
+}
+
+impl<'a> RootTimes<'a> {
+    /// The mtimes of the root files, in order: read now by the first job
+    /// that asks; a job that asks while another reads them waits for it.
+    fn root_m_times(self, fs: &dyn Fs) -> &'a [Option<SystemTime>] {
+        self.times.get_or_init(|| {
+            self.files
+                .iter()
+                .map(|file| fs.stat(file).and_then(|stat| stat.mod_time()))
+                .collect()
+        })
+    }
+}
+
 /// The newest of some mtimes, and whether a file had none.
 #[derive(Clone, Copy, Default)]
 struct NewestTime {
@@ -1830,16 +1899,17 @@ impl NewestTime {
 /// `read` (its root files and the files of its build info, `status`) into
 /// `m_times`, as `BuildHost::get_m_time` reads them (`incremental.GetMTime`).
 /// Each path is read once: the build info lists the root files too, and the
-/// check keeps the first mtime of a path. `root_times`: the mtimes of the
-/// root files, in order, when a forecast read them (`unchanged_inputs`).
-/// Returns the newest mtime read.
+/// check keeps the first mtime of a path. With a forecast, the root mtimes
+/// come from `roots`, which the mtimes job of the read shares. Returns the
+/// newest mtime read.
 fn prefetch_m_times(
     fs: &dyn Fs,
     read: &BuildInfoRead,
     status: &StatusPrefetch,
     m_times: &MTimePrefetch,
-    root_times: Option<&[SystemTime]>,
+    roots: Option<RootTimes<'_>>,
 ) -> NewestTime {
+    let root_times = roots.map(|roots| roots.root_m_times(fs));
     let roots = read
         .input_files
         .iter()
@@ -1859,7 +1929,7 @@ fn prefetch_m_times(
         .chain(files)
         .filter(|(file, path, _)| is_typescript_source(file) && seen.insert(path))
         .map(|(file, path, known)| {
-            let m_time = known.or_else(|| fs.stat(file).and_then(|stat| stat.mod_time()));
+            let m_time = known.unwrap_or_else(|| fs.stat(file).and_then(|stat| stat.mod_time()));
             (path.clone(), m_time)
         })
         .collect();
@@ -1872,63 +1942,56 @@ fn prefetch_m_times(
     newest
 }
 
-/// PORT: not in Go (perf). What a forecast reads before the parse of a
-/// build info (`RebuildForecast`): the mtime of the build info and the
-/// mtimes of the root files of its task, in order, when no root or config
-/// file is newer than the build info (`unchanged_inputs`).
-struct UnchangedInputs {
-    build_info_time: SystemTime,
-    roots: Vec<SystemTime>,
-}
-
-/// The mtimes of the build info of `read`, of its config files and of its
-/// root files (all of them where Go's check reads none: the check of a
-/// light rebuild returns first). None when the build info is missing, or
-/// a file is missing or newer than the build info: then the task builds
-/// with changed inputs. It stops at the first such file.
-fn unchanged_inputs(fs: &dyn Fs, read: &BuildInfoRead) -> Option<UnchangedInputs> {
+/// PORT: not in Go (perf). The mtimes job of a forecast
+/// (`PrefetchJob::Mtimes`): true when the build info of `read` exists and
+/// no config or root file of its task is missing or newer than it. Else the
+/// task builds with changed inputs. Go's check of a light rebuild reads no
+/// root mtime (it returns first); the forecast reads them all, on a thread.
+fn unchanged_inputs(fs: &dyn Fs, read: &PrefetchRead) -> bool {
     let m_time = |file: &str| fs.stat(file).and_then(|stat| stat.mod_time());
-    let build_info_time = m_time(&read.name)?;
-    let unchanged = |file: &str| m_time(file).filter(|m_time| *m_time <= build_info_time);
-    for file in &read.config_files {
-        unchanged(file)?;
-    }
-    let roots = read
-        .input_files
+    let Some(build_info_time) = m_time(&read.read.name) else {
+        return false;
+    };
+    let unchanged =
+        |m_time: Option<SystemTime>| m_time.is_some_and(|m_time| m_time <= build_info_time);
+    read.read
+        .config_files
         .iter()
-        .map(|file| unchanged(file))
-        .collect::<Option<Vec<_>>>()?;
-    Some(UnchangedInputs {
-        build_info_time,
-        roots,
-    })
+        .all(|file| unchanged(m_time(file)))
+        && read
+            .roots_cell()
+            .root_m_times(fs)
+            .iter()
+            .all(|root| unchanged(*root))
 }
 
-/// PORT: not in Go (perf). The rebuild of a task whose root and config
-/// files are not newer than its build info (`unchanged_inputs`), whose
-/// build info was last written at `build_info_time`. `early` is where the
-/// task's check returns before it reads the input mtimes (`None`: no build
-/// info), and `sources` the newest of the TypeScript source mtimes that the
-/// thread read for a check that reads them (`prefetch_m_times`, which also
-/// covers the files of the build info that are not root files).
+/// PORT: not in Go (perf). The rebuild of the task of `read` as its build
+/// info tells (`Rebuild`; the mtimes job finds changed root and config
+/// files). `early` is where the task's check returns before it reads the
+/// input mtimes (`None`: no build info), and `sources` the newest of the
+/// TypeScript source mtimes that the thread read for a check that reads
+/// them (`prefetch_m_times`, which also covers the files of the build info
+/// that are not root files).
 /// The forecast misses a change that only Go's later parts of the check
 /// see (a package.json file, an upstream output), or, for a light rebuild,
 /// a changed file of the build info that is not a root file. Such a task
 /// compiles on a builder thread with the same output.
 fn forecast_rebuild(
+    fs: &dyn Fs,
+    read: &BuildInfoRead,
     early: Option<EarlyReturn>,
     sources: Option<NewestTime>,
-    build_info_time: SystemTime,
 ) -> Rebuild {
     match early {
         None | Some(EarlyReturn::OutOfDate) => Rebuild::Heavy,
         Some(EarlyReturn::ErrorsOrPendingEmit) => Rebuild::Light,
         Some(EarlyReturn::No) => {
-            if sources.is_some_and(|sources| sources.newer_than(build_info_time)) {
-                Rebuild::Heavy
-            } else {
-                Rebuild::None
-            }
+            let build_info_time = fs.stat(&read.name).and_then(|stat| stat.mod_time());
+            let newer = match (sources, build_info_time) {
+                (Some(sources), Some(time)) => sources.newer_than(time),
+                _ => true,
+            };
+            if newer { Rebuild::Heavy } else { Rebuild::None }
         }
     }
 }
@@ -1990,4 +2053,35 @@ pub fn new_orchestrator(opts: Options) -> Orchestrator {
         ));
     }
     orchestrator
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `RebuildForecast::light`: builders start only with no heavy rebuild
+    /// and two or more light ones.
+    #[test]
+    fn rebuild_forecast_needs_two_light_rebuilds_and_no_heavy_one() {
+        let forecast = |mtimes: &[bool], parses: &[Rebuild]| {
+            let forecast = RebuildForecast::new(3);
+            mtimes
+                .iter()
+                .for_each(|&unchanged| forecast.add_mtimes(unchanged));
+            parses
+                .iter()
+                .for_each(|&rebuild| forecast.add_parse(rebuild));
+            forecast.light()
+        };
+        let unchanged = [true; 3];
+        // Two light rebuilds decide before the third build info is parsed.
+        assert!(forecast(&unchanged, &[Rebuild::Light, Rebuild::Light]));
+        assert!(!forecast(
+            &unchanged,
+            &[Rebuild::Light, Rebuild::None, Rebuild::None]
+        ));
+        assert!(!forecast(&unchanged, &[Rebuild::Light, Rebuild::Heavy]));
+        // A changed input decides before any parse.
+        assert!(!forecast(&[true, false], &[]));
+    }
 }
