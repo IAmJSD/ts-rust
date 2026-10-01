@@ -962,9 +962,15 @@ impl Orchestrator {
                         if !in_build_order
                             && self.first_task_uses_builder(builders_setting, &task.borrow())
                         {
-                            builders = self.start_builders(num_routines, &ready);
+                            // A forecast that is known already decides for
+                            // every task now.
+                            later_on_builders =
+                                self.known_later_tasks_use_builders(builders_setting);
+                            if later_on_builders != Some(false) {
+                                builders = self.start_builders(num_routines, &ready);
+                            }
                         }
-                        if builders.is_none() {
+                        if builders.is_none() || later_on_builders.is_some() {
                             self.end_forecast();
                         }
                     } else if let Some(builders) = &builders
@@ -1187,6 +1193,20 @@ impl Orchestrator {
                 .borrow()
                 .as_ref()
                 .is_some_and(BuildInfoPrefetch::light_rebuilds),
+        }
+    }
+
+    /// PORT: not in Go (perf). `later_tasks_use_builders` when the forecast
+    /// is known without a wait, else None.
+    fn known_later_tasks_use_builders(&self, setting: BuildersSetting) -> Option<bool> {
+        match setting {
+            BuildersSetting::Off => Some(false),
+            BuildersSetting::Always => Some(true),
+            BuildersSetting::Light => self
+                .build_info_prefetch
+                .borrow()
+                .as_ref()
+                .map_or(Some(false), BuildInfoPrefetch::known_light_rebuilds),
         }
     }
 
@@ -1645,6 +1665,20 @@ struct ForecastState {
     heavy: bool,
 }
 
+impl ForecastState {
+    /// `RebuildForecast::light` from what is known now, or None when it
+    /// waits.
+    fn light_now(&self) -> Option<bool> {
+        if self.heavy || (self.light < 2 && self.unclassed == 0) {
+            Some(false)
+        } else if self.light >= 2 && self.unstated == 0 {
+            Some(true)
+        } else {
+            None
+        }
+    }
+}
+
 impl RebuildForecast {
     fn new(reads: usize) -> Self {
         RebuildForecast {
@@ -1707,17 +1741,22 @@ impl RebuildForecast {
     fn light(&self) -> bool {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         loop {
-            if state.heavy || (state.light < 2 && state.unclassed == 0) {
-                return false;
-            }
-            if state.light >= 2 && state.unstated == 0 {
-                return true;
+            if let Some(light) = state.light_now() {
+                return light;
             }
             state = self
                 .changed
                 .wait(state)
                 .unwrap_or_else(PoisonError::into_inner);
         }
+    }
+
+    /// `light` when it would not wait, else None.
+    fn known_light(&self) -> Option<bool> {
+        self.state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .light_now()
     }
 }
 
@@ -1857,6 +1896,13 @@ impl BuildInfoPrefetch {
         self.forecast
             .as_ref()
             .is_some_and(|forecast| forecast.light())
+    }
+
+    /// `light_rebuilds` when the threads know it already, else None.
+    fn known_light_rebuilds(&self) -> Option<bool> {
+        self.forecast
+            .as_ref()
+            .map_or(Some(false), |forecast| forecast.known_light())
     }
 
     /// The orchestrator made its decision: the forecast reads nothing more
