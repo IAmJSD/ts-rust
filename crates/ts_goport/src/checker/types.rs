@@ -2706,8 +2706,7 @@ pub type StringLiteralType = Type;
 // copies every entry when it grows, and keeps up to half its capacity unused.
 // `ChunkedArena` stores entries in chunks of `ARENA_CHUNK_LEN`, so growing it
 // never moves an entry of a later chunk. Index 0 is the nil dummy, like the
-// other arenas. The mappers use it; the types use `ReservedArena`, which
-// uses the same memory until a program makes many types.
+// other arenas. The mappers use it; the types use `ReservedArena`.
 //
 // PERF (rss2): the first chunk starts at `ARENA_FIRST_CAPACITY` entries. It
 // doubles up to `ARENA_CHUNK_STEP` entries, then grows in steps of as many
@@ -2763,15 +2762,6 @@ impl<T> ChunkedArena<T> {
 
     pub fn is_empty(&self) -> bool {
         self.len == 0
-    }
-
-    /// Moves every entry, in order, to the end of `out`, and frees the
-    /// chunks. The arena is empty after.
-    fn move_into(&mut self, out: &mut Vec<T>) {
-        for mut chunk in self.chunks.drain(..) {
-            out.append(&mut chunk);
-        }
-        self.len = 0;
     }
 
     // PERF: always inlined, so the caller builds `value` straight in its
@@ -2855,33 +2845,35 @@ impl<T> std::ops::IndexMut<usize> for ChunkedArena<T> {
 }
 
 // PORT: no Go counterpart. The type arena: the entries from 0 are in one
-// `Vec` (`head`), and the entries after a full head in a `ChunkedArena`
-// (`tail`).
+// `Vec` (`head`), and the entries after a full reserved head in a
+// `ChunkedArena` (`tail`).
 //
 // PERF (typestore1 step 3, typearena2): a read of a head entry is one bounds
 // test and one base pointer. A `ChunkedArena` read is the chunk table and
 // then the chunk: 2 bounds tests and 2 dependent loads, and `ty()` runs
 // about 70M times on an effect check.
 //
-// Until the arena has `RESERVE_AT` entries, it uses the memory of a
-// `ChunkedArena`: the head grows like its first chunk to `ARENA_CHUNK_LEN`
-// entries, and the tail chunks are its later chunks. The entry at
-// `RESERVE_AT` moves all entries to a new head with room for `reserve`
-// entries, which never grows again. A program that makes fewer types than
-// `RESERVE_AT` per checker (query core: 12,007 in `--singleThreaded`)
-// keeps the memory it had. A head made at its final size for every
-// program cost query 3.3 MiB of RSS: jemalloc gives it huge pages, and the
-// last one is only partly used. Memory of the head that is never written
-// is never resident.
+// The head grows like the first chunk of a `ChunkedArena` to
+// `ARENA_CHUNK_LEN` entries, then doubles to `RESERVE_AT`. When that is
+// full, it grows once to the reserved room and never again. A program that
+// makes fewer types than `RESERVE_AT` per checker (query core: 12,007 in
+// `--singleThreaded`) never gets the reserved head. A head made with the
+// reserved room for every program cost query 3.3 MiB of RSS (typestore1):
+// jemalloc gives it huge pages, and the last one is only partly used.
+// Reserved room that is never written is never resident.
+//
+// The tail is empty until the reserved head is full, so reads take the head
+// branch. A tail read next to head reads makes the branch mispredict
+// (typearena2 v1, a tail after 8,192 entries: query check +0.8%).
 pub struct ReservedArena<T> {
     head: Vec<T>,
     tail: ChunkedArena<T>,
-    /// The room of the head that the entry at `RESERVE_AT` makes. 0 after.
+    /// The room of the reserved head. 0 once the head has it.
     reserve: usize,
 }
 
-/// The entry count at which the arena takes its reserved head: 4 chunks
-/// (4 MiB of `Type`), above the 12,007 types of query core.
+/// The head room after which the next entry takes the reserved head: 4 MiB
+/// of `Type`, above the 12,007 types of query core.
 const RESERVE_AT: usize = 4 * ARENA_CHUNK_LEN;
 /// The largest reserved head: 256 MiB of `Type`. A program that makes more
 /// types per checker puts the rest in the tail.
@@ -2889,8 +2881,8 @@ const RESERVE_MAX: usize = 1 << 21;
 
 impl<T> ReservedArena<T> {
     /// Creates an arena that holds only `nil`, the dummy entry at index 0.
-    /// `reserve` is the head room to take at `RESERVE_AT` entries; it is
-    /// kept between `2 * RESERVE_AT` and `RESERVE_MAX`.
+    /// `reserve` is the room of the reserved head; it is kept between
+    /// `2 * RESERVE_AT` and `RESERVE_MAX`.
     pub fn with_nil(nil: T, reserve: usize) -> Self {
         let mut head = Vec::with_capacity(ARENA_FIRST_CAPACITY);
         head.push(nil);
@@ -2921,19 +2913,19 @@ impl<T> ReservedArena<T> {
         self.head.push(make());
     }
 
-    /// Pushes when the head is full: the head grows while it is smaller
-    /// than a chunk, the entry at `RESERVE_AT` takes the reserved head, and
-    /// all other entries go to the tail.
+    /// Pushes when the head is full: the head grows (as a first chunk, then
+    /// doubles to `RESERVE_AT`, then to the reserved room), or the entry goes
+    /// to the tail after the reserved head.
     #[cold]
     #[inline(never)]
     fn push_full(&mut self, make: impl FnOnce() -> T) {
-        if self.tail.is_empty() && self.head.capacity() < ARENA_CHUNK_LEN {
+        let capacity = self.head.capacity();
+        if capacity < ARENA_CHUNK_LEN {
             grow_chunk(&mut self.head);
-        } else if self.reserve != 0 && self.len() == RESERVE_AT {
-            let mut head = Vec::with_capacity(self.reserve);
-            head.append(&mut self.head);
-            self.tail.move_into(&mut head);
-            self.head = head;
+        } else if capacity < RESERVE_AT {
+            self.head.reserve_exact(capacity);
+        } else if self.reserve != 0 {
+            self.head.reserve_exact(self.reserve - capacity);
             self.reserve = 0;
         } else {
             self.tail.push_with(make);
@@ -2982,8 +2974,8 @@ impl<T> std::ops::IndexMut<usize> for ReservedArena<T> {
 mod tests {
     use super::{ARENA_CHUNK_LEN, RESERVE_AT, ReservedArena};
 
-    /// Entries keep their index and value through the head growth, the tail,
-    /// the move to the reserved head and the tail after a full reserved head.
+    /// Entries keep their index and value through every growth of the head,
+    /// the reserved head and the tail after it.
     #[test]
     fn reserved_arena_keeps_entries_through_every_stage() {
         let mut arena = ReservedArena::with_nil(u32::MAX, 0);
@@ -2993,11 +2985,12 @@ mod tests {
             arena.push_with(|| value);
             assert_eq!(arena.len(), i + 1);
             if i == ARENA_CHUNK_LEN {
-                assert_eq!(arena.head.capacity(), ARENA_CHUNK_LEN);
-                assert_eq!(arena.tail.len(), 1);
+                assert_eq!(arena.head.capacity(), 2 * ARENA_CHUNK_LEN);
             }
             if i == RESERVE_AT {
-                assert_eq!(arena.head.len(), RESERVE_AT + 1);
+                assert_eq!(arena.head.capacity(), 2 * RESERVE_AT);
+            }
+            if i < 2 * RESERVE_AT {
                 assert!(arena.tail.is_empty());
             }
         }
