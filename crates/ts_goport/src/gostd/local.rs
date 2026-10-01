@@ -9,11 +9,18 @@
 //! became ready: a job when it is queued, a timer when it is due.
 //!
 //! Contract with the dispatch loop: the server calls `set_waker(f)` once. A
-//! timer thread calls the waker when a `LocalTimer` becomes due. The
+//! timer thread calls the waker when a `LocalTimer` becomes due. Each
+//! thread that arms a `LocalTimer` gets one timer thread for all its timers,
+//! made at its first arm. It ends when that thread ends. The
 //! dispatch loop calls `run_pending()` after each message and after each
 //! wake-up. Go `WaitForBackgroundTasks` (`background::Queue::wait`) calls
 //! `run_pending()`, and `wait_pending()` while a queued task sleeps on a
 //! timer, until the queue's tasks have finished.
+//!
+//! A job that waits for another thread is `post_later(f)`: the other
+//! thread posts the `Send` handle it returns once, when its work ends, and
+//! `f` then runs in `run_pending` like a `go` job (Go: a goroutine that a
+//! channel send makes runnable). Nothing runs or polls before the post.
 //!
 //! Idle work (`go_idle`) is a second, separate queue for long work that
 //! sends nothing to the client (the auto-import warm). The dispatch loop
@@ -28,15 +35,16 @@
 //! after a message, so the free is not in the answer time. On other
 //! threads `drop_later` drops at once.
 //!
-//! The queues are per thread: `go`, `go_idle`, `after_func`, `run_pending`,
-//! `run_idle`, `drop_later` and `drop_garbage` act on the calling thread's
-//! queues.
+//! The queues are per thread: `go`, `post_later`, `go_idle`, `after_func`,
+//! `run_pending`, `run_idle`, `drop_later` and `drop_garbage` act on the
+//! calling thread's queues.
 
 use crate::prelude::*;
 
 use std::any::Any;
 use std::cell::Cell;
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -48,13 +56,79 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 /// The waker the dispatch loop installs with `set_waker`.
 pub type Waker = Arc<dyn Fn() + Send + Sync>;
 
-/// The part of a thread's queue that timer threads can reach.
+/// The part of a thread's queue that its timer thread can reach.
 struct LocalShared {
     /// Ready work in the order it became ready.
     queue: Mutex<VecDeque<Entry>>,
-    /// Signalled when a timer thread adds to `queue` (for `wait_pending`).
+    /// Signalled when the timer thread or a `Post` adds to `queue` (for
+    /// `wait_pending`).
     ready: Condvar,
     waker: Mutex<Option<Waker>>,
+    /// `Post` handles that have not posted yet. A post changes it while it
+    /// holds the `queue` lock, after it queues its job.
+    posts: AtomicUsize,
+    /// The timers of the thread. A thread that holds this lock can take
+    /// `queue`, not the other way round.
+    timers: Mutex<Timers>,
+    /// Signalled when a timer becomes the first due, and when the thread
+    /// ends (`Timers::closed`).
+    timers_changed: Condvar,
+}
+
+/// The `LocalTimer`s of one thread, for its timer thread
+/// (`run_local_timers`).
+// PERF (perfplan4 R6): one timer thread per thread, not one per timer. The
+// language server stops and makes two timers on each edit
+// (`schedule_idle_cache_clean`, `schedule_cleanup_locked`), which started
+// two threads per edit. Go `time.AfterFunc` starts no thread.
+#[derive(Default)]
+struct Timers {
+    /// Go `t.when` of each armed timer, by id.
+    when: FxHashMap<u64, Instant>,
+    /// The armed timers by `when`, then id.
+    due: BTreeSet<(Instant, u64)>,
+    /// Due entries of each timer in the queue that have not run yet.
+    queued: FxHashMap<u64, u32>,
+    /// Whether the timer thread runs.
+    thread_running: bool,
+    /// Set when the thread ends: its timer thread then ends too.
+    closed: bool,
+}
+
+impl Timers {
+    /// Arms timer `id` for `when`. Returns whether it was armed before.
+    fn arm(&mut self, id: u64, when: Instant) -> bool {
+        let old = self.when.insert(id, when);
+        if let Some(old) = old {
+            self.due.remove(&(old, id));
+        }
+        self.due.insert((when, id));
+        old.is_some()
+    }
+
+    /// Disarms timer `id`. Returns whether it was armed.
+    fn disarm(&mut self, id: u64) -> bool {
+        let old = self.when.remove(&id);
+        if let Some(old) = old {
+            self.due.remove(&(old, id));
+        }
+        old.is_some()
+    }
+
+    /// Whether timer `id` is neither armed nor queued.
+    fn idle(&self, id: u64) -> bool {
+        !self.when.contains_key(&id) && !self.queued.contains_key(&id)
+    }
+
+    /// Counts one run of a due entry of timer `id`.
+    fn unqueue(&mut self, id: u64) {
+        if let Some(count) = self.queued.get_mut(&id) {
+            *count -= 1;
+            if *count == 0 {
+                self.queued.remove(&id);
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -78,12 +152,23 @@ struct LocalState {
     garbage: RefCell<Option<VecDeque<Box<dyn Any>>>>,
 }
 
+impl Drop for LocalState {
+    // The timer thread of this thread ends with it.
+    fn drop(&mut self) {
+        lock(&self.shared.timers).closed = true;
+        self.shared.timers_changed.notify_all();
+    }
+}
+
 thread_local! {
     static LOCAL: LocalState = LocalState {
         shared: Arc::new(LocalShared {
             queue: Mutex::new(VecDeque::new()),
             ready: Condvar::new(),
             waker: Mutex::new(None),
+            posts: AtomicUsize::new(0),
+            timers: Mutex::new(Timers::default()),
+            timers_changed: Condvar::new(),
         }),
         next_id: Cell::new(1),
         jobs: RefCell::new(FxHashMap::default()),
@@ -109,6 +194,48 @@ pub fn go(f: Box<dyn FnOnce()>) {
         l.jobs.borrow_mut().insert(id, f);
         lock(&l.shared.queue).push_back(Entry::Job(id));
     });
+}
+
+/// The `Send` handle of `post_later`.
+pub struct Post {
+    id: u64,
+    shared: Arc<LocalShared>,
+}
+
+/// Go `go f()` where `f` first waits for work on another thread (a
+/// goroutine that blocks on a channel or a child process, then touches
+/// dispatch-thread state). `f` waits on this thread until the other thread
+/// calls `post` on the handle; then it is queued like a `go` job and the
+/// waker is called. Until then `wait_pending` waits for it.
+pub fn post_later(f: Box<dyn FnOnce()>) -> Post {
+    let id = next_id();
+    let shared = LOCAL.with(|l| {
+        l.jobs.borrow_mut().insert(id, f);
+        l.shared.posts.fetch_add(1, Ordering::SeqCst);
+        l.shared.clone()
+    });
+    Post { id, shared }
+}
+
+impl Post {
+    /// Queues the job on its thread, once. Dropping the handle posts it
+    /// too, so the job also runs when the other thread panics.
+    pub fn post(self) {}
+}
+
+impl Drop for Post {
+    fn drop(&mut self) {
+        {
+            let mut queue = lock(&self.shared.queue);
+            queue.push_back(Entry::Job(self.id));
+            self.shared.posts.fetch_sub(1, Ordering::SeqCst);
+            self.shared.ready.notify_all();
+        }
+        let waker = lock(&self.shared.waker).clone();
+        if let Some(waker) = waker {
+            waker();
+        }
+    }
 }
 
 /// Queues `f` as idle work on this thread. The dispatch loop runs it with
@@ -199,31 +326,30 @@ pub fn has_pending() -> bool {
 }
 
 /// Blocks until ready work waits for `run_pending`. Returns false at once
-/// when nothing is ready and no timer of this thread is armed, so nothing
-/// can become ready (only this thread arms timers).
+/// when nothing is ready, no timer of this thread is armed and no `Post`
+/// of this thread waits, so nothing can become ready (only this thread arms
+/// timers and makes posts).
 pub fn wait_pending() -> bool {
     let shared = LOCAL.with(|l| l.shared.clone());
     loop {
         if has_pending() {
             return true;
         }
-        // A timer state lock is not taken under the queue lock: the timer
+        // The timers lock is not taken under the queue lock: the timer
         // thread takes them in the other order.
-        let armed = LOCAL.with(|l| {
-            l.timers
-                .borrow()
-                .values()
-                .any(|t| lock(&t.core.state).when.is_some())
-        });
+        let armed =
+            shared.posts.load(Ordering::SeqCst) > 0 || !lock(&shared.timers).when.is_empty();
         if !armed {
             // A timer that fired after the first check cleared `when` and
-            // queued its entry under one hold of its state lock, so the
-            // entry is there now.
+            // queued its entry under one hold of the timers lock, and a post
+            // queued its job before it counted down, so the entry is there
+            // now.
             return has_pending();
         }
         let queue = lock(&shared.queue);
         if queue.is_empty() {
-            // The timeout only bounds a missed signal; a due timer signals.
+            // The timeout only bounds a missed signal; a due timer and a
+            // post signal.
             drop(shared.ready.wait_timeout(queue, Duration::from_millis(50)));
         }
     }
@@ -247,14 +373,11 @@ pub fn run_pending() {
                 }
             }
             Entry::Timer(id) => {
+                lock(&shared.timers).unqueue(id);
                 let timer = LOCAL.with(|l| l.timers.borrow().get(&id).cloned());
                 let Some(timer) = timer else {
                     continue;
                 };
-                {
-                    let mut state = lock(&timer.core.state);
-                    state.queued -= 1;
-                }
                 // Go: the goroutine that the timer started runs f.
                 {
                     let mut f = timer.f.borrow_mut();
@@ -275,24 +398,8 @@ pub struct LocalTimer {
 struct LocalTimerInner {
     id: u64,
     f: RefCell<Box<dyn FnMut()>>,
-    core: Arc<LocalTimerCore>,
-}
-
-/// The `Send` part of a `LocalTimer`, shared with its waiting thread.
-struct LocalTimerCore {
-    id: u64,
-    state: Mutex<LocalTimerState>,
-    cond: Condvar,
+    /// The queues of the thread that made the timer.
     shared: Arc<LocalShared>,
-}
-
-struct LocalTimerState {
-    /// Go `t.when`; `None` is not armed.
-    when: Option<Instant>,
-    /// Whether a thread is waiting for `when`.
-    thread_running: bool,
-    /// Due entries of this timer in the queue that have not run yet.
-    queued: u32,
 }
 
 /// Go `time.AfterFunc(d, f)` when `f` touches dispatch-thread state. After
@@ -307,16 +414,7 @@ pub fn after_func(d: Duration, f: Box<dyn FnMut()>) -> LocalTimer {
     let inner = Rc::new(LocalTimerInner {
         id,
         f: RefCell::new(f),
-        core: Arc::new(LocalTimerCore {
-            id,
-            state: Mutex::new(LocalTimerState {
-                when: None,
-                thread_running: false,
-                queued: 0,
-            }),
-            cond: Condvar::new(),
-            shared,
-        }),
+        shared,
     });
     inner.arm(when(d));
     LOCAL.with(|l| {
@@ -330,13 +428,9 @@ impl LocalTimer {
     /// timer, false if the timer has already expired (its function is queued
     /// or has run) or been stopped. Stop does not remove a queued run.
     pub fn stop(&self) -> bool {
-        let pending = {
-            let mut state = lock(&self.inner.core.state);
-            let pending = state.when.is_some();
-            state.when = None;
-            self.inner.core.cond.notify_all();
-            pending
-        };
+        // The timer thread is not woken: at the old `when` it finds this
+        // timer gone and waits for the next one.
+        let pending = lock(&self.inner.shared.timers).disarm(self.inner.id);
         self.inner.forget_if_idle();
         pending
     }
@@ -361,27 +455,27 @@ impl std::fmt::Debug for LocalTimer {
         write!(
             f,
             "LocalTimer(when: {:?})",
-            lock(&self.inner.core.state).when
+            lock(&self.inner.shared.timers).when.get(&self.inner.id)
         )
     }
 }
 
 impl LocalTimerInner {
-    /// Sets `when` and makes sure a thread waits for it. Returns whether the
-    /// timer was armed before.
+    /// Sets `when` and makes sure the timer thread waits for it: starts the
+    /// thread at the first arm, or wakes it when this timer is now the first
+    /// due. Returns whether the timer was armed before.
     fn arm(&self, when: Instant) -> bool {
-        let mut state = lock(&self.core.state);
-        let pending = state.when.is_some();
-        state.when = Some(when);
-        if state.thread_running {
-            self.core.cond.notify_all();
-        } else {
-            state.thread_running = true;
-            let core = self.core.clone();
+        let mut timers = lock(&self.shared.timers);
+        let pending = timers.arm(self.id, when);
+        if !timers.thread_running {
+            timers.thread_running = true;
+            let shared = self.shared.clone();
             std::thread::Builder::new()
                 .name("local-timer".to_string())
-                .spawn(move || run_local_timer(core))
+                .spawn(move || run_local_timers(shared))
                 .expect("local: failed to start the timer thread");
+        } else if timers.due.first() == Some(&(when, self.id)) {
+            self.shared.timers_changed.notify_all();
         }
         pending
     }
@@ -389,10 +483,7 @@ impl LocalTimerInner {
     /// Drops this thread's reference when the timer is neither armed nor
     /// queued, so an unreferenced timer is freed.
     fn forget_if_idle(&self) {
-        let idle = {
-            let state = lock(&self.core.state);
-            state.when.is_none() && state.queued == 0
-        };
+        let idle = lock(&self.shared.timers).idle(self.id);
         if idle {
             LOCAL.with(|l| {
                 l.timers.borrow_mut().remove(&self.id);
@@ -401,35 +492,42 @@ impl LocalTimerInner {
     }
 }
 
-/// The waiting thread of one `LocalTimer`: when the timer is due it queues
-/// the timer on its thread and calls the waker, then exits unless the timer
-/// was armed again.
-fn run_local_timer(core: Arc<LocalTimerCore>) {
-    let mut state = lock(&core.state);
+/// The timer thread of one thread (`shared`): when the first armed timer
+/// is due, it queues the timer on that thread and calls the waker. It waits
+/// while no timer is armed, and ends when that thread ends.
+fn run_local_timers(shared: Arc<LocalShared>) {
+    let mut timers = lock(&shared.timers);
     loop {
-        let Some(w) = state.when else {
-            state.thread_running = false;
+        if timers.closed {
+            timers.thread_running = false;
             return;
+        }
+        let Some(&(w, id)) = timers.due.first() else {
+            timers = shared
+                .timers_changed
+                .wait(timers)
+                .unwrap_or_else(|e| e.into_inner());
+            continue;
         };
         let now = Instant::now();
         if now < w {
-            state = core
-                .cond
-                .wait_timeout(state, w - now)
+            timers = shared
+                .timers_changed
+                .wait_timeout(timers, w - now)
                 .unwrap_or_else(|e| e.into_inner())
                 .0;
             continue;
         }
-        state.when = None;
-        state.queued += 1;
-        lock(&core.shared.queue).push_back(Entry::Timer(core.id));
-        core.shared.ready.notify_all();
-        drop(state);
-        let waker = lock(&core.shared.waker).clone();
+        timers.disarm(id);
+        *timers.queued.entry(id).or_default() += 1;
+        lock(&shared.queue).push_back(Entry::Timer(id));
+        shared.ready.notify_all();
+        drop(timers);
+        let waker = lock(&shared.waker).clone();
         if let Some(waker) = waker {
             waker();
         }
-        state = lock(&core.state);
+        timers = lock(&shared.timers);
     }
 }
 
@@ -448,5 +546,45 @@ fn when(d: Duration) -> Instant {
                 d /= 2;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Runs the ready work of this thread until no timer is armed.
+    fn run_until_idle() {
+        while wait_pending() {
+            run_pending();
+        }
+    }
+
+    #[test]
+    fn timers_of_one_thread_fire_in_deadline_order_after_stop_and_reset() {
+        // A thread of its own: the timer thread ends with it.
+        std::thread::spawn(|| {
+            let log = Rc::new(RefCell::new(Vec::new()));
+            let push = |name: &'static str| -> Box<dyn FnMut()> {
+                let log = log.clone();
+                Box::new(move || log.borrow_mut().push(name))
+            };
+            let late = after_func(Duration::from_millis(40), push("late"));
+            let early = after_func(Duration::from_millis(10), push("early"));
+            let stopped = after_func(Duration::from_millis(5), push("stopped"));
+            assert!(stopped.stop());
+            assert!(!stopped.stop());
+            run_until_idle();
+            assert_eq!(*log.borrow(), ["early", "late"]);
+            // Reset after it fired: false, and it runs again.
+            assert!(!early.reset(Duration::from_millis(1)));
+            // Reset while armed moves the deadline: true.
+            assert!(!late.reset(Duration::from_millis(30)));
+            assert!(late.reset(Duration::from_millis(2)));
+            run_until_idle();
+            assert_eq!(*log.borrow(), ["early", "late", "early", "late"]);
+        })
+        .join()
+        .expect("timer test thread");
     }
 }

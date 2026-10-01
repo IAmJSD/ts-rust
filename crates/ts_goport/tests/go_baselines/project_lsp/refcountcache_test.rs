@@ -135,11 +135,13 @@ fn test_content_mapped_parse_cache_key_reconstruction() {
     );
 }
 
-// Go: refcountcache_test.go:72 TestParseCacheBindsBeforePublishing (ts#63952)
+// Go: refcountcache_test.go:73 TestParseCacheBindsBeforePublishing (ts#63952)
 // PORT: Go `cache.Acquire` is `acquire_bound`. The port's `acquire` does not
 // bind, because a program load binds its files later in file order
-// (`project::acquire_bound`). `acquire_bound` binds before it returns the
-// file, as Go binds before the entry is published.
+// (`program::bind_all`). `acquire_bound` binds before it returns the
+// file, as Go binds before the entry is published. This is a partial port:
+// it covers the API lease path only. Program loads and the auto-import
+// registry use `acquire` and bind later.
 #[test]
 fn test_parse_cache_binds_before_publishing() {
     const FILE_NAME: &str = "/index.js";

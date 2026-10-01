@@ -96,6 +96,14 @@ impl<T: Send + 'static> DynamicQueue<T> {
         Ok(item)
     }
 
+    /// PORT: no Go counterpart. Runs `f` on the queued items, in order,
+    /// while it holds the state. The LSP server takes an LSP `shutdown` or
+    /// `exit` out of the queue with it while an API request waits for the
+    /// client (`ServerShared::wait_during_api_call`).
+    pub fn with_items<R>(&self, f: impl FnOnce(&mut VecDeque<T>) -> R) -> R {
+        f(&mut self.get_any().items)
+    }
+
     // Go: lsp/dynamic_queue.go:76 getAny
     // PORT: the state is always available (see `put`), so this only takes
     // the mutex. Go also returns `ctx.Err()` when the context is done while

@@ -859,12 +859,13 @@ impl Converters {
 
         if line_map.ascii_only || self.position_encoding == lsproto::PositionEncodingKind::UTF8 {
             let pos = start.max(start.wrapping_add(char).min(line_end));
-            if line_map.ascii_only || pos == start {
+            if line_map.ascii_only || !line_map.has_marker || pos == start {
                 return pos;
             }
             // PORT: `char` counts Go bytes. A line holds whole units, so
             // the Go bytes of the line give the port offset
-            // (`port_byte_offset`), at most the line end.
+            // (`port_byte_offset`), at most the line end. Text with no
+            // marker unit has Go's offsets (above).
             let text = script.text();
             let Some(line_text) = text.get(start as usize..line_end as usize) else {
                 return pos;
@@ -939,11 +940,14 @@ impl Converters {
             character = position - start;
         } else if self.position_encoding == lsproto::PositionEncodingKind::UTF8 {
             // PORT: Go counts the Go bytes from the line start, which is a
-            // unit boundary (`go_byte_offset`).
+            // unit boundary (`go_byte_offset`). Text with no marker unit
+            // has Go's offsets.
             let text = script.text();
             character = match text.get(start as usize..) {
-                Some(line_text) => go_byte_offset(line_text, position - start),
-                None => position - start,
+                Some(line_text) if line_map.has_marker => {
+                    go_byte_offset(line_text, position - start)
+                }
+                _ => position - start,
             };
         } else {
             // We need to rescan the text as UTF-16 to find the character offset.
@@ -1387,5 +1391,66 @@ mod tests {
         };
         let back = from_lsp_position(&converters, script.clone(), past, Feature::ALL);
         assert_eq!(back[0].position, port_byte_offset(&script.0, 8));
+    }
+
+    // R151 reviewer: UTF-8 columns scanned each line for markers in any
+    // non-ASCII text. A text with no marker unit skips the scan
+    // (`LSPLineMap::has_marker`) and gives the same columns.
+    #[test]
+    fn utf8_columns_without_marker_skip_the_scan() {
+        let script = PortScript("é = 1;\n€x = \"\u{1F600}\";".to_string());
+        let line_map = compute_lsp_line_starts(&script.0);
+        assert!(!line_map.ascii_only && !line_map.has_marker);
+        let marked = compute_lsp_line_starts(&crate::scanner_util::go_string_from_bytes(
+            b"\xFF\n".to_vec(),
+        ));
+        assert!(marked.has_marker);
+        let converters = new_converters(lsproto::PositionEncodingKind::UTF8, move |_| {
+            Some(Rc::clone(&line_map))
+        });
+        for pos in 0..=script.0.len() as i32 {
+            let line = i32::from(pos >= 8);
+            let character = pos - [0, 8][line as usize];
+            let lc = lsproto::Position {
+                line: line as u32,
+                character: character as u32,
+            };
+            assert_eq!(converters.to_lsp_position(&script, pos).0, lc, "{pos}");
+            let back = from_lsp_position(&converters, script.clone(), lc, Feature::ALL);
+            assert_eq!(back[0].position, pos, "{lc:?}");
+        }
+    }
+
+    // `GoOffsets` gives `go_byte_offset` and `port_byte_offset` of every
+    // offset of a text after one scan (code lenses, references).
+    #[test]
+    fn go_offsets_match_the_scans() {
+        use crate::scanner_util::{GoOffsets, go_string_from_bytes};
+        let lone = format!(
+            "a{}\u{10F83D}b\u{FDD0}\u{FDD0}c",
+            crate::scanner_util::GO_STRING_MARKER
+        );
+        let texts = [
+            go_string_from_bytes(b"a\xACb\xEF\xB7\x90c\nd\xED\xA0\x80e \xE2\x82\xACf".to_vec()),
+            go_string_from_bytes(b"\xFF\xFE\xEF\xB7\x90".to_vec()),
+            "plain é text".to_string(),
+            lone,
+        ];
+        for text in &texts {
+            let offsets = GoOffsets::new(text);
+            assert_eq!(offsets.has_units(), text.contains('\u{FDD0}'), "{text:?}");
+            for pos in -2..=text.len() as i32 + 3 {
+                assert_eq!(
+                    offsets.go_offset(pos),
+                    go_byte_offset(text, pos),
+                    "{text:?} {pos}"
+                );
+                assert_eq!(
+                    offsets.port_offset(pos),
+                    port_byte_offset(text, pos),
+                    "{text:?} Go {pos}"
+                );
+            }
+        }
     }
 }

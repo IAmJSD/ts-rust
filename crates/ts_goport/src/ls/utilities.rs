@@ -10,6 +10,7 @@
 use crate::ls::prelude::*;
 
 use crate::frontend::parser::ParsedSourceFile;
+use crate::scanner_util::{GoUnit, go_unit_bytes, go_unit_cut_at};
 use crate::spanmap::{Feature, Fidelity};
 use std::borrow::Cow;
 use std::cell::Cell;
@@ -2003,11 +2004,16 @@ pub fn is_source_file_with_global_exports(node: Node) -> bool {
 /// slices bytes, so `lo` or `hi` can cut a char: Go keeps the cut bytes and
 /// reads each one as a RuneError of size 1. Here each cut byte is an invalid
 /// byte unit (`go_string_from_bytes`), so the result is longer than
-/// `hi - lo` at a cut. A slice at char boundaries is borrowed.
+/// `hi - lo` at a cut. A slice at unit boundaries is borrowed.
 // PORT: an out of range bound panics with the Go runtime text. Go checks
 // `hi` against the length first, then `lo` against `hi`; a negative bound is
 // printed alone. A content-mapped file reaches the JSDoc snippet checks with
 // empty text in Go at B too, and the LSP error response carries the text.
+// PORT: a bound `k` bytes into a unit of `g` Go bytes is Go's bound `k`
+// bytes into the unit's Go bytes, at most `g` (`go_byte_offset`). So a
+// bound inside a marker unit (also at the char boundary between its two
+// chars) cuts the unit's Go bytes, and the rest of that unit is not in the
+// slice. A real U+FDD0 is two markers, and its first holds Go's 3 bytes.
 pub fn go_text_slice(text: &str, lo: i32, hi: i32) -> Cow<'_, str> {
     let len = text.len();
     if hi < 0 {
@@ -2027,23 +2033,78 @@ pub fn go_text_slice(text: &str, lo: i32, hi: i32) -> Cow<'_, str> {
         ));
     }
     let (lo, hi) = (lo as usize, hi as usize);
-    if let Some(whole) = text.get(lo..hi) {
-        return Cow::Borrowed(whole);
+    let lo_cut = go_unit_cut_at(text, lo);
+    let hi_cut = go_unit_cut_at(text, hi);
+    if lo_cut.is_none() && hi_cut.is_none() {
+        return Cow::Borrowed(&text[lo..hi]);
     }
-    // The whole chars are `head..tail`; the bytes around them are cut.
-    let mut head = lo;
-    while head < hi && !text.is_char_boundary(head) {
-        head += 1;
+    // The Go bytes of the cut unit at `at` from `from` to `to` port bytes
+    // into it.
+    let cut_bytes = |at: usize, unit: GoUnit, from: usize, to: usize| -> Vec<u8> {
+        let mut buf = [0u8; 4];
+        let bytes = go_unit_bytes(unit, &mut buf);
+        bytes[(from - at).min(bytes.len())..(to - at).min(bytes.len())].to_vec()
+    };
+    match (lo_cut, hi_cut) {
+        (Some((at, unit, _)), Some((hi_at, _, _))) if hi_at == at => {
+            Cow::Owned(go_string_from_bytes(cut_bytes(at, unit, lo, hi)))
+        }
+        _ => {
+            // The whole units are `head..tail`; the bytes around them are
+            // cut.
+            let (mut out, head) = match lo_cut {
+                Some((at, unit, size)) => (
+                    go_string_from_bytes(cut_bytes(at, unit, lo, at + size)),
+                    at + size,
+                ),
+                None => (String::new(), lo),
+            };
+            let (tail, suffix) = match hi_cut {
+                Some((at, unit, _)) => (at, go_string_from_bytes(cut_bytes(at, unit, at, hi))),
+                None => (hi, String::new()),
+            };
+            out.push_str(&text[head..tail]);
+            out.push_str(&suffix);
+            Cow::Owned(out)
+        }
     }
-    let mut tail = hi;
-    while tail > head && !text.is_char_boundary(tail) {
-        tail -= 1;
+}
+
+#[cfg(test)]
+mod go_text_slice_tests {
+    use super::go_text_slice;
+    use crate::scanner_util::{go_byte_offset, go_string_bytes, go_string_from_bytes};
+
+    // R151 reviewer: a `lo` inside the first marker of a real U+FDD0 kept
+    // the second marker, which then read as another U+FDD0. Each slice must
+    // be Go's slice of the Go bytes at the Go offsets of its bounds.
+    #[test]
+    fn go_text_slice_is_go_slice_of_go_bytes() {
+        let mut go = b"a\xE2\x82\xACb".to_vec(); // a, U+20AC, b
+        go.extend_from_slice("\u{FDD0}".as_bytes()); // a real U+FDD0
+        go.extend_from_slice(b"c\xFFd\xED\xA0\x80e"); // invalid byte, WTF-8 surrogate
+        go.extend_from_slice("\u{1F600}\u{FDD0}".as_bytes());
+        let text = go_string_from_bytes(go.clone());
+        assert_eq!(go_string_bytes(&text).as_ref(), go.as_slice());
+        for lo in 0..=text.len() {
+            for hi in lo..=text.len() {
+                let (go_lo, go_hi) = (
+                    go_byte_offset(&text, lo as i32) as usize,
+                    go_byte_offset(&text, hi as i32) as usize,
+                );
+                let want = go_string_from_bytes(go[go_lo..go_hi].to_vec());
+                assert_eq!(
+                    go_text_slice(&text, lo as i32, hi as i32),
+                    want,
+                    "{text:?}[{lo}:{hi}]"
+                );
+            }
+        }
+        // `lo` one byte into a real U+FDD0: Go keeps its last 2 bytes.
+        let at = text.find('\u{FDD0}').expect("marker");
+        assert_eq!(
+            go_text_slice(&text, at as i32 + 1, at as i32 + 7),
+            go_string_from_bytes(b"\xB7\x90c".to_vec())
+        );
     }
-    let bytes = text.as_bytes();
-    let mut out = go_string_from_bytes(bytes[lo..head].to_vec());
-    if head < tail {
-        out.push_str(&text[head..tail]);
-    }
-    out.push_str(&go_string_from_bytes(bytes[tail..hi].to_vec()));
-    Cow::Owned(out)
 }

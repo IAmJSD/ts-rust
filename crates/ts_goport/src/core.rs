@@ -427,7 +427,7 @@ mod lib_names;
 mod intern {
     use super::{Name, lib_names};
     use rustc_hash::{FxBuildHasher, FxHashMap};
-    use std::cell::Cell;
+    use std::cell::{Cell, OnceCell};
     use std::collections::HashMap;
     use std::hash::{BuildHasherDefault, Hasher};
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -514,17 +514,32 @@ mod intern {
     #[repr(align(64))]
     struct CacheSet([CacheSlot; CACHE_WAYS]);
 
+    /// The `CACHE` of one thread (64 KiB).
+    type Cache = [CacheSet; CACHE_SETS];
+
+    /// An empty `Cache` on the heap.
+    #[cold]
+    fn new_cache() -> Box<Cache> {
+        const EMPTY: CacheSet = CacheSet([const { Cell::new((0, 0, "")) }; CACHE_WAYS]);
+        let sets: Box<[CacheSet]> = (0..CACHE_SETS).map(|_| EMPTY).collect();
+        match sets.try_into() {
+            Ok(cache) => cache,
+            Err(_) => unreachable!("the iterator makes CACHE_SETS sets"),
+        }
+    }
+
     thread_local! {
-        /// 2-way set-associative cache of recent `intern` results. It is a
-        /// const array with no destructor, so a hit reads thread-local
-        /// memory directly and needs no lazy init, borrow flag or `text`
-        /// lookup.
+        /// 2-way set-associative cache of recent `intern` results, made at
+        /// the first `intern` of the thread. A hit needs no borrow flag or
+        /// `text` lookup.
         // PERF: two ways in place of one direct-mapped slot, so two hot
         // names with the same set do not evict each other. The cache only
         // holds ids the shards gave out, so it never changes an id.
-        static CACHE: [CacheSet; CACHE_SETS] = const {
-            [const { CacheSet([const { Cell::new((0, 0, "")) }; CACHE_WAYS]) }; CACHE_SETS]
-        };
+        // PERF (perfplan4 R1): on the heap, not in the static TLS block.
+        // glibc copies that block into each new thread on the thread that
+        // starts it, and the cache was 64 KiB of its 99 KiB (`tsc -b` starts
+        // 20 to 350 threads, many of which never intern).
+        static CACHE: OnceCell<Box<Cache>> = const { OnceCell::new() };
 
         /// The ids this thread took from `NEXT` and did not use yet:
         /// (next, end).
@@ -737,8 +752,10 @@ mod intern {
         }
         let hash = hash_str(s);
         let set = (hash as usize) & (CACHE_SETS - 1);
-        let cached = CACHE.with(|cache| {
-            let [first, second] = &cache[set].0;
+        // After the thread-local destructors ran (`try_with` fails), a
+        // name goes to the shared map without the cache.
+        let cached = CACHE.try_with(|cache| {
+            let [first, second] = &cache.get_or_init(new_cache)[set].0;
             let (h, id, stored) = first.get();
             if id != 0 && h == hash && stored == s {
                 return Some(id);
@@ -753,7 +770,7 @@ mod intern {
             }
             None
         });
-        if let Some(id) = cached {
+        if let Ok(Some(id)) = cached {
             return Name(id);
         }
         // PERF: bind B2. A lib name (lib.dom alone brings about 7k names
@@ -766,10 +783,12 @@ mod intern {
             Some(found) => found,
             None => intern_shared(s, hash),
         };
-        CACHE.with(|cache| {
-            let [first, second] = &cache[set].0;
-            second.set(first.get());
-            first.set((hash, id, stored));
+        let _ = CACHE.try_with(|cache| {
+            if let Some(cache) = cache.get() {
+                let [first, second] = &cache[set].0;
+                second.set(first.get());
+                first.set((hash, id, stored));
+            }
         });
         Name(id)
     }

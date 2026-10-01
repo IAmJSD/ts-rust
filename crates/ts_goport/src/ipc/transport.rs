@@ -266,9 +266,15 @@ use crate::ipc::transport_unix::new_pipe_listener;
 // client connects. Both reject remote clients and allow any number of
 // instances. The failure text is winio's `open <path>: <system message>`.
 // PORT divergence: winio's buffer sizes are 0; these are miow's 64 KiB,
-// because the port reads and writes a connection on one thread (Go uses
-// overlapped I/O on goroutines). `Close` does not end an `Accept` that
-// waits on another thread (the port's callers close after `Accept`).
+// because `--api` reads and writes its connection on one thread (Go uses
+// overlapped I/O on goroutines). An API session of the LSP server reads on
+// its `api-reader` thread and writes on the dispatch thread
+// (`lsp/server.rs` `start_api_reader`). miow opens the pipe with
+// `FILE_FLAG_OVERLAPPED` and each read and write waits on its own thread's
+// event, so a read that waits does not hold a write on another thread.
+// `Close` does not end an `Accept` that waits on another thread. The LSP
+// server's `api-accept` thread closes the transport after its `Accept`; if
+// the server ends first, the process exit ends the wait, as in Go.
 #[cfg(windows)]
 pub fn new_pipe_listener(path: &str) -> Result<Box<dyn NetListener>, GoError> {
     let first = new_pipe_instance(path, true)

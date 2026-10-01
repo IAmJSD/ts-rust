@@ -490,32 +490,40 @@ impl ProjectCollectionBuilder {
         }
         // PORT: Go runs each update on its own goroutine (`sync.WaitGroup`);
         // the port runs them serially in Go start order (PORTING "Threads").
+        // Go: projectcollectionbuilder.go:337,345 `wg.Go`. A `recover()`
+        // sees only its own goroutine, so a Go panic in an update ends the
+        // process whatever the API request recovers
+        // (`go_wait_group_goroutine`).
         let mut created_programs: Vec<Rc<RefCell<Project>>> =
             Vec::with_capacity(created_entries.len());
         for entry in &created_entries {
-            if entry
-                .value()
-                .unwrap_or_else(|| crate::core::go_nil_dereference())
-                .borrow()
-                .dirty
-            {
-                self.update_program(&**entry, logger.clone());
-            }
-            created_programs.push(
-                entry
+            crate::core::go_wait_group_goroutine(|| {
+                if entry
                     .value()
-                    .unwrap_or_else(|| crate::core::go_nil_dereference()),
-            );
+                    .unwrap_or_else(|| crate::core::go_nil_dereference())
+                    .borrow()
+                    .dirty
+                {
+                    self.update_program(&**entry, logger.clone());
+                }
+                created_programs.push(
+                    entry
+                        .value()
+                        .unwrap_or_else(|| crate::core::go_nil_dereference()),
+                );
+            });
         }
         for entry in &reconfigured_entries {
-            if entry
-                .value()
-                .unwrap_or_else(|| crate::core::go_nil_dereference())
-                .borrow()
-                .dirty
-            {
-                self.update_program(&**entry, logger.clone());
-            }
+            crate::core::go_wait_group_goroutine(|| {
+                if entry
+                    .value()
+                    .unwrap_or_else(|| crate::core::go_nil_dereference())
+                    .borrow()
+                    .dirty
+                {
+                    self.update_program(&**entry, logger.clone());
+                }
+            });
         }
         *self.created_programs.borrow_mut() = created_programs;
         // ts#64391: the request maps each path to its file name.

@@ -930,7 +930,7 @@ pub fn is_export_specifier_alias(reference_location: Node, export_specifier: Nod
     }
 }
 
-// Go: checker/services.go:635 getPossibleSymbolReferenceNodes
+// Go: checker/services.go:646 getPossibleSymbolReferenceNodes
 pub fn get_possible_symbol_reference_nodes(
     source_file: Node,
     symbol_name: &str,
@@ -952,76 +952,22 @@ pub fn get_possible_symbol_reference_nodes(
     result
 }
 
-// Go: checker/services.go:644 getPossibleSymbolReferencePositions
-// PORT: Go indexes the text by byte. The search runs on the bytes, because
-// `position + symbolNameLength + 1` can fall inside a multi-byte character,
-// where a `&str` slice would panic.
-// PERF: Go `strings.Index` is one `memmem::Finder`, built once per call. It
-// returns the same first index (see ls/findallreferences_p2.rs).
+// Go: checker/services.go:655 getPossibleSymbolReferencePositions
+// PORT: Go has two copies of this function with the same body (here and
+// ls/findallreferences.go:1646). The port keeps one: the ls copy, which
+// searches Go bytes and reads the bytes next to a match as Go bytes (see
+// its PORT notes). Before, this copy read port bytes there, so a match
+// next to an invalid byte unit tested a port byte (0x85 for Go's 0xC5).
 pub fn get_possible_symbol_reference_positions(
     source_file: Node,
     symbol_name: &str,
     container: Node,
 ) -> Vec<i32> {
-    let mut positions: Vec<i32> = Vec::new();
-
-    // TODO: Cache symbol existence for files to save text search
-    // Also, need to make this work for unicode escapes.
-
-    // Be resilient in the face of a symbol with no name or zero length name
-    if symbol_name.is_empty() {
-        return positions;
-    }
-
-    let text_text = source_file_text(source_file);
-    let text = text_text.as_bytes();
-    let symbol_name = symbol_name.as_bytes();
-    let source_length = text.len() as i32;
-    let symbol_name_length = symbol_name.len() as i32;
-    // Go `strings.Index(s, symbolName)` is `finder.find(s)`; -1 is `None`.
-    let finder = memchr::memmem::Finder::new(symbol_name);
-
-    let container = if container.is_nil() {
-        source_file
-    } else {
-        container
-    };
-
-    // PORT: as in Go, the first index is relative to `container.Pos()` and
-    // is compared with the absolute `container.End()`.
-    let mut position = finder
-        .find(&text[container.pos() as usize..])
-        .map_or(-1, |index| index as i32);
-    let end_pos = container.end();
-    while position >= 0 && position < end_pos {
-        // We found a match.  Make sure it's not part of a larger word (i.e. the char
-        // before and after it have to be a non-identifier char).
-        let end_position = position + symbol_name_length;
-
-        // PORT: Go `rune(text[i])` converts one byte to a rune; `char::from`
-        // does the same for a `u8`.
-        if (position == 0 || !is_identifier_part(char::from(text[(position - 1) as usize])))
-            && (end_position == source_length
-                || !is_identifier_part(char::from(text[end_position as usize])))
-        {
-            // Found a real match.  Keep searching.
-            positions.push(position);
-        }
-        let start_index = position + symbol_name_length + 1;
-        if start_index > text.len() as i32 {
-            break;
-        }
-        let found_index = finder
-            .find(&text[start_index as usize..])
-            .map_or(-1, |index| index as i32);
-        if found_index != -1 {
-            position = start_index + found_index;
-        } else {
-            break;
-        }
-    }
-
-    positions
+    crate::ls::findallreferences_p2::get_possible_symbol_reference_positions(
+        source_file,
+        symbol_name,
+        container,
+    )
 }
 
 impl Checker {

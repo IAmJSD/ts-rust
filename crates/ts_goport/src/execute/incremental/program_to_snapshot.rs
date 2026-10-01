@@ -419,7 +419,7 @@ fn start_text_hashes(files: &[Node], hash_with_text: bool) -> std::sync::mpsc::R
         std::thread::Builder::new()
             .name("goport-text-hash".to_string())
             .spawn(hash_texts)
-            .expect("start the text hash thread");
+            .unwrap_or_else(|err| crate::core::go_fatal_newosproc(&err));
     }
     receiver
 }

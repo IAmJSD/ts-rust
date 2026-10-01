@@ -241,6 +241,17 @@ pub fn program_version(p: &NewProgram) -> &'static GoProgram {
     program_checkers(p).version
 }
 
+/// Not in Go: true when the tables of `version` started from those of the
+/// version it was updated from, because its frontend program replaced files
+/// of that one in place (Go `ReuseProgram`, editfast1); false when they were
+/// built from its files alone. Tests pin the path with it.
+pub fn version_tables_reused(version: &'static GoProgram) -> bool {
+    held_tables(version)
+        .go
+        .as_ref()
+        .is_some_and(|go| go.from_old_tables)
+}
+
 /// The parsed file whose root is `file`, from any program made here that
 /// is not released, or None. Go `*ast.SourceFile` is one object in every
 /// program that has it; here the programs hold the `ParsedSourceFile`.

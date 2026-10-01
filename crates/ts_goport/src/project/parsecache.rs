@@ -406,6 +406,13 @@ impl ProgramFileRefs {
         content_mapped_parse_cache: &ContentMappedParseCache,
         files: &[Rc<parser::ParsedSourceFile>],
     ) {
+        // `zip` stops at the shorter list: a length mismatch would skip
+        // derefs, so it must be the same program's files.
+        debug_assert_eq!(
+            files.len(),
+            self.slots.len(),
+            "ProgramFileRefs::release: files are not the files these refs were made for"
+        );
         for (file, slot) in files.iter().zip(&self.slots) {
             match slot {
                 FileRef::None => {}

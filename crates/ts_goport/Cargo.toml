@@ -25,6 +25,10 @@ signal-hook = "=0.4.4"
 # `jemalloc` feature does nothing there.
 [target.'cfg(not(windows))'.dependencies]
 tikv-jemallocator = { version = "=0.7.0", optional = true }
+# `thread.arena` through its safe `Access` API (program.rs
+# `jemalloc_thread_arena`): the one checker of `--singleThreaded` allocates
+# in the arena of the loading thread.
+tikv-jemalloc-ctl = { version = "=0.7.0", optional = true }
 
 # ipc/transport.rs: Windows named pipes for `--pipe` (Go `winio.ListenPipe`),
 # through miow's safe `NamedPipe` API. execute/tsc/compile.rs: Go
@@ -42,7 +46,7 @@ default = ["jemalloc"]
 # jemalloc as the global allocator of the goport binaries (default; the
 # shipped build). `--no-default-features` gives glibc malloc with its
 # tunables. See bin/goport.rs `set_malloc_tunables`.
-jemalloc = ["dep:tikv-jemallocator"]
+jemalloc = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-ctl"]
 # Go build tag `noembed`, as in Go's release builds and npm packages: the
 # lib files are not in the binary. The binaries read them from their own
 # directory and print their real paths, not `bundled:///libs/...`. Put them

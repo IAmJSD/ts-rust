@@ -145,6 +145,13 @@ thread_local! {
 /// handlers). Returns the payload of a panic in `f`. The Go runtime prints
 /// nothing for a recovered panic, so the bins' panic hooks stay quiet while
 /// `in_go_recover` is true.
+// PORT: Go's request recovers (ipc/conn_async.go:206-223,
+// ipc/conn_sync.go:119-136, api/session.go:1148-1153) put
+// `panic: <value>\n<stack>` in the error response and write nothing to
+// stderr. In `tsgo` a plain Rust panic in `f` (a port gap that is not
+// `unported!`) is quiet too: its message is in the error response, and
+// `GOPORT_TRACE=1` prints it with the backtrace of the panic site on
+// stderr. The `goport` dev bin prints it with its port site.
 pub fn go_recover<R>(f: impl FnOnce() -> R) -> std::thread::Result<R> {
     GO_RECOVER_DEPTH.with(|depth| depth.set(depth.get() + 1));
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));

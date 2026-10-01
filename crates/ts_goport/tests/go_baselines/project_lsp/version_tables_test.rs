@@ -177,3 +177,54 @@ child_test! {
         wait_freed(&probe);
     }
 }
+
+child_test! {
+    env &[("GOPORT_CHECK_VERSION_TABLES", "1")];
+    // editfast1: a body edit replaces index.ts in place (Go `ReuseProgram`),
+    // so the tables of the new version start from the old version's. An
+    // edit that adds a program file (an import of a file that the config
+    // does not list) builds them from the files alone, and the next body
+    // edit starts from those. With GOPORT_CHECK_VERSION_TABLES=1 each
+    // reused build is also compared with a full build.
+    fn version_tables_reuse_only_files_replaced_in_place() {
+        const B_FILE: &str = "/home/projects/TS/p1/b.ts";
+        const INDEX_FILE: &str = "/home/projects/TS/p1/index.ts";
+        let session = bare_session(files(&[
+            (CONFIG, r#"{"files": ["index.ts"]}"#),
+            (INDEX_FILE, INDEX_TEXT),
+            (A_FILE, "export const a = 1;"),
+            (B_FILE, "export const b = 1;"),
+        ]));
+        open(&session, INDEX_URI, INDEX_TEXT);
+        let reused = |p: &NewProgram| {
+            ls_program::version_tables_reused(ls_program::program_version(p))
+        };
+        let p1 = program(&session, INDEX_URI);
+        let count = p1.source_files().len();
+        assert!(!reused(&p1), "a first load builds its tables");
+
+        body_edit(&session, 2, "2");
+        let p2 = program(&session, INDEX_URI);
+        assert_eq!(p2.source_files().len(), count);
+        assert!(reused(&p2), "a body edit starts from the old tables");
+
+        import_edit(&session, 3);
+        let p3 = program(&session, INDEX_URI);
+        assert_eq!(p3.source_files().len(), count + 1, "b.ts joins the program");
+        assert!(!reused(&p3), "a new program file gives a full build");
+        assert_eq!(sem_diag_count(&p3, INDEX_FILE), 0);
+        {
+            let _program = ls_program::enter(&p3);
+            assert!(program::get_source_file(B_FILE).is_some());
+        }
+
+        // `export const x = a + 1;` is line 2 after the import edit.
+        edit(&session, INDEX_URI, 4, (2, 21), (2, 22), "3");
+        let p4 = program(&session, INDEX_URI);
+        assert_eq!(p4.source_files().len(), count + 1);
+        assert!(reused(&p4), "a body edit after a full build starts from its tables");
+        assert_eq!(sem_diag_count(&p4, INDEX_FILE), 0);
+        let _program = ls_program::enter(&p4);
+        assert!(program::get_source_file(B_FILE).is_some());
+    }
+}

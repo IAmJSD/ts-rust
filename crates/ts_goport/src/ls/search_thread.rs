@@ -348,7 +348,7 @@ fn spawn_search_thread(program: &compiler::NewProgram) -> mpsc::Sender<Job> {
         .name("ls-search".to_string())
         .stack_size(crate::gostd::stack::max_stack_size())
         .spawn(move || search_thread_main(seed, data, receiver))
-        .expect("cannot start a search thread");
+        .unwrap_or_else(|err| crate::core::go_fatal_newosproc(&err));
     jobs
 }
 

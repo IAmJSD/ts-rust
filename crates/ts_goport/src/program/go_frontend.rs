@@ -86,6 +86,11 @@ pub(super) struct GoSharedState {
     // PORT: `NewProgram` has no field for it, so the program version keeps
     // it (see `GoSharedState::new`).
     content_mapper_option_diagnostics: Vec<Diagnostic>,
+    /// Not in Go: true when the tables of this version started from those
+    /// of the version it was updated from (`reused_tables`), false when
+    /// they were built from its files alone (`full_tables`). Tests read it
+    /// (`ls_program::version_tables_reused`).
+    pub(super) from_old_tables: bool,
 }
 
 type FrontendSourceOutput = crate::frontend::tsoptions::SourceOutputAndProjectReference;
@@ -783,7 +788,8 @@ struct Replaced<'a> {
 /// The files of `np` that are not those of `old_np`, when `np` replaced
 /// them in place (Go `ReuseProgram`): the same number of files at the same
 /// paths in the same order, and the same resolutions. `old` holds the tables
-/// of `old_np`. None when `np` is not such a program.
+/// of `old_np`. None when `np` is not such a program, or when a replaced
+/// file is in a package redirect group.
 fn replaced_files<'a>(
     np: &'a NewProgram,
     old_np: &'a NewProgram,
@@ -805,6 +811,24 @@ fn replaced_files<'a>(
             continue;
         }
         if file.path() != old_file.path() {
+            return None;
+        }
+        // Go: program.go:368-375 ReuseProgram rebuilds when the changed file
+        // is in a package redirect group, but it does not check the
+        // content-mapper supplemental files (:391, :424-429). When one of those
+        // is a redirect target, Go's `filesByPath` keeps the old file at the
+        // redirect paths of its group, and a shared path-to-slot map would
+        // give the new file there. So such a version takes the full build,
+        // which keeps Go's map.
+        let in_redirect_group = old_np
+            .redirect_files_by_path
+            .as_ref()
+            .is_some_and(|redirects| redirects.contains_key(old_file.path()))
+            || old_np
+                .redirect_targets_map
+                .as_ref()
+                .is_some_and(|targets| targets.contains_key(old_file.path()));
+        if in_redirect_group {
             return None;
         }
         replaced.push(Replaced {
@@ -1405,6 +1429,7 @@ impl GoSharedState {
             resolved_project_references,
             known_symlinks,
             source_files_found_searching_node_modules,
+            from_old_tables: reused.is_some(),
         }
     }
 

@@ -3,11 +3,11 @@
 use crate::ls::prelude::*;
 
 use crate::frontend::json::{MarshalerTo, json_marshal, json_unmarshal};
-use crate::scanner_util::{contains_go_string_marker, go_byte_offset, port_byte_offset};
+use crate::scanner_util::{GoOffsets, port_byte_offset};
 use crate::spanmap::Feature;
 
 impl LanguageService {
-    // Go: ls/codelens.go:15 ProvideCodeLenses
+    // Go: ls/codelens.go:18 ProvideCodeLenses
     pub fn provide_code_lenses(
         &self,
         ctx: &Context,
@@ -52,13 +52,13 @@ impl LanguageService {
             // resolve. Port offsets differ from Go offsets after a marker
             // unit (see `scanner_util::GO_STRING_MARKER`), so the lenses of
             // this projection leave with Go offsets (`go_byte_offset`) and
-            // `resolve_code_lens` maps them back. Text without a marker
-            // needs no scan for each lens.
-            let text = source_file_text(projection);
-            if contains_go_string_marker(&text) {
+            // `resolve_code_lens` maps them back. The text is scanned once
+            // for all lenses (`GoOffsets`).
+            let offsets = GoOffsets::new(&source_file_text(projection));
+            if offsets.has_units() {
                 for code_lens in &mut result[first..] {
                     if let Some(data) = &mut code_lens.data {
-                        data.position = go_byte_offset(&text, data.position);
+                        data.position = offsets.go_offset(data.position);
                     }
                 }
             }

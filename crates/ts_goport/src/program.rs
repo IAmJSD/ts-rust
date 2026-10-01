@@ -437,7 +437,7 @@ fn create_emit_pool(count: usize) -> EmitPool {
                         forget_synthetic_nodes();
                     }
                 })
-                .expect("cannot start an emit thread")
+                .unwrap_or_else(|err| crate::core::go_fatal_newosproc(&err))
         })
         .collect();
     EmitPool {
@@ -532,7 +532,7 @@ fn create_dts_twin() -> DtsTwin {
                 forget_synthetic_nodes();
             }
         })
-        .expect("cannot start a d.ts twin thread");
+        .unwrap_or_else(|err| crate::core::go_fatal_newosproc(&err));
     DtsTwin {
         queue,
         thread,
@@ -3017,7 +3017,7 @@ pub fn spawn_seeded_thread<R: Send + 'static>(
             seed.install();
             f()
         })
-        .expect("start a seeded thread")
+        .unwrap_or_else(|err| crate::core::go_fatal_newosproc(&err))
 }
 
 // Go: compiler/checkerpool.go:40 newCheckerPoolWithTracing (the count)
@@ -3062,6 +3062,17 @@ fn create_checkers() -> CheckerPool {
         with_tables(|tables| tables.file_associations.set(file_associations).is_ok()),
         "checker pool made twice"
     );
+    // PERF (perfplan4 R7): with `--singleThreaded` the one checker allocates
+    // in the jemalloc arena of the loading thread, which waits for it. It
+    // then reuses the pages that the parse and the bind freed, where it
+    // faulted new ones in an arena of its own (spawn1 t1 and t4, stable
+    // builds: query check -2.9% to -3.6%, hono check -1.9% to -2.4%). With
+    // more checkers each keeps its own arena: they run at once.
+    let arena = if single_threaded() {
+        jemalloc_thread_arena()
+    } else {
+        None
+    };
     let (workers, threads): (Vec<_>, Vec<_>) = (0..count)
         .map(|index| {
             let (sender, receiver) = std::sync::mpsc::channel::<Job>();
@@ -3070,6 +3081,9 @@ fn create_checkers() -> CheckerPool {
                 .name(format!("checker-{index}"))
                 .stack_size(crate::gostd::stack::max_stack_size())
                 .spawn(move || {
+                    if let Some(arena) = arena {
+                        set_jemalloc_thread_arena(arena);
+                    }
                     seed.install();
                     let checker = Checker::new(index);
                     WORKER_CHECKER.with(|slot| *slot.borrow_mut() = Some(checker));
@@ -3091,7 +3105,7 @@ fn create_checkers() -> CheckerPool {
                         forget_synthetic_nodes();
                     }
                 })
-                .expect("cannot start a checker thread");
+                .unwrap_or_else(|err| crate::core::go_fatal_newosproc(&err));
             (sender, thread)
         })
         .unzip();
@@ -3196,6 +3210,30 @@ pub fn checker_pool_created() -> bool {
             .as_deref()
             .is_some_and(created),
     }
+}
+
+/// The jemalloc arena of this thread (`thread.arena`), or None in a build
+/// without jemalloc.
+fn jemalloc_thread_arena() -> Option<u32> {
+    #[cfg(all(feature = "jemalloc", not(windows)))]
+    {
+        use tikv_jemalloc_ctl::{Access, AsName};
+        b"thread.arena\0".name().read().ok()
+    }
+    #[cfg(not(all(feature = "jemalloc", not(windows))))]
+    None
+}
+
+/// Makes this thread allocate in jemalloc arena `arena` (`thread.arena`,
+/// from `jemalloc_thread_arena`). A failure keeps its arena.
+fn set_jemalloc_thread_arena(arena: u32) {
+    #[cfg(all(feature = "jemalloc", not(windows)))]
+    {
+        use tikv_jemalloc_ctl::{Access, AsName};
+        let _ = b"thread.arena\0".name().write(arena);
+    }
+    #[cfg(not(all(feature = "jemalloc", not(windows))))]
+    let _ = arena;
 }
 
 /// The pool index of this thread's checker, or None off the worker threads.

@@ -472,6 +472,10 @@ impl AsyncConn {
                     self.close_pending_calls(None);
                     if !self.running.get() {
                         // No `run` can resume the panic, so it leaves here.
+                        // In Go the panic ends the process. The read loop
+                        // ends as on the run path: a later `run` reads no
+                        // more and returns Go's deferred `err` (nil).
+                        *self.read_loop_end.borrow_mut() = Some(Ok(()));
                         resume_unwind(payload);
                     }
                     *self.read_panic.borrow_mut() = Some(payload);
@@ -1371,6 +1375,11 @@ pub(crate) mod tests {
 
     // PORT: no Go test. Go's deferred function in `Call` deletes the pending
     // entry also when `WriteRequest` panics. The read loop does not end.
+    // PORT: Go locks `writeMu` around `WriteRequest` with no defer
+    // (conn_async.go:281-283), so after this panic Go keeps `writeMu`
+    // locked and a later `Notify` (:315) blocks forever. The port does not
+    // port that deadlock: its write lock is the `protocol` RefCell borrow,
+    // which the unwind releases, so the `notify` below succeeds.
     #[test]
     fn test_async_conn_call_deletes_pending_entry_when_write_request_panics() {
         let (conn, _) = panicking_conn(Vec::new(), true, Rc::new(NoOpHandler));
@@ -1446,7 +1455,7 @@ pub(crate) mod tests {
 
     // PORT: no Go test. With no `run`, the panic of a read in `call` leaves
     // the call after Go's deferred function in `Run` closed the pending
-    // calls.
+    // calls. The read loop ended: a later `run` does not read again.
     #[test]
     fn test_async_conn_call_read_panic_without_run() {
         let (conn, _) = panicking_conn(Vec::new(), false, Rc::new(NoOpHandler));
@@ -1463,6 +1472,12 @@ pub(crate) mod tests {
             errors::is(&err, &ERR_CONN_CLOSED),
             "expected ErrConnClosed, got {}",
             err.error()
+        );
+        // The protocol's queue is empty, so a second read would panic again.
+        let run = catch_unwind(AssertUnwindSafe(|| conn.run(&ctx)));
+        assert!(
+            matches!(run, Ok(Ok(()))),
+            "a later run read again or failed"
         );
     }
 }

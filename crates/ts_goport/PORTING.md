@@ -892,6 +892,7 @@ program version:
 | `err.Error()` | `err.error()` |
 | `go f()` that touches dispatch-thread state | `gostd::local::go(Box::new(f))`: FIFO on the dispatch thread, run by `local::run_pending()` |
 | `go f()` over `Send` data only | `std::thread::spawn` |
+| `go f()` that waits for other-thread work (a child process, a channel), then touches dispatch-thread state | the wait on a `std::thread::spawn` thread that calls `post()` on the handle of `gostd::local::post_later(Box::new(rest))` when it ends; `rest` then runs in `local::run_pending()`, with no poll before (ATA npm) |
 | `sync.WaitGroup`, `wg.Go`, `core.WorkGroup`, `errgroup` over dispatch-thread state | serial, in Go start order, like Go's single-threaded `WorkGroup`; keep the `ctx.err()` checks (the cross-project search is the one exception, see "Threads") |
 | `errgroup.WithContext` over `Send` loops | `gostd::errgroup` (real threads) |
 | `chan T` with capacity n / unbuffered | `std::sync::mpsc::sync_channel(n)` / `sync_channel(0)`; `select` with `default` is `try_send` / `try_recv`; `select` on `ctx.Done()` is a `recv_timeout` loop that checks `ctx.err()` (PORT note) |
@@ -1107,7 +1108,29 @@ each message and after each wake-up. Go `WaitForBackgroundTasks` runs
 - One dispatch thread (see "Threads"): the server answers requests in
   arrival order, where Go runs the async part of a request on a goroutine
   and answers in finish order. Timers and background tasks run at message
-  boundaries. The results are Go's; only order and timing differ.
+  boundaries. Without an API session, the results of LSP requests are
+  Go's and only order and timing differ. With an API session, the limits
+  below also change which messages are answered and when.
+- API sessions of the LSP server (`custom/initializeAPISession`) are
+  served on the dispatch thread too (`lsp/server.rs` `ApiConnProtocol`).
+  LSP messages and API requests do not run at the same time. These
+  limits are more than order and timing:
+  - While an API request waits for a client callback, the server serves
+    `didChange`, `didClose`, `didSave` and `$/setTrace` in arrival order.
+    Other LSP messages, and all messages after the first of them, wait
+    until the client answers. `shutdown` and `exit` are served wherever
+    they are in the queue, so the server still stops; a message that
+    waits behind them is answered later, or not at all after `exit`. Go
+    answers the waiting messages, except those that need the snapshot
+    that an API request builds for the session.
+  - A second connected API session holds the first until it closes. A
+    client that waits for the first before it closes the second
+    deadlocks.
+  - A client callback from an LSP message served while an API connection
+    waits returns an error. Go makes the call.
+  - `--api --async` and the API sessions run requests one at a time
+    (`ipc/conn_async.rs`). A pipelined request sees the result of the one
+    before it. Go runs them at the same time.
 - Go runtime profiles (pprof) have no samples: the port writes Go's file
   names, errors and log lines and valid empty profiles. `runtime.GC` is a
   no-op. `runtime/metrics` reads as `KindBad`, so the Go runtime fields of

@@ -780,6 +780,92 @@ pub fn port_byte_offset(text: &str, go_pos: i32) -> i32 {
     (port + (go_pos - go)) as i32
 }
 
+/// `go_byte_offset` and `port_byte_offset` for many offsets of one text,
+/// with one scan for markers. LSP code lenses and references convert one
+/// offset for each item; each call of the plain functions scans from the
+/// text start.
+pub struct GoOffsets {
+    len: usize,
+    /// The marker units in text order.
+    units: Vec<GoOffsetUnit>,
+}
+
+struct GoOffsetUnit {
+    /// The unit's port offset and size.
+    at: usize,
+    size: usize,
+    /// The unit's Go offset and Go length.
+    go_at: usize,
+    go_len: usize,
+}
+
+impl GoOffsets {
+    pub fn new(text: &str) -> Self {
+        let bytes = text.as_bytes();
+        let mut units = Vec::new();
+        // `port` and `go` are the same point in both texts.
+        let (mut port, mut go) = (0usize, 0usize);
+        while let Some(at) = find_go_string_marker(bytes, port) {
+            let (unit, size) = go_unit_at(text, at);
+            let go_at = go + (at - port);
+            units.push(GoOffsetUnit {
+                at,
+                size,
+                go_at,
+                go_len: unit.go_len(),
+            });
+            go = go_at + unit.go_len();
+            port = at + size;
+        }
+        Self {
+            len: text.len(),
+            units,
+        }
+    }
+
+    /// Reports whether the text has a marker unit. Without one, port and Go
+    /// offsets are the same.
+    pub fn has_units(&self) -> bool {
+        !self.units.is_empty()
+    }
+
+    /// `go_byte_offset(text, pos)`.
+    pub fn go_offset(&self, pos: i32) -> i32 {
+        if pos <= 0 {
+            return pos;
+        }
+        let end = (pos as usize).min(self.len);
+        let i = self.units.partition_point(|u| u.at < end);
+        let Some(u) = i.checked_sub(1).map(|i| &self.units[i]) else {
+            return pos;
+        };
+        // The port bytes before `u` that Go does not have, then `u`'s.
+        let mut extra = u.at - u.go_at;
+        if u.at + u.size > end {
+            extra += (end - u.at).saturating_sub(u.go_len);
+        } else {
+            extra += u.size - u.go_len;
+        }
+        pos - extra as i32
+    }
+
+    /// `port_byte_offset(text, go_pos)`.
+    pub fn port_offset(&self, go_pos: i32) -> i32 {
+        if go_pos <= 0 {
+            return go_pos;
+        }
+        let go_pos = go_pos as usize;
+        let i = self.units.partition_point(|u| u.go_at < go_pos);
+        let Some(u) = i.checked_sub(1).map(|i| &self.units[i]) else {
+            return go_pos as i32;
+        };
+        if u.go_at + u.go_len > go_pos {
+            return (u.at + (go_pos - u.go_at)) as i32;
+        }
+        (u.at + u.size + (go_pos - u.go_at - u.go_len)) as i32
+    }
+}
+
 /// The unit of the port form `s` that holds byte `pos` after its start
 /// (see `GO_STRING_MARKER`): the unit's start, the unit and its size in `s`.
 /// `None` when `pos` is a unit boundary or at or past the end. A char that

@@ -72,17 +72,22 @@ pub struct ProjectReferenceParser<'a> {
     pub loader: &'a mut FileLoader,
     pub queue: Vec<ProjectReferenceParseTaskRef>,
     pub tasks_by_file_name: FxHashMap<Path, ProjectReferenceParseTaskRef>,
+    /// Go `core.NewWorkGroup(singleThreaded)`: false when Go runs each
+    /// queued task on its own goroutine (see `run_and_wait`).
+    single_threaded: bool,
 }
 
 impl<'a> ProjectReferenceParser<'a> {
     // PORT: Go builds the parser with a struct literal and
-    // `core.NewWorkGroup(singleThreaded)`. The port has only the
-    // single-threaded work group, so `single_threaded` is not used.
-    pub fn new(loader: &'a mut FileLoader, _single_threaded: bool) -> Self {
+    // `core.NewWorkGroup(singleThreaded)`. The port runs the queue of the
+    // single-threaded work group in both modes; `single_threaded` keeps
+    // Go's goroutine boundary for panics (`run_and_wait`).
+    pub fn new(loader: &'a mut FileLoader, single_threaded: bool) -> Self {
         ProjectReferenceParser {
             loader,
             queue: Vec::new(),
             tasks_by_file_name: FxHashMap::default(),
+            single_threaded,
         }
     }
 
@@ -101,13 +106,25 @@ impl<'a> ProjectReferenceParser<'a> {
 
     // Go: core/workgroup.go:67 (*singleThreadedWorkGroup).RunAndWait
     // PORT: each popped entry is the Go queued closure
-    // `task.parse(p); p.start(task.subTasks)`.
+    // `task.parse(p); p.start(task.subTasks)`. Unless single threaded, Go
+    // runs it on its own goroutine (core/workgroup.go:38
+    // `parallelWorkGroup.Queue`, `sync.WaitGroup.Go`), where no caller's
+    // `recover()` sees a panic: with `go_work_group_task` a Go panic in it
+    // ends the run as it does in Go, as in `FilesParser::run_queue`.
     fn run_and_wait(&mut self) {
+        let single_threaded = self.single_threaded;
         while let Some(task) = self.queue.pop() {
-            task.borrow_mut().parse(self);
-            let mut sub_tasks = std::mem::take(&mut task.borrow_mut().sub_tasks);
-            self.start(&mut sub_tasks);
-            task.borrow_mut().sub_tasks = sub_tasks;
+            let mut run = || {
+                task.borrow_mut().parse(self);
+                let mut sub_tasks = std::mem::take(&mut task.borrow_mut().sub_tasks);
+                self.start(&mut sub_tasks);
+                task.borrow_mut().sub_tasks = sub_tasks;
+            };
+            if single_threaded {
+                run();
+            } else {
+                crate::core::go_work_group_task(run);
+            }
         }
     }
 

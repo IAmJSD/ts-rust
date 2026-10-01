@@ -4,6 +4,7 @@ use crate::ls::lsconv::prelude::*;
 
 use crate::frontend::scanner::scanner_p1::{RUNE_SELF, utf8_decode_rune_in_string};
 use crate::gostd;
+use crate::scanner_util::contains_go_string_marker;
 
 // Go: ls/lsconv/linemap.go:12 LSPLineStarts
 // PORT: Go `[]core.TextPos`; `core.TextPos` is `int32`.
@@ -14,6 +15,11 @@ pub type LSPLineStarts = Vec<i32>;
 pub struct LSPLineMap {
     pub line_starts: LSPLineStarts,
     pub ascii_only: bool, // TODO(jakebailey): collect ascii-only info per line
+    /// PORT: whether the text holds a marker unit (see
+    /// `scanner_util::GO_STRING_MARKER`). Without one, port byte offsets
+    /// are Go's, so a UTF-8 column needs no scan of its line (Go
+    /// `converters.go` `start+char` and `position - start`).
+    pub has_marker: bool,
 }
 
 // Go: ls/lsconv/linemap.go:19 ComputeLSPLineStarts
@@ -61,6 +67,7 @@ pub fn compute_lsp_line_starts(text: &str) -> Rc<LSPLineMap> {
     Rc::new(LSPLineMap {
         line_starts,
         ascii_only,
+        has_marker: !ascii_only && contains_go_string_marker(text),
     })
 }
 

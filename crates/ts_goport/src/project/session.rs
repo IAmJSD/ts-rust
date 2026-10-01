@@ -352,6 +352,11 @@ impl ata::NpmExecutor for Session {
             .unwrap_or_else(|| crate::core::go_nil_dereference())
             .npm_install(cwd, npm_install_args)
     }
+
+    // PORT: see `ata::NpmExecutor::npm_install_func`.
+    fn npm_install_func(&self) -> Option<ata::NpmInstallFunc> {
+        self.npm_executor.as_ref()?.npm_install_func()
+    }
 }
 
 impl Session {
@@ -3351,7 +3356,7 @@ impl Session {
                     if let Some(client) = s.client.as_ref() {
                         client.progress_start(
                             diag::Installing_types_for_0,
-                            args![project_display_name],
+                            args![project_display_name.clone()],
                         );
                     }
                     let typings_installer = s
@@ -3359,39 +3364,46 @@ impl Session {
                         .borrow()
                         .clone()
                         .unwrap_or_else(|| crate::core::go_nil_dereference());
-                    let result = typings_installer.install_typings_exported(&request);
-                    if let Some(client) = s.client.as_ref() {
-                        client.progress_finish(
-                            diag::Installing_types_for_0,
-                            args![project_display_name],
-                        );
-                    }
-                    match result {
-                        Err(err) => {
-                            if log_tree.is_some() {
-                                s.logger.log(&format!(
-                                    "ATA installation failed for project {}: {}",
-                                    project_id,
-                                    err.error()
-                                ));
-                                s.logger.log(&log_tree.string());
+                    // PORT: the rest of the goroutine is a future that waits
+                    // for npm off the dispatch thread (`ata::run_task`). The
+                    // hold keeps this task running until the future ends.
+                    let hold = s.background_queue.hold();
+                    ata::run_task(Box::pin(async move {
+                        let result = typings_installer.install_typings_exported(&request).await;
+                        if let Some(client) = s.client.as_ref() {
+                            client.progress_finish(
+                                diag::Installing_types_for_0,
+                                args![project_display_name],
+                            );
+                        }
+                        match result {
+                            Err(err) => {
+                                if log_tree.is_some() {
+                                    s.logger.log(&format!(
+                                        "ATA installation failed for project {}: {}",
+                                        project_id,
+                                        err.error()
+                                    ));
+                                    s.logger.log(&log_tree.string());
+                                }
+                            }
+                            Ok(result) => {
+                                if result.typings_files != project.borrow().typings_files {
+                                    s.pending_ata_changes.borrow_mut().insert(
+                                        project_id,
+                                        Rc::new(ATAStateChange {
+                                            typings_info: Some(typings_info),
+                                            typings_files: result.typings_files,
+                                            typings_files_to_watch: result.files_to_watch,
+                                            logs: log_tree,
+                                        }),
+                                    );
+                                    s.schedule_diagnostics_refresh_exported();
+                                }
                             }
                         }
-                        Ok(result) => {
-                            if result.typings_files != project.borrow().typings_files {
-                                s.pending_ata_changes.borrow_mut().insert(
-                                    project_id,
-                                    Rc::new(ATAStateChange {
-                                        typings_info: Some(typings_info),
-                                        typings_files: result.typings_files,
-                                        typings_files_to_watch: result.files_to_watch,
-                                        logs: log_tree,
-                                    }),
-                                );
-                                s.schedule_diagnostics_refresh_exported();
-                            }
-                        }
-                    }
+                        drop(hold);
+                    }));
                 });
         }
     }

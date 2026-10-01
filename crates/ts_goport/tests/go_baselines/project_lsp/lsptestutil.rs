@@ -214,7 +214,7 @@ pub fn new_lsp_client(
     }
 }
 
-type NpmInstall = Box<dyn Fn(&str, &[String]) -> (Vec<u8>, Option<GoError>)>;
+type NpmInstall = Box<dyn Fn(&str, &[String]) -> (Vec<u8>, Option<GoError>) + Send + Sync>;
 
 /// Go `exec.Command("npm", args...)` in `cwd`, `cmd.Output()` (the
 /// `NpmInstall` of lsp `TestReplay`). PORT: the error text is approximated.
@@ -407,6 +407,21 @@ impl LspClient {
     pub fn send_notification<P: AnyValue>(&self, info: &lsproto::NotificationInfo<P>, params: P) {
         let notification = info.new_notification_message(params);
         self.write_msg(notification.message());
+    }
+
+    /// Waits up to `timeout` for the server's `run` to return by itself,
+    /// as after an LSP `exit`. True when it returned.
+    pub fn wait_server_end(&self, timeout: Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if self.server.as_ref().is_none_or(JoinHandle::is_finished) {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     /// Go `closeClient()`: cancel, close the input and wait for the server.

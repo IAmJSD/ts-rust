@@ -58,6 +58,13 @@ pub struct AliasResolver {
         RefCell<FxHashMap<tspath::Path, FxHashMap<module::ModeAwareCacheKey, Arc<ResolvedModule>>>>,
     /// The program of the checker, once `new_checker` made it.
     pub checker_program: Cell<Option<&'static GoProgram>>,
+    /// The ids of the files that the walk of `new_narrow_checker` read. None
+    /// for a full walk.
+    pub narrow_files: RefCell<Option<FxHashSet<usize>>>,
+    /// Set when the checker of a narrow walk asked for a file outside it
+    /// (`get_source_file`). The caller then drops the checker and its
+    /// results, and makes a checker with the full walk.
+    pub missed: Cell<bool>,
 }
 
 // Go: ls/autoimport/aliasresolver.go:33 newAliasResolver
@@ -79,6 +86,8 @@ pub fn new_alias_resolver(
         resolved_modules: RefCell::new(FxHashMap::default()),
         prefetched_modules: RefCell::new(FxHashMap::default()),
         checker_program: Cell::new(None),
+        narrow_files: RefCell::new(None),
+        missed: Cell::new(false),
     });
     r
 }
@@ -112,10 +121,35 @@ fn checker_module_references(file: Node) -> Vec<String> {
     let info = source_file_info(file);
     let mut names: Vec<String> = Vec::new();
     for node in file.statements().iter() {
-        collect_checker_module_references(node, &mut names);
+        collect_checker_module_references(node, false, &mut names);
     }
     names.extend(info.imports.iter().map(|name| name.text().to_string()));
     // Go: checker mergeModuleAugmentation resolves each augmentation name.
+    names.extend(
+        info.module_augmentations
+            .iter()
+            .filter(|name| is_string_literal(**name))
+            .map(|name| name.text().to_string()),
+    );
+    names
+}
+
+/// The module names that the walk of `new_narrow_checker` follows from
+/// `file`: every name of `checker_module_references` for a declaration
+/// file. For any other file only the re-exports (`export ... from`) and
+/// the string literal module augmentations: the imports, `require` calls
+/// and import calls of JS and TS sources reach their whole implementation
+/// (about 870 files of jsdom, css-tree and cssstyle in Query core), and the
+/// export extraction rarely asks for them.
+fn narrow_module_references(file: Node) -> Vec<String> {
+    let info = source_file_info(file);
+    if info.is_declaration_file {
+        return checker_module_references(file);
+    }
+    let mut names: Vec<String> = Vec::new();
+    for node in file.statements().iter() {
+        collect_checker_module_references(node, true, &mut names);
+    }
     names.extend(
         info.module_augmentations
             .iter()
@@ -129,7 +163,12 @@ fn checker_module_references(file: Node) -> Vec<String> {
 // PORT: without the ambient module conditions (see
 // `checker_module_references`). Go checker `resolveExternalModuleNameWorker`
 // takes any string literal like specifier.
-fn collect_checker_module_references(node: Node, names: &mut Vec<String>) {
+// PORT: `re_exports_only` keeps only the export declarations
+// (`narrow_module_references`).
+fn collect_checker_module_references(node: Node, re_exports_only: bool, names: &mut Vec<String>) {
+    if re_exports_only && is_any_import_or_re_export(node) && !is_export_declaration(node) {
+        return;
+    }
     if is_any_import_or_re_export(node) {
         let module_name_expr = crate::ast::get_external_module_name(node);
         if module_name_expr.is_some() && is_string_literal_like(module_name_expr) {
@@ -149,10 +188,10 @@ fn collect_checker_module_references(node: Node, names: &mut Vec<String>) {
         }
         if is_module_block(body) {
             for statement in body.statements().iter() {
-                collect_checker_module_references(statement, names);
+                collect_checker_module_references(statement, re_exports_only, names);
             }
         } else {
-            collect_checker_module_references(body, names);
+            collect_checker_module_references(body, re_exports_only, names);
         }
     }
 }
@@ -203,6 +242,35 @@ impl AliasResolver {
         ctx: &Context,
         also_reads: &[Node],
     ) -> Option<(Rc<RefCell<Checker>>, AliasResolverProgramScope)> {
+        self.new_checker_walk(ctx, also_reads, false)
+    }
+
+    /// `new_checker` with a narrow walk: it follows only
+    /// `narrow_module_references`, and the checker can read only the walked
+    /// files. For any other file `get_source_file` sets `missed` and gives
+    /// nil; the caller must then drop the checker and every result of it, and
+    /// use `new_checker` on a new resolver. With no miss, the checker read
+    /// only files that it asked for, so its results are those of
+    /// `new_checker`.
+    // PERF: Go reads only the files that the checker asks for: 450
+    // node_modules files in the Query core editor session, against 1,316
+    // for the full walk. The first auto-import of that session added 162 MiB
+    // of RSS with the full walk, and 16 MiB with this one (Go: 17 to 35).
+    pub fn new_narrow_checker(
+        self: &Rc<Self>,
+        ctx: &Context,
+    ) -> Option<(Rc<RefCell<Checker>>, AliasResolverProgramScope)> {
+        self.new_checker_walk(ctx, &[], true)
+    }
+
+    /// `new_checker`, with the narrow walk of `new_narrow_checker` when
+    /// `narrow` is set.
+    fn new_checker_walk(
+        self: &Rc<Self>,
+        ctx: &Context,
+        also_reads: &[Node],
+        narrow: bool,
+    ) -> Option<(Rc<RefCell<Checker>>, AliasResolverProgramScope)> {
         // Go: NewChecker reads each root file; a nil file is a nil dereference.
         if self.root_files.iter().any(|file| file.is_nil()) {
             crate::core::go_nil_dereference();
@@ -227,7 +295,12 @@ impl AliasResolver {
             }
             let file = files[next];
             next += 1;
-            for module_reference in checker_module_references(file) {
+            let module_references = if narrow {
+                narrow_module_references(file)
+            } else {
+                checker_module_references(file)
+            };
+            for module_reference in module_references {
                 let resolved = self.prefetch_resolved_module(file, &module_reference);
                 if !resolved.is_resolved()
                     || !read_names.insert(resolved.resolved_file_name.clone())
@@ -253,6 +326,10 @@ impl AliasResolver {
             self.use_case_sensitive_file_names(),
             self.clone(),
         );
+        if narrow {
+            *self.narrow_files.borrow_mut() =
+                Some(files.iter().map(|file| file.file_index()).collect());
+        }
         self.checker_program.set(Some(scope.program()));
         let checker = ls_program::new_checker_for_version(scope.program());
         Some((Rc::new(RefCell::new(checker)), scope))
@@ -347,6 +424,17 @@ impl AliasResolver {
             .get_source_file(file_name, &(self.to_path)(file_name));
         // file may be nil due to symlink/realpath mismatch; see TestAutoImportBuilderFS
         if file.is_nil() {
+            return Node::NIL;
+        }
+        // PORT: a file outside a narrow walk (`new_narrow_checker`).
+        if self.checker_program.get().is_some()
+            && self
+                .narrow_files
+                .borrow()
+                .as_ref()
+                .is_some_and(|files| !files.contains(&file.file_index()))
+        {
+            self.missed.set(true);
             return Node::NIL;
         }
         self.bind_source_file(file);
