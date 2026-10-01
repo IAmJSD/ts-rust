@@ -763,10 +763,10 @@ impl BuildTask {
     /// what `compile_and_emit_start` and `compile_and_emit_finish` read
     /// from the task. The builder makes its own copy of the task from it
     /// (`from_compile_job`).
-    pub(crate) fn compile_job(&self, orchestrator: &dyn BuildTaskOrchestrator) -> CompileJob {
+    pub(crate) fn compile_job(&self, path: &Path) -> CompileJob {
         CompileJob {
             config: self.config.clone(),
-            path: orchestrator.to_path(&self.config),
+            path: path.clone(),
             status: self.status.clone(),
             build_info_entry: self.build_info_entry.clone().map(|entry| BuildInfoEntry {
                 // Only the up-to-date check reads it.

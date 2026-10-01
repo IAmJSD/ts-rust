@@ -36,11 +36,11 @@
 //! on it (`start_builders`), the programs of the started tasks load at the
 //! same time instead, each on a builder thread that also checks, emits,
 //! writes and releases it (builders.rs); the schedule above does not
-//! change, and a finish waits for the loads that run. Where Go does task work on its goroutines
-//! that needs no task state, threads do it ahead of this thread: the file
-//! name match of each config (config_prefetch.rs), and the build info
-//! read, its check parts and the source mtimes of each task
-//! (`BuildInfoPrefetch`).
+//! change, and a finish waits for the loads that run. Where Go does task
+//! work on its goroutines that needs no task state, threads do it ahead of
+//! this thread: the file name match of each config (config_prefetch.rs),
+//! and the build info read, its check parts and the source mtimes of each
+//! task (`BuildInfoPrefetch`).
 //!
 //! PORT: the task keeps its project statistics (see build_task.rs), and
 //! `report_task` adds them to the aggregate `--diagnostics` and
@@ -943,7 +943,7 @@ impl Orchestrator {
                         task.build_project_check(self, &paths[index])
                     }
                 };
-                if compiles && !overlap_checked && num_routines > 1 {
+                if compiles && !testing && !overlap_checked && num_routines > 1 {
                     overlap_checked = true;
                     in_build_order = self.outputs_overlap(&paths);
                     builders = self.start_builders(num_routines, in_build_order, &ready);
@@ -952,7 +952,7 @@ impl Orchestrator {
                 states[index] = if !compiles {
                     State::Done
                 } else if let Some(builders) = &mut builders {
-                    builders.compile(index, task.compile_job(self));
+                    builders.compile(index, task.compile_job(&paths[index]));
                     signals[index] = 1;
                     State::Compiling
                 } else if !task.build_project_compile(self, &paths[index]) {
