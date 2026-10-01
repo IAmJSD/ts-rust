@@ -33,7 +33,8 @@
 //! Outside tests each program is released when its task is built, as Go
 //! drops it there; in tests when its task reports. Its checker threads
 //! free it in the background. In a build where the output does not depend
-//! on it (`start_builders`), the programs of the started tasks load at the
+//! on it and every task that compiles is a light rebuild
+//! (`uses_builders`), the programs of the started tasks load at the
 //! same time instead, each on a builder thread that also checks, emits,
 //! writes and releases it (builders.rs); the schedule above does not
 //! change, and a finish waits for the loads that run. Where Go does task
@@ -861,8 +862,13 @@ impl Orchestrator {
         // PORT: testing (see the top comment)
         let testing = self.opts.testing.is_some();
         let paths: Vec<Path> = order.iter().map(|c| self.to_path(c)).collect();
+        // PORT: not in Go (perf). Whether the programs can load on builder
+        // threads (builders.rs), made when the first task compiles.
+        let builders_setting = self.builders_setting(num_routines);
+        let mut builders = None;
         if !clean {
-            *self.build_info_prefetch.borrow_mut() = self.start_build_info_prefetch(&paths);
+            *self.build_info_prefetch.borrow_mut() =
+                self.start_build_info_prefetch(&paths, builders_setting == BuildersSetting::Light);
         }
         // The threads of the config parses end once their queued reads
         // are done.
@@ -895,9 +901,6 @@ impl Orchestrator {
         // was done when it started. With one builder the order is the same.
         let mut in_build_order = false;
         let mut overlap_checked = false;
-        // PORT: not in Go (perf). The builder threads of a parallel build
-        // (builders.rs), made when the first task compiles.
-        let mut builders = None;
         // Tasks taken (Go `currentTaskIndex`), taken and not built, and
         // reported. The tasks before `next_report` are built.
         let mut next_take = 0;
@@ -931,7 +934,7 @@ impl Orchestrator {
                         continue;
                     }
                 }
-                let (compiles, light) = {
+                let compiles = {
                     let mut task = task.borrow_mut();
                     task.result = Some(TaskResult::new(
                         self.create_task_builder_status_reporter(),
@@ -939,16 +942,17 @@ impl Orchestrator {
                     ));
                     if clean {
                         task.clean_project(self, &paths[index]);
-                        (false, false)
+                        false
                     } else {
-                        let compiles = task.build_project_check(self, &paths[index]);
-                        (compiles, compiles && self.is_light_rebuild(&task))
+                        task.build_project_check(self, &paths[index])
                     }
                 };
                 if compiles && !testing && !overlap_checked && num_routines > 1 {
                     overlap_checked = true;
                     in_build_order = self.outputs_overlap(&paths);
-                    builders = self.start_builders(num_routines, in_build_order, light, &ready);
+                    if !in_build_order && self.uses_builders(builders_setting, &task.borrow()) {
+                        builders = self.start_builders(num_routines, &ready);
+                    }
                 }
                 let mut task = task.borrow_mut();
                 states[index] = if !compiles {
@@ -1067,77 +1071,27 @@ impl Orchestrator {
         outputs_overlap(&configs, &self.opts.sys.fs(), &self.compare_paths_options)
     }
 
-    /// PORT: not in Go (perf). True for a task that compiles whose rebuild
-    /// only reports the errors of its build info or makes its pending emit,
-    /// and whose root files are not newer than its build info: its program
-    /// loads, and there is little to check. A build whose first compile is
-    /// such a rebuild loads its programs on builder threads
-    /// (`start_builders`). The mtimes come from the file system without the
-    /// build host's caches, so this changes no later check.
-    // PERF (tscbpar1, stable bins): parallel loads cut hono-b noop (3 such
-    // rebuilds) from 122 to 101 ms on mini-743d. In the builds that check,
-    // the checkers keep the cores busy, and each builder parses the shared
-    // `.d.ts` files of its loads again (its own parse cache): hono-b cold
-    // was 6.5% and wide cold 4% slower, and the hono-b body and API edits
-    // used 20% to 75% more CPU and 12% to 49% more memory for the same time.
-    fn is_light_rebuild(&self, task: &BuildTask) -> bool {
-        let light = task.status.as_ref().is_some_and(|status| {
-            matches!(
-                status.kind,
-                UpToDateStatusType::OutOfDateBuildInfoWithErrors
-                    | UpToDateStatusType::OutOfDateBuildInfoWithPendingEmit
-            )
-        });
-        let (Some(resolved), Some(build_info_time)) = (
-            &task.resolved,
-            task.build_info_entry
-                .as_ref()
-                .and_then(|entry| entry.m_time),
-        ) else {
-            return false;
-        };
-        let fs = self.opts.sys.fs();
-        light
-            && resolved.file_names().iter().all(|file| {
-                fs.stat(file)
-                    .and_then(|info| info.mod_time())
-                    .is_some_and(|m_time| m_time <= build_info_time)
-            })
-    }
-
-    /// PORT: not in Go (perf). The builder threads of a parallel build
-    /// (builders.rs), at most `num_routines`, which send the index of each
-    /// task whose check and emit are done to `ready`. `light`: the first
-    /// task that compiles is a light rebuild (`is_light_rebuild`). None
-    /// when that task is not, unless `GOPORT_TSCB_BUILDERS=1`, and where
-    /// the output of builders could differ from the output of this thread
-    /// alone; this thread then builds every program:
-    /// - one routine, or tasks that can see each other's writes
-    ///   (`overlap`, see `in_build_order` in `build_all_tasks`);
+    /// PORT: not in Go (perf). Whether the tasks of this build can compile
+    /// on builder threads (builders.rs). `Off` where the output of builders
+    /// could differ from the output of this thread alone, or where they
+    /// gain nothing:
+    /// - one routine (`--singleThreaded`, `--builders 1`);
     /// - tests, watch mode, `--clean`, and content mappers;
     /// - a file system other than the OS one, or writes that only this
     ///   thread can make (`System::emit_writes_through_osvfs`);
     /// - a build host that keeps parses of an earlier build;
     /// - `GOPORT_TSCB_BUILDERS=0` (for A/B runs, and as a fallback).
-    /// The output is the same with or without builders.
-    /// This thread then publishes the stores of the configs that it parsed,
-    /// so the builders can read them, and takes its file ids in runs
-    /// (`ast::reserve_file_ids`) from now on, as the builders do.
-    fn start_builders(
-        &self,
-        num_routines: usize,
-        overlap: bool,
-        light: bool,
-        ready: &std::sync::mpsc::Sender<usize>,
-    ) -> Option<Builders> {
+    /// Else `Always` with `GOPORT_TSCB_BUILDERS=1`, and `Light` otherwise.
+    /// Tasks that can see each other's writes (`outputs_overlap`) also
+    /// compile on this thread; that is found when the first task compiles.
+    fn builders_setting(&self, num_routines: usize) -> BuildersSetting {
         let setting = std::env::var_os("GOPORT_TSCB_BUILDERS");
         let options = &self.opts.command.compiler_options;
         let mut host_has_parses = false;
         self.host
             .source_files
             .for_each_stored(|_, _| host_has_parses = true);
-        if overlap
-            || num_routines < 2
+        if num_routines < 2
             || self.opts.testing.is_some()
             || options.watch.is_true()
             || self.opts.command.build_options.clean.is_true()
@@ -1146,10 +1100,64 @@ impl Orchestrator {
             || !self.opts.sys.emit_writes_through_osvfs()
             || host_has_parses
             || setting.as_ref().is_some_and(|value| value == "0")
-            || !(light || setting.is_some_and(|value| value == "1"))
         {
-            return None;
+            BuildersSetting::Off
+        } else if setting.is_some_and(|value| value == "1") {
+            BuildersSetting::Always
+        } else {
+            BuildersSetting::Light
         }
+    }
+
+    /// PORT: not in Go (perf). True when the tasks of this build compile on
+    /// builder threads, decided when the first task that compiles, `first`,
+    /// has its status. With `BuildersSetting::Light`: when `first` only
+    /// reports the errors of its build info or makes its pending emit, and
+    /// the build info threads forecast the same light rebuild for every
+    /// other task that compiles, and for at least two tasks
+    /// (`RebuildForecast`).
+    // PERF (tscbpar1, stable bins): parallel loads cut hono-b noop (3 light
+    // rebuilds) from about 122 to 101 ms on the minis. Where a task checks,
+    // the checkers keep the cores busy, and each builder parses the shared
+    // `.d.ts` files of its loads again (its own parse cache). With builders
+    // in every build, hono-b cold was 6.5% and wide cold 4% slower. With
+    // builders after a light first compile only, a hono-b rebuild after an
+    // edit of a test file of one later project used 50% to 90% more CPU and
+    // 20% to 45% more memory, for the same time or 1% to 2% more. One light
+    // task alone gains nothing.
+    fn uses_builders(&self, setting: BuildersSetting, first: &BuildTask) -> bool {
+        match setting {
+            BuildersSetting::Off => false,
+            BuildersSetting::Always => true,
+            BuildersSetting::Light => {
+                first.status.as_ref().is_some_and(|status| {
+                    matches!(
+                        status.kind,
+                        UpToDateStatusType::OutOfDateBuildInfoWithErrors
+                            | UpToDateStatusType::OutOfDateBuildInfoWithPendingEmit
+                    )
+                }) && self
+                    .build_info_prefetch
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(BuildInfoPrefetch::light_rebuilds)
+            }
+        }
+    }
+
+    /// PORT: not in Go (perf). The builder threads of a parallel build
+    /// (builders.rs), at most `num_routines`, which send the index of each
+    /// task whose check and emit are done to `ready` (`uses_builders`).
+    /// None when a config cannot go to a builder (`BuildHost::builder_shared`).
+    /// The output is the same with or without builders.
+    /// This thread then publishes the stores of the configs that it parsed,
+    /// so the builders can read them, and takes its file ids in runs
+    /// (`ast::reserve_file_ids`) from now on, as the builders do.
+    fn start_builders(
+        &self,
+        num_routines: usize,
+        ready: &std::sync::mpsc::Sender<usize>,
+    ) -> Option<Builders> {
         let shared = self.host.builder_shared()?;
         let cwd = self.opts.sys.get_current_directory();
         crate::program::publish_parsed_files(&cwd);
@@ -1206,8 +1214,13 @@ impl Orchestrator {
     /// be any build info file of the build, so nothing is read.
     /// The threads also make the check parts of each build info
     /// (`StatusPrefetch`) and read the mtimes of its task's TypeScript
-    /// sources (`BuildHost::m_time_prefetch`).
-    fn start_build_info_prefetch(&self, paths: &[Path]) -> Option<BuildInfoPrefetch> {
+    /// sources (`BuildHost::m_time_prefetch`). With `forecast`, they then
+    /// forecast the rebuild of each task (`RebuildForecast`).
+    fn start_build_info_prefetch(
+        &self,
+        paths: &[Path],
+        forecast: bool,
+    ) -> Option<BuildInfoPrefetch> {
         let num_routines = usize::try_from(self.num_routines()).unwrap_or(0);
         if num_routines < 2
             || self.opts.command.build_options.force.is_true()
@@ -1221,39 +1234,55 @@ impl Orchestrator {
         let keys = PathKeys::new(&fs, &self.compare_paths_options);
         let mut named: FxHashMap<String, usize> = FxHashMap::default();
         let mut reads: Vec<(String, BuildInfoRead)> = Vec::new();
+        // A task that can compile and has no read: then no forecast is
+        // light.
+        let mut unread = false;
         for path in paths {
             let task = self.get_task(path);
             let task = task.borrow();
             let Some(resolved) = &task.resolved else {
                 continue;
             };
+            let solution = resolved.file_names().is_empty() && resolved.has_project_references();
             let name = resolved.get_build_info_file_name();
             if name.is_empty() {
+                unread |= !solution;
                 continue;
             }
             let build_info_key = keys.build_info_key(&name)?;
             *named.entry(build_info_key.clone()).or_default() += 1;
             let build_info_path = self.to_path(&name);
-            let solution = resolved.file_names().is_empty() && resolved.has_project_references();
             let keeps = task
                 .build_info_entry
                 .as_ref()
                 .is_some_and(|entry| entry.path == build_info_path);
+            unread |= keeps;
             if !solution && !keeps {
+                // Go's check compares the config files with the outputs too.
+                let config_files = if forecast {
+                    std::iter::once(task.config.clone())
+                        .chain(resolved.extended_source_files().iter().cloned())
+                        .collect()
+                } else {
+                    Vec::new()
+                };
                 reads.push((
                     build_info_key,
                     BuildInfoRead {
                         name,
                         input_files: resolved.file_names().to_vec(),
                         check: StatusCheckOptions::new(resolved.compiler_options()),
+                        config_files,
                     },
                 ));
             }
         }
+        let read_count = reads.len();
         let reads: Vec<BuildInfoRead> = reads
             .into_iter()
             .filter_map(|(key, read)| (named[&key] == 1).then_some(read))
             .collect();
+        unread |= reads.len() < read_count;
         if reads.len() < 2 {
             return None;
         }
@@ -1269,11 +1298,15 @@ impl Orchestrator {
             Some(pool) => pool,
             None => PrefetchPool::start()?,
         };
+        // Two light rebuilds need two tasks that can compile, each with a
+        // read.
+        let forecast = (forecast && !unread).then(|| Arc::new(RebuildForecast::new(reads.len())));
         let prefetch = BuildInfoPrefetch::start(
             &pool,
             reads,
             self.compare_paths_options.clone(),
             m_times.clone(),
+            forecast,
         );
         drop(pool);
         *self.host.m_time_prefetch.borrow_mut() = Some(m_times);
@@ -1482,16 +1515,108 @@ impl BuildTaskOrchestrator for Orchestrator {
 /// info shows that the check returns before these parts (errors, pending
 /// emit: `StatusCheckOptions::reads_input_times`), the thread skips them,
 /// as Go reads no input mtime there.
+///
+/// In a build that can use builder threads, each thread then forecasts the
+/// rebuild of the task (`RebuildForecast`).
 struct BuildInfoPrefetch {
     slots: FxHashMap<String, Arc<BuildInfoSlot>>,
+    forecast: Option<Arc<RebuildForecast>>,
 }
 
 /// One build info file that the threads read, the root files of its task
-/// (`resolved.FileNames()`) and the options that its check reads.
+/// (`resolved.FileNames()`) and the options that its check reads. For a
+/// forecast, the config file of the task and its extended config files.
 struct BuildInfoRead {
     name: String,
     input_files: Vec<String>,
     check: StatusCheckOptions,
+    config_files: Vec<String>,
+}
+
+/// PORT: not in Go (perf). Whether a build can compile its tasks on
+/// builder threads (`Orchestrator::builders_setting`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BuildersSetting {
+    Off,
+    /// Only when every task that compiles is a light rebuild
+    /// (`Orchestrator::uses_builders`).
+    Light,
+    /// In every build that can (`GOPORT_TSCB_BUILDERS=1`).
+    Always,
+}
+
+/// PORT: not in Go (perf). How the task of a build info file rebuilds, as
+/// far as its build info and the mtimes of its root and config files tell
+/// (`forecast_rebuild`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Rebuild {
+    /// The check finds the task up to date, unless an upstream task
+    /// changes its outputs.
+    None,
+    /// The task compiles to report the errors of its build info or to make
+    /// its pending emit, and no root or config file is newer than its
+    /// build info: its program loads, and there is little to check.
+    Light,
+    /// The task builds with changed inputs, without a build info, or with
+    /// another version or options, or the thread cannot tell.
+    Heavy,
+}
+
+/// PORT: not in Go (perf). The rebuilds that the build info threads
+/// forecast for the tasks of a build (`Rebuild`), for
+/// `Orchestrator::uses_builders`. Builders gain only where the loads of
+/// two or more tasks run at the same time and little is checked.
+struct RebuildForecast {
+    state: Mutex<ForecastState>,
+    changed: Condvar,
+}
+
+struct ForecastState {
+    /// The reads whose rebuild is not forecast yet.
+    pending: usize,
+    /// The light rebuilds.
+    light: usize,
+    /// A rebuild is heavy.
+    heavy: bool,
+}
+
+impl RebuildForecast {
+    fn new(reads: usize) -> Self {
+        RebuildForecast {
+            state: Mutex::new(ForecastState {
+                pending: reads,
+                light: 0,
+                heavy: false,
+            }),
+            changed: Condvar::new(),
+        }
+    }
+
+    fn add(&self, rebuild: Rebuild) {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state.pending -= 1;
+        match rebuild {
+            Rebuild::None => {}
+            Rebuild::Light => state.light += 1,
+            Rebuild::Heavy => state.heavy = true,
+        }
+        if state.pending == 0 || state.heavy {
+            self.changed.notify_all();
+        }
+    }
+
+    /// True when no rebuild is heavy and two or more are light. Waits
+    /// until a thread forecasts a heavy rebuild or every rebuild is known.
+    fn light(&self) -> bool {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        while state.pending > 0 && !state.heavy {
+            state = self
+                .changed
+                .wait(state)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+        !state.heavy && state.light >= 2
+    }
 }
 
 /// The mtimes that the build info threads read ahead of the checks, by
@@ -1541,7 +1666,8 @@ impl Drop for ReadySignal {
 impl BuildInfoPrefetch {
     /// Starts reading and parsing the files of `reads`, in order, on the
     /// threads of `pool` (at most one per file), and puts the mtimes they
-    /// read into `m_times`.
+    /// read into `m_times`. With `forecast`, each thread then forecasts the
+    /// rebuild of the task of each file it read (`forecast_rebuild`).
     // PORT: the threads only read, so their count changes no output; it
     // is not Go's `numRoutines`.
     fn start(
@@ -1549,6 +1675,7 @@ impl BuildInfoPrefetch {
         reads: Vec<BuildInfoRead>,
         compare_paths_options: ComparePathsOptions,
         m_times: MTimePrefetch,
+        forecast: Option<Arc<RebuildForecast>>,
     ) -> Self {
         let slots: Vec<(String, Arc<BuildInfoSlot>)> = reads
             .iter()
@@ -1561,6 +1688,7 @@ impl BuildInfoPrefetch {
                 .collect::<Vec<_>>()
                 .into_iter(),
         );
+        let thread_forecast = forecast.clone();
         pool.run(pool.threads().min(slots.len()), move || {
             let fs = crate::frontend::bundled::wrap_fs(crate::frontend::vfs::osvfs_fs());
             loop {
@@ -1573,11 +1701,15 @@ impl BuildInfoPrefetch {
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     let (data, ok) = fs.read_file(&read.name);
                     let build_info = if ok { parse_build_info(&data) } else { None };
+                    let early = build_info
+                        .as_ref()
+                        .map(|build_info| read.check.early_return(build_info));
                     // A check that returns before the input mtimes reads
                     // neither the check parts nor the mtimes.
+                    let mut sources = None;
                     let status = build_info
                         .as_ref()
-                        .filter(|build_info| read.check.reads_input_times(build_info))
+                        .filter(|_| early == Some(EarlyReturn::No))
                         .map(|build_info| {
                             let status = StatusPrefetch::new(
                                 build_info,
@@ -1585,17 +1717,31 @@ impl BuildInfoPrefetch {
                                 &read.input_files,
                                 &compare_paths_options,
                             );
-                            prefetch_m_times(&*fs, &read, &status, &m_times);
+                            sources = Some(prefetch_m_times(&*fs, &read, &status, &m_times));
                             status
                         });
-                    (build_info, status)
+                    ((build_info, status), early, sources)
                 }));
-                *slot.result.lock().unwrap_or_else(PoisonError::into_inner) = Some(result.ok());
+                let (result, shape) = match result {
+                    Ok((result, early, sources)) => (Some(result), Some((early, sources))),
+                    Err(_) => (None, None),
+                };
+                *slot.result.lock().unwrap_or_else(PoisonError::into_inner) = Some(result);
                 slot.done.notify_all();
+                if let Some(forecast) = &thread_forecast {
+                    let rebuild = shape.map_or(Rebuild::Heavy, |(early, sources)| {
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            forecast_rebuild(&*fs, &read, early, sources)
+                        }))
+                        .unwrap_or(Rebuild::Heavy)
+                    });
+                    forecast.add(rebuild);
+                }
             }
         });
         BuildInfoPrefetch {
             slots: slots.into_iter().collect(),
+            forecast,
         }
     }
 
@@ -1616,19 +1762,48 @@ impl BuildInfoPrefetch {
                 .unwrap_or_else(PoisonError::into_inner);
         }
     }
+
+    /// True when the threads forecast a light rebuild for two or more tasks
+    /// and no heavy one (`RebuildForecast::light`). False without a
+    /// forecast.
+    fn light_rebuilds(&self) -> bool {
+        self.forecast
+            .as_ref()
+            .is_some_and(|forecast| forecast.light())
+    }
+}
+
+/// The newest of some mtimes, and whether a file had none.
+#[derive(Clone, Copy, Default)]
+struct NewestTime {
+    newest: Option<SystemTime>,
+    missing: bool,
+}
+
+impl NewestTime {
+    fn add(&mut self, m_time: Option<SystemTime>) {
+        match m_time {
+            Some(m_time) => self.newest = self.newest.max(Some(m_time)),
+            None => self.missing = true,
+        }
+    }
+
+    fn newer_than(self, time: SystemTime) -> bool {
+        self.missing || self.newest.is_some_and(|newest| newest > time)
+    }
 }
 
 /// Reads the mtimes of the TypeScript sources (`is_typescript_source`) of
 /// `read` (its root files and the files of its build info, `status`) into
 /// `m_times`, as `BuildHost::get_m_time` reads them (`incremental.GetMTime`).
 /// Each path is read once: the build info lists the root files too, and the
-/// check keeps the first mtime of a path.
+/// check keeps the first mtime of a path. Returns the newest mtime read.
 fn prefetch_m_times(
     fs: &dyn Fs,
     read: &BuildInfoRead,
     status: &StatusPrefetch,
     m_times: &MTimePrefetch,
-) {
+) -> NewestTime {
     let roots = read.input_files.iter().zip(&status.input_paths);
     let files = status.file_names.iter().map(|(file, path)| (file, path));
     let mut seen: FxHashSet<&Path> =
@@ -1638,9 +1813,57 @@ fn prefetch_m_times(
         .filter(|(file, path)| is_typescript_source(file) && seen.insert(path))
         .map(|(file, path)| (path.clone(), fs.stat(file).and_then(|stat| stat.mod_time())))
         .collect();
+    let mut newest = NewestTime::default();
     let mut m_times = m_times.lock().unwrap_or_else(PoisonError::into_inner);
     for (path, m_time) in read {
+        newest.add(m_time);
         m_times.entry(path).or_insert(m_time);
+    }
+    newest
+}
+
+/// PORT: not in Go (perf). The rebuild of the task of `read` (`Rebuild`).
+/// `early` is where the task's check returns before it reads the input
+/// mtimes (`None`: no build info), and `sources` the newest of the
+/// TypeScript source mtimes that the thread read for a check that reads
+/// them (`prefetch_m_times`). The thread reads only the other mtimes that
+/// the forecast needs: the build info, the config files, and the root
+/// files that `sources` does not cover (all of them for a light rebuild,
+/// where Go's check reads none). It stops at the first file that is newer
+/// than the build info.
+/// The forecast misses a change that only Go's later parts of the check
+/// see (a package.json file, an upstream output), or, for a light rebuild,
+/// a changed file of the build info that is not a root file. Such a task
+/// compiles on a builder thread with the same output.
+fn forecast_rebuild(
+    fs: &dyn Fs,
+    read: &BuildInfoRead,
+    early: Option<EarlyReturn>,
+    sources: Option<NewestTime>,
+) -> Rebuild {
+    let Some(early) = early.filter(|early| *early != EarlyReturn::OutOfDate) else {
+        return Rebuild::Heavy;
+    };
+    let Some(build_info_time) = fs.stat(&read.name).and_then(|stat| stat.mod_time()) else {
+        return Rebuild::Heavy;
+    };
+    if sources.is_some_and(|sources| sources.newer_than(build_info_time)) {
+        return Rebuild::Heavy;
+    }
+    let roots = read
+        .input_files
+        .iter()
+        .filter(|file| sources.is_none() || !is_typescript_source(file));
+    for file in read.config_files.iter().chain(roots) {
+        let m_time = fs.stat(file).and_then(|stat| stat.mod_time());
+        if m_time.is_none_or(|m_time| m_time > build_info_time) {
+            return Rebuild::Heavy;
+        }
+    }
+    if early == EarlyReturn::ErrorsOrPendingEmit {
+        Rebuild::Light
+    } else {
+        Rebuild::None
     }
 }
 

@@ -31,7 +31,8 @@
 //!   ids.
 //!
 //! The orchestrator uses builders only where the output is the serial
-//! output (`Orchestrator::start_builders`).
+//! output (`Orchestrator::builders_setting`), and only when every task
+//! that compiles is a light rebuild (`Orchestrator::uses_builders`).
 
 use crate::execute::build::build_task::*;
 use crate::execute::build::command_line::{ParsedBuildCommandLine, SendBuildCommandLine};

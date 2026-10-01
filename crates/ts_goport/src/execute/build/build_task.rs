@@ -139,38 +139,58 @@ impl StatusCheckOptions {
     }
 
     /// False when `get_up_to_date_status` returns for `build_info` before
-    /// it reads an input mtime: the version, error and pending emit checks
-    /// that read only the build info and these options. True otherwise,
-    /// also when the check may return early for another reason.
+    /// it reads an input mtime (`early_return`). True otherwise, also when
+    /// the check may return early for another reason.
     pub fn reads_input_times(self, build_info: &BuildInfo) -> bool {
+        self.early_return(build_info) == EarlyReturn::No
+    }
+
+    /// Where `get_up_to_date_status` returns for `build_info` before it
+    /// reads an input mtime: the version, error and pending emit checks
+    /// that read only the build info and these options.
+    pub fn early_return(self, build_info: &BuildInfo) -> EarlyReturn {
         if !build_info.is_valid_version() {
-            return false;
+            return EarlyReturn::OutOfDate;
         }
         if build_info.errors
             || (!self.no_check && (build_info.semantic_errors || build_info.check_pending))
         {
-            return false;
+            return EarlyReturn::ErrorsOrPendingEmit;
         }
         if self.is_incremental {
             if !build_info.is_incremental() {
-                return false;
+                return EarlyReturn::OutOfDate;
             }
             if (self.emit_declarations && build_info.emit_diagnostics_per_file.is_some())
                 || (!self.no_check
                     && (build_info.change_file_set.is_some()
                         || build_info.semantic_diagnostics_per_file.is_some()))
             {
-                return false;
+                return EarlyReturn::ErrorsOrPendingEmit;
             }
             if !self.no_emit
                 && (build_info.change_file_set.is_some()
                     || build_info.affected_files_pending_emit.is_some())
             {
-                return false;
+                return EarlyReturn::ErrorsOrPendingEmit;
             }
         }
-        true
+        EarlyReturn::No
     }
+}
+
+/// PORT: not in Go (perf). Where `get_up_to_date_status` returns before it
+/// reads an input mtime (`StatusCheckOptions::early_return`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum EarlyReturn {
+    /// It does not: the check reads the input mtimes.
+    No,
+    /// `OutOfDateBuildInfoWithErrors` or `OutOfDateBuildInfoWithPendingEmit`:
+    /// the task compiles to report the errors of its build info or to make
+    /// its pending emit.
+    ErrorsOrPendingEmit,
+    /// `TsVersionOutputOfDate` or `OutOfDateOptions`: the task builds again.
+    OutOfDate,
 }
 
 impl StatusPrefetch {
