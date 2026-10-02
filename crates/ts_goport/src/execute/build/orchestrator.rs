@@ -39,8 +39,9 @@
 //! that compiles is a light rebuild (`later_tasks_use_builders`), the
 //! later ones do too, and load at the same time with the parses of the
 //! first program; else they compile on this thread with those parses. The
-//! schedule above does not change, and a finish waits for the loads that
-//! run on builders. Where Go does task
+//! schedule above does not change: a task that compiles while every
+//! builder is busy loads on this thread, and a finish waits for the loads
+//! that run on builders (see SLOTS in `build_all_tasks`). Where Go does task
 //! work on its goroutines that needs no task state, threads do it ahead of
 //! this thread: the file name match of each config (config_prefetch.rs),
 //! and the build info read, its check parts and the source mtimes of each
@@ -853,9 +854,6 @@ impl Orchestrator {
         enum State {
             NotTaken,
             Waiting,
-            /// PORT: not in Go (perf). Checked: it compiles on a builder
-            /// when one is free.
-            Checked,
             Compiling,
             Done,
         }
@@ -912,6 +910,53 @@ impl Orchestrator {
         // was done when it started. With one builder the order is the same.
         let mut in_build_order = false;
         let mut overlap_checked = false;
+        // SLOTS. Go (`rangeTasks`, `buildOrCleanProject`): `numRoutines`
+        // goroutines. A goroutine takes the next task in `order` when it
+        // starts and when it finished its task, writes included. A task
+        // waits for its upstream tasks, then it checks, loads, checks and
+        // emits, and writes. So in Go:
+        // (G1) a task is taken only while fewer than `numRoutines` taken
+        //      tasks are not finished, and the tasks are taken in order;
+        // (G2) a task loads after it is taken and its upstream tasks
+        //      finished (their writes included);
+        // (G3) a task writes after its own load;
+        // (G4) a taken task whose upstream tasks finished loads at once: its
+        //      goroutine waits for nothing else. So its load comes before
+        //      each write that starts later.
+        // Here:
+        // (P1) `in_flight` keeps G1: a slot frees when its task is built.
+        // (P2) a taken task starts when its upstream tasks are `Done`
+        //      (finished, writes included): G2.
+        // (P3) a task writes only in its finish, after its load (on a
+        //      builder: `Builders::compile`, then `Builders::finish`; on this
+        //      thread: `build_project_compile`, then `build_project_finish`).
+        //      The emit keeps its writes in memory until the finish: G3.
+        // (P4) this thread finishes a task only when the start loop made no
+        //      progress. Then every taken task whose upstream tasks are done
+        //      started: it loads at once, on a free builder or on this
+        //      thread. No task waits for a builder: when every builder is
+        //      busy, this thread loads the task. A load on this thread ends
+        //      before this thread starts a finish, and a finish waits for the
+        //      loads on builders (the read rule, builders.rs). So the load of
+        //      each such task comes before the next write: G4.
+        // (P5) a pseudo build (`updateTimeStamps` in the check) changes
+        //      mtimes only. No load reads an mtime, so its order with a load
+        //      does not change the output (as in R155).
+        // (P6) loads only read. With no write between two loads, their order
+        //      gives the same parses (the build's parse cache keeps the first
+        //      parse of each key, and no file changed). So a load that waits
+        //      for a parse of another load is the same as a load at once.
+        // So for a load L of task B and a write W of task A: when A is
+        // upstream of B, W comes before L (P2), as in Go. When B is upstream
+        // of A, L comes before W (P2, P3), as in Go. Else when B is taken and
+        // its upstream tasks are done when W starts, L comes first (P4), as
+        // G4 gives. Else W comes first: B is taken after a finish frees its
+        // slot (P1), or its upstream tasks finish after W. In Go too, B is
+        // taken only when the same number of tasks finished (G1), and W can
+        // be one of them or come before them. The finishes come in the order
+        // in which the checks and emits end (or in build order, see
+        // `in_build_order`), and Go can finish its tasks in that order. So
+        // each order of a load and a write here is one that Go can make.
         // Tasks taken (Go `currentTaskIndex`), taken and not built, and
         // reported. The tasks before `next_report` are built.
         let mut next_take = 0;
@@ -930,13 +975,11 @@ impl Orchestrator {
             // builder (Go `close(task.built)`).
             let mut progressed = false;
             for index in next_report..next_take {
-                let checked = match states[index] {
-                    State::Waiting => false,
-                    State::Checked => true,
-                    _ => continue,
-                };
+                if states[index] != State::Waiting {
+                    continue;
+                }
                 let task = self.get_task(&paths[index]);
-                if !clean && !checked {
+                if !clean {
                     let upstream_done = task.borrow().up_stream.iter().all(|upstream| {
                         let path = self.to_path(&upstream.task.borrow().config);
                         index_of
@@ -947,7 +990,7 @@ impl Orchestrator {
                         continue;
                     }
                 }
-                let compiles = checked || {
+                let compiles = {
                     let mut task = task.borrow_mut();
                     task.result = Some(TaskResult::new(
                         self.create_task_builder_status_reporter(),
@@ -960,7 +1003,7 @@ impl Orchestrator {
                         task.build_project_check(self, &paths[index])
                     }
                 };
-                if compiles && !checked && !testing && num_routines > 1 {
+                if compiles && !testing && num_routines > 1 {
                     if !overlap_checked {
                         overlap_checked = true;
                         in_build_order = self.outputs_overlap(&paths);
@@ -995,32 +1038,16 @@ impl Orchestrator {
                         }
                     }
                 }
-                // PORT: not in Go (perf). A task that compiles on a builder
-                // waits while every builder is busy (`start_builders`). Its
-                // check runs first, so a task that is up to date or skipped
-                // does not wait.
-                if compiles
-                    && later_on_builders != Some(false)
-                    && builders.as_ref().is_some_and(Builders::all_busy)
-                {
-                    states[index] = State::Checked;
-                    continue;
-                }
-                // The read rule (builders.rs): beside builders, this thread
-                // loads a program only when no builder loads one.
-                if compiles
-                    && later_on_builders == Some(false)
-                    && let Some(builders) = &builders
-                {
-                    builders.wait_for_loads();
-                }
+                // PORT: not in Go (perf). SLOTS (P4): a task that compiles
+                // loads now, on a free builder when the tasks use builders,
+                // else on this thread, beside the loads of the builders.
+                let on_builder = builders.as_mut().filter(|builders| {
+                    compiles && later_on_builders != Some(false) && !builders.all_busy()
+                });
                 let mut task = task.borrow_mut();
                 states[index] = if !compiles {
                     State::Done
-                } else if let Some(builders) = builders
-                    .as_mut()
-                    .filter(|_| later_on_builders != Some(false))
-                {
+                } else if let Some(builders) = on_builder {
                     builders.compile(index, task.compile_job(&paths[index]));
                     signals[index] = 1;
                     State::Compiling
@@ -1088,7 +1115,14 @@ impl Orchestrator {
                     let compiled = builders.finish(index);
                     task.finish_compile_job(self, &paths[index], compiled);
                 }
-                None => task.build_project_finish(self, &paths[index]),
+                None => {
+                    // The read rule (builders.rs): this thread writes only
+                    // when no builder loads (SLOTS, P4).
+                    if let Some(builders) = &builders {
+                        builders.wait_for_loads();
+                    }
+                    task.build_project_finish(self, &paths[index]);
+                }
             }
             states[index] = State::Done;
             self.task_built(&mut task);
@@ -1152,7 +1186,10 @@ impl Orchestrator {
     /// Tasks that can see each other's writes (`outputs_overlap`) also
     /// compile on this thread; that is found when the first task compiles.
     fn builders_setting(&self, num_routines: usize) -> BuildersSetting {
-        let setting = std::env::var_os("GOPORT_TSCB_BUILDERS");
+        let (setting, _) = self
+            .opts
+            .sys
+            .get_environment_variable("GOPORT_TSCB_BUILDERS");
         let options = &self.opts.command.compiler_options;
         let mut host_has_parses = false;
         self.host
@@ -1166,10 +1203,10 @@ impl Orchestrator {
             || !is_wrapped_os_fs(&self.opts.sys.fs())
             || !self.opts.sys.emit_writes_through_osvfs()
             || host_has_parses
-            || setting.as_ref().is_some_and(|value| value == "0")
+            || setting == "0"
         {
             BuildersSetting::Off
-        } else if setting.is_some_and(|value| value == "1") {
+        } else if setting == "1" {
             BuildersSetting::Always
         } else {
             BuildersSetting::Light
@@ -1206,8 +1243,8 @@ impl Orchestrator {
     /// info threads forecast no heavy rebuild (no task with changed inputs)
     /// and light ones in tasks that can compile at the same time, with
     /// enough files to load beside the largest one
-    /// (`RebuildForecast::light`). Else they compile on this thread, after
-    /// the first program loads, with the parse cache of the build (host.rs
+    /// (`RebuildForecast::light`). Else they compile on this thread, beside
+    /// the loads of the builders, with the parse cache of the build (host.rs
     /// `SharedSourceFiles`), as in a serial build.
     // PERF (tscbpar1, stable bins): parallel loads cut hono-b noop (3 light
     // rebuilds) from about 122 to 101 ms on the minis. Where a task checks,
@@ -1284,8 +1321,9 @@ impl Orchestrator {
     /// PORT: not in Go (perf). The builder threads of a parallel build
     /// (builders.rs), which send the index of each task whose check and emit
     /// are done to `ready` (`first_task_uses_builder`). There are one fewer
-    /// builders than `num_routines`, and at least 2 (Go builds on
-    /// `num_routines` goroutines).
+    /// builders than `num_routines`, and at least 2. Go builds on
+    /// `num_routines` goroutines: a task that compiles while every builder
+    /// is busy loads on this thread (SLOTS in `build_all_tasks`).
     /// None when a config cannot go to a builder (`BuildHost::builder_shared`).
     /// The output is the same with or without builders.
     /// This thread then publishes the stores of the configs that it parsed,
@@ -2682,5 +2720,165 @@ mod tests {
         // beside it.
         assert!(!light(&[1563, 78]));
         assert!(light(&[WIDE, WIDE]));
+    }
+
+    /// `tsc -b` with `args` (after `-b`) on the OS file system in `dir`, as
+    /// the `tsgo` bin runs it, with `GOPORT_TSCB_BUILDERS=builders`.
+    /// Returns the exit status and the output.
+    #[cfg(unix)]
+    fn tsc_b_in(dir: &str, builders: &'static str, args: &[&str]) -> (ExitStatus, String) {
+        use crate::execute::build::command_line::parse_build_command_line;
+        use crate::execute::tsc::compile::{OsSystem, SystemParseConfigHost};
+
+        /// The OS system with its own `GOPORT_TSCB_BUILDERS`.
+        struct DirSystem {
+            os: OsSystem,
+            builders: &'static str,
+        }
+        impl System for DirSystem {
+            fn writer(&self) -> Writer {
+                self.os.writer()
+            }
+            fn error_writer(&self) -> crate::execute::tsc::compile::ErrorWriter {
+                self.os.error_writer()
+            }
+            fn fs(&self) -> Rc<dyn Fs> {
+                self.os.fs()
+            }
+            fn default_library_path(&self) -> String {
+                self.os.default_library_path()
+            }
+            fn get_current_directory(&self) -> String {
+                self.os.get_current_directory()
+            }
+            fn write_output_is_tty(&self) -> bool {
+                false
+            }
+            fn get_width_of_terminal(&self) -> i32 {
+                0
+            }
+            fn get_environment_variable(&self, name: &str) -> (String, bool) {
+                if name == "GOPORT_TSCB_BUILDERS" {
+                    (self.builders.to_string(), true)
+                } else {
+                    self.os.get_environment_variable(name)
+                }
+            }
+            fn spawn(
+                &self,
+                command: &[String],
+                dir: &str,
+                stderr: Option<Box<dyn std::io::Write + Send>>,
+            ) -> Result<Arc<dyn crate::contentmapper::ProcessExitState>, crate::gostd::GoError>
+            {
+                self.os.spawn(command, dir, stderr)
+            }
+            fn now(&self) -> SystemTime {
+                self.os.now()
+            }
+            fn since_start(&self) -> std::time::Duration {
+                self.os.since_start()
+            }
+        }
+
+        let out: Rc<RefCell<Vec<u8>>> = Rc::default();
+        let os = OsSystem::for_thread(
+            dir.to_string(),
+            crate::frontend::bundled::lib_path(),
+            std::time::Instant::now(),
+        )
+        .with_writer(out.clone());
+        let sys: Rc<dyn System> = Rc::new(DirSystem { os, builders });
+        let args: Vec<String> = ["-b", "--pretty", "false"]
+            .iter()
+            .chain(args)
+            .map(ToString::to_string)
+            .collect();
+        let command = parse_build_command_line(&args, &SystemParseConfigHost(&*sys));
+        let mut orchestrator = new_orchestrator(Options {
+            sys,
+            command: Rc::new(command),
+            testing: None,
+        });
+        let ctx = crate::gostd::context::background();
+        let status = orchestrator.build(&ctx, "").result.status;
+        let text = String::from_utf8(out.borrow().clone()).expect("UTF-8 output");
+        (status, text)
+    }
+
+    /// The slots of a parallel build (`SLOTS`): with 4 routines, the 4
+    /// tasks below run at once, so each loads before any of them writes,
+    /// also when every builder is busy. The tscbpar1e skeptic's wait4n
+    /// shape: p1's pending emit adds `v2` to its `.d.ts`; p2 and p3 have
+    /// 60 files of pending emit; p4 has no reference to p1 and reads its
+    /// `.d.ts` through `node_modules/p1` (a link to p1, whose package.json
+    /// names the `.d.ts` as its types), so p4 reads the old `.d.ts`. The
+    /// expected output is Go N's (673a5f17d713) for this shape.
+    #[cfg(unix)]
+    #[test]
+    fn parallel_build_loads_every_started_task_before_a_write() {
+        let dir = std::env::temp_dir().join(format!("goport-tscb-slots-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let write = |path: &str, text: &str| {
+            let path = dir.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        };
+        let config = r#"{"compilerOptions": {"composite": true, "strict": true, "target": "es2022",
+            "module": "esnext", "moduleResolution": "bundler", "outDir": "dist", "rootDir": "src",
+            "skipLibCheck": true}, "include": ["src"]}"#;
+        let bulk = |project: &str, tag: &str| {
+            for i in 0..60 {
+                write(
+                    &format!("{project}/src/m{i}.ts"),
+                    &format!(
+                        "export interface I{i} {{ a: number; b: string; c{i}: boolean }}\n\
+                         export function f{i}(x: I{i}): I{i} {{ return {{ ...x, a: x.a + {i} }}; }}\n\
+                         export const k{i}: number = {i}; // {tag}\n"
+                    ),
+                );
+            }
+        };
+        for project in ["p1", "p2", "p3", "p4"] {
+            write(&format!("{project}/tsconfig.json"), config);
+        }
+        write(
+            "tsconfig.json",
+            r#"{"files": [], "references": [{"path": "./p1"}, {"path": "./p2"}, {"path": "./p3"}, {"path": "./p4"}]}"#,
+        );
+        write("p1/src/index.ts", "export const v1 = 1;\n");
+        write(
+            "p1/package.json",
+            r#"{"name": "p1", "version": "1.0.0", "types": "dist/index.d.ts"}"#,
+        );
+        bulk("p2", "v1");
+        bulk("p3", "v1");
+        std::fs::create_dir_all(dir.join("p4/node_modules")).unwrap();
+        std::os::unix::fs::symlink("../../p1", dir.join("p4/node_modules/p1")).unwrap();
+        write(
+            "p4/src/a.ts",
+            "import { v1, v2 } from \"p1\";\nexport const a = v1 + v2;\n",
+        );
+        let cwd = dir.to_str().unwrap();
+        tsc_b_in(cwd, "0", &["tsconfig.json"]);
+        // The pending emits.
+        write(
+            "p1/src/index.ts",
+            "export const v1 = 1;\nexport const v2 = 2;\n",
+        );
+        tsc_b_in(cwd, "0", &["p1", "--noEmit"]);
+        for project in ["p2", "p3"] {
+            bulk(project, "v2");
+            tsc_b_in(cwd, "0", &[project, "--noEmit"]);
+        }
+        // Every task on a builder: p4 is the 4th task, beside 3 busy
+        // builders.
+        let (status, text) = tsc_b_in(cwd, "1", &["tsconfig.json"]);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            text,
+            "p4/src/a.ts(1,14): error TS2305: Module '\"p1\"' has no exported member 'v2'.\n"
+        );
+        assert_eq!(status, ExitStatus::DiagnosticsPresentOutputsGenerated);
     }
 }

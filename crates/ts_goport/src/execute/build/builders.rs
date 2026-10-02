@@ -23,11 +23,13 @@
 //!   task (`CompileJob`), and the orchestrator's task takes what the
 //!   compile set (`CompileResult`).
 //! - The read rule: a builder writes a file other than its task's build
-//!   info, or changes an mtime, only when no load runs (`LoadGate`). The
-//!   orchestrator finishes one task at a time and starts no task while it
-//!   finishes one, so a task that starts before a finish loads before the
-//!   finish writes, and a task that starts after it loads after, as in a
-//!   serial build.
+//!   info, or changes an mtime, only when no load runs (`LoadGate`), and
+//!   the orchestrator thread finishes a task of its own only when no
+//!   builder loads (`Builders::wait_for_loads`). The orchestrator finishes
+//!   one task at a time and starts no task while it finishes one, so a task
+//!   that starts before a finish loads before the finish writes, and a task
+//!   that starts after it loads after, as in a serial build (SLOTS in
+//!   orchestrator.rs `build_all_tasks`).
 //! - Each builder takes its file ids in runs (`ast::reserve_file_ids`), so
 //!   loads can publish at the same time. The output does not depend on the
 //!   ids.
@@ -40,9 +42,10 @@
 //! task is a heavy one (`Orchestrator::first_task_uses_builder`,
 //! `light_unchanged`, `later_tasks_use_builders`). Else the later ones
 //! compile on the orchestrator thread with the parse cache of the build,
-//! after the programs of the builders are made (`Builders::wait_for_loads`).
-//! The builders of the earlier tasks write only when the orchestrator
-//! finishes them, so the read rule holds for them.
+//! beside the loads of the builders. A task that compiles while every
+//! builder is busy compiles on the orchestrator thread too. The builders of
+//! the earlier tasks write only when the orchestrator finishes them, so the
+//! read rule holds for them.
 
 use crate::execute::build::build_task::*;
 use crate::execute::build::command_line::{ParsedBuildCommandLine, SendBuildCommandLine};
@@ -140,8 +143,8 @@ struct Builder {
 /// goes to the first idle builder (`compile`), so a chain of tasks stays on
 /// the first builder and its parse cache. A builder starts with its first
 /// task. There are at most `max` builders (`Orchestrator::start_builders`).
-/// When all of them are busy, a task that compiles waits until one is free
-/// (`all_busy`).
+/// When all of them are busy, a task that compiles loads on the
+/// orchestrator thread (`all_busy`).
 pub(crate) struct Builders {
     setup: Arc<BuilderSetup>,
     max: usize,
@@ -199,7 +202,8 @@ impl Builders {
     }
 
     /// True when every builder is busy and no other can start: then a task
-    /// that compiles waits for a finish (orchestrator.rs `build_all_tasks`).
+    /// that compiles loads on the orchestrator thread (orchestrator.rs
+    /// `build_all_tasks`).
     pub(crate) fn all_busy(&self) -> bool {
         self.builders.len() >= self.max && self.builders.iter().all(|builder| builder.busy)
     }
@@ -211,7 +215,7 @@ impl Builders {
     }
 
     /// Waits until no program loads on a builder: the orchestrator thread
-    /// compiles a task only then (the read rule above).
+    /// finishes a task of its own only then (the read rule above).
     pub(crate) fn wait_for_loads(&self) {
         self.gate.wait_for_loads();
     }
