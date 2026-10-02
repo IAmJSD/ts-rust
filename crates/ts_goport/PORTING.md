@@ -560,11 +560,17 @@ process (bin/tsgo.rs `unblock_go_signals`, `go_signal_handlers`,
   budget and the exec of `set_malloc_tunables` (the new image sets them
   again at the same point). A signal that comes before them has its
   default action, as one that comes before Go's runtime start. A worker
-  sets no early SIGINT and SIGTERM handlers: its launcher holds them until
-  `notify_context` in the worker catches them. PORT: with `--lsp` and
-  `--api`, SIGINT and SIGTERM keep their default actions until their own
-  `notify_context` (in cmd/tsgo/lsp.rs and api.rs), which the early
-  handlers cannot see.
+  sets them after the exec: its launcher holds a signal until the worker
+  catches it, so a handler of the image before the exec would end the hold
+  too soon. It sets no early SIGINT and SIGTERM handlers: its launcher
+  holds them until `notify_context` in the worker catches them. Measured
+  on mini-743d (followups9): a run without a worker catches SIGHUP, SIGINT
+  and SIGTERM 1.95 ms after the spawn (median of 40; before, 2.50 ms for
+  SIGHUP and 2.91 ms for SIGINT and SIGTERM; Go N 1.56 ms). Most of the
+  rest is the start before `main` (the dynamic loader and std). PORT: with
+  `--lsp` and `--api`, SIGINT and SIGTERM keep their default actions until
+  their own `notify_context` (in cmd/tsgo/lsp.rs and api.rs), which the
+  early handlers cannot see.
 - The pid 1 of a PID namespace (`docker run` without `--init`, `unshare
   -pf`, `bwrap --as-pid-1`): the kernel drops each signal with the default
   action that such a process gets from its namespace or sends itself. Go
