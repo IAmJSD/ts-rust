@@ -49,7 +49,7 @@ pub fn program_to_snapshot(
     Rc::new(RefCell::new(to.snapshot))
 }
 
-// Go: incremental/programtosnapshot.go:40 toProgramSnapshot
+// Go: incremental/programtosnapshot.go:42 toProgramSnapshot
 // PORT: Go `program` is the current program and is not a field.
 struct ToProgramSnapshot<'a> {
     old_program: Option<&'a Program>,
@@ -58,7 +58,7 @@ struct ToProgramSnapshot<'a> {
 }
 
 impl ToProgramSnapshot<'_> {
-    // Go: incremental/programtosnapshot.go:47 reuseFromOldProgram
+    // Go: incremental/programtosnapshot.go:49 reuseFromOldProgram
     fn reuse_from_old_program(&mut self) {
         if let Some(old_program) = self.old_program {
             let old_snapshot = old_program.snapshot.borrow();
@@ -89,7 +89,7 @@ impl ToProgramSnapshot<'_> {
         }
     }
 
-    // Go: incremental/programtosnapshot.go:67 computeProgramFileChanges
+    // Go: incremental/programtosnapshot.go:73 computeProgramFileChanges
     fn compute_program_file_changes(&mut self) {
         let old_snapshot_ref = self.old_program.map(|old| old.snapshot.borrow());
         let old_snapshot = old_snapshot_ref.as_deref();
@@ -257,29 +257,54 @@ impl ToProgramSnapshot<'_> {
         }
     }
 
-    // Go: incremental/programtosnapshot.go:152 handleFileDelete
+    // Go: incremental/programtosnapshot.go:162 handleFileDelete
+    // PORT: Go ranges over the old `fileInfos` `SyncMap` (random order) and
+    // stops at the first gone file. If that file affects global scope, all
+    // files change. Else Go only sets `buildInfoEmitPending`, and unchanged
+    // files keep their old semantic diagnostics. So Go's answer is random
+    // when a gone file affects global scope and another does not (a
+    // `target` or `lib` change removes libs that hold only
+    // `/// <reference lib>` lines). `file_infos` keeps insertion order, so
+    // stopping at the first gone file would always take the stale branch for
+    // such libs (missing errors). The port walks all gone files: if any one
+    // affects global scope it takes the global branch once (Go's answer when
+    // it meets that file first). Else, if any file is gone, it sets
+    // `build_info_emit_pending`.
+    // TypeScript JS `forEachEntry` without `outFile` also stops at the first
+    // gone file that affects global scope, but it sets
+    // `buildInfoEmitPending` for each gone file that does not and comes
+    // before it. The global branch here does not set
+    // `build_info_emit_pending`. This differs from JS only when such a file
+    // comes first and the program has no file other than default libs,
+    // because `add_file_to_change_set` sets the flag for each other file.
     fn handle_file_delete(&mut self) {
-        if let Some(old_program) = self.old_program {
-            let old_snapshot = old_program.snapshot.borrow();
-            // If the global file is removed, add all files as changed
-            for (file_path, old_info) in &old_snapshot.file_infos {
-                if !self.snapshot.file_infos.contains_key(file_path) {
-                    if old_info.affects_global_scope {
-                        let files = self
-                            .snapshot
-                            .get_all_files_excluding_default_library_file(Node::NIL)
-                            .to_vec();
-                        for file in files {
-                            self.snapshot
-                                .add_file_to_change_set(Path(source_file_info(file).path.clone()));
-                        }
-                        self.global_file_removed = true;
-                    } else {
-                        self.snapshot.build_info_emit_pending = true;
-                    }
+        let Some(old_program) = self.old_program else {
+            return;
+        };
+        let mut file_removed = false;
+        let mut global_file_removed = false;
+        for (file_path, old_info) in &old_program.snapshot.borrow().file_infos {
+            if !self.snapshot.file_infos.contains_key(file_path) {
+                file_removed = true;
+                if old_info.affects_global_scope {
+                    global_file_removed = true;
                     break;
                 }
             }
+        }
+        if global_file_removed {
+            // If the global file is removed, add all files as changed
+            let files = self
+                .snapshot
+                .get_all_files_excluding_default_library_file(Node::NIL)
+                .to_vec();
+            for file in files {
+                self.snapshot
+                    .add_file_to_change_set(Path(source_file_info(file).path.clone()));
+            }
+            self.global_file_removed = true;
+        } else if file_removed {
+            self.snapshot.build_info_emit_pending = true;
         }
     }
 
@@ -347,7 +372,7 @@ impl ToProgramSnapshot<'_> {
         }
     }
 
-    // Go: incremental/programtosnapshot.go:195 handlePendingCheck
+    // Go: incremental/programtosnapshot.go:227 handlePendingCheck
     fn handle_pending_check(&mut self) {
         if let Some(old_program) = self.old_program {
             if self.snapshot.semantic_diagnostics_per_file.len() != source_files().len()
@@ -423,7 +448,7 @@ fn start_text_hashes(files: &[Node], hash_with_text: bool) -> std::sync::mpsc::R
     receiver
 }
 
-// Go: incremental/programtosnapshot.go:203 fileAffectsGlobalScope
+// Go: incremental/programtosnapshot.go:235 fileAffectsGlobalScope
 #[must_use]
 pub fn file_affects_global_scope(file: Node) -> bool {
     // PORT: Go `binder.BindSourceFile(file)`. The port binds every file
@@ -452,7 +477,7 @@ pub fn file_affects_global_scope(file: Node) -> bool {
         .any(|stmt| !is_module_with_string_literal_name(stmt))
 }
 
-// Go: incremental/programtosnapshot.go:227 addReferencedFilesFromSymbol
+// Go: incremental/programtosnapshot.go:260 addReferencedFilesFromSymbol
 // PORT: the symbol belongs to the checker, so its arena is a parameter.
 fn add_referenced_files_from_symbol(
     checker: &Checker,
@@ -474,7 +499,7 @@ fn add_referenced_files_from_symbol(
     }
 }
 
-// Go: incremental/programtosnapshot.go:243 addReferencedFilesFromImportLiteral
+// Go: incremental/programtosnapshot.go:276 addReferencedFilesFromImportLiteral
 // Get the module source file and all augmenting files from the import name node from file
 fn add_referenced_files_from_import_literal(
     file: Node,
@@ -569,7 +594,7 @@ impl ReferencedFileSet {
     }
 }
 
-// Go: incremental/programtosnapshot.go:249 addReferencedFileFromFileName
+// Go: incremental/programtosnapshot.go:282 addReferencedFileFromFileName
 // Gets the path to reference file from file name, it could be resolvedPath if present otherwise path
 // PORT: the paths are pushed in Go order; the checker job adds them to the
 // set (see `start_referenced_files_job`).
@@ -594,7 +619,7 @@ fn add_referenced_file_from_file_name(
     }
 }
 
-// Go: incremental/programtosnapshot.go:258 getReferencedFiles
+// Go: incremental/programtosnapshot.go:291 getReferencedFiles
 // Gets the referenced files for a file from the program with values for the keys as referenced file's path to be true
 #[must_use]
 pub fn get_referenced_files(file: Node) -> Option<FxIndexSet<Path>> {
@@ -766,7 +791,7 @@ fn referenced_file_name_paths(file: Node) -> Vec<Path> {
     referenced_files
 }
 
-// Go: incremental/programtosnapshot.go:302 repopulateDiagnosticsOfFile
+// Go: incremental/programtosnapshot.go:337 repopulateDiagnosticsOfFile
 // repopulateDiagnosticsOfFile repopulates diagnostic chains that depend on program state.
 // When diagnostics are copied from a previous build, their message chains may reference
 // stale program state (e.g., resolved module alternate results, package.json scope).
@@ -792,7 +817,7 @@ pub fn repopulate_diagnostics_of_file(
     diags.clone()
 }
 
-// Go: incremental/programtosnapshot.go:317 repopulateDiagnosticsList
+// Go: incremental/programtosnapshot.go:351 repopulateDiagnosticsList
 // repopulateDiagnosticsList repopulates diagnostic chains in a list of diagnostics.
 // Returns nil if no diagnostics needed repopulation (i.e., no changes were made).
 #[must_use]
@@ -815,7 +840,7 @@ pub fn repopulate_diagnostics_list(diags: &[Diagnostic], file: Node) -> Option<V
     Some(result)
 }
 
-// Go: incremental/programtosnapshot.go:337 repopulateDiagnosticMessageChain
+// Go: incremental/programtosnapshot.go:373 repopulateDiagnosticMessageChain
 // repopulateDiagnosticMessageChain repopulates chains that have repopulate info.
 // Returns nil if no changes were made.
 #[must_use]
@@ -869,7 +894,7 @@ pub fn repopulate_diagnostic_message_chain(
     Some(result)
 }
 
-// Go: incremental/programtosnapshot.go:382 astDiagToBuildInfoDiag
+// Go: incremental/programtosnapshot.go:418 astDiagToBuildInfoDiag
 #[must_use]
 pub fn ast_diag_to_build_info_diag(d: &Diagnostic) -> BuildInfoDiagnosticWithFileName {
     // PORT: Go byte offsets (see `go_text_range`).

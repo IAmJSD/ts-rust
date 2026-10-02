@@ -1,4 +1,5 @@
 mod contentmapper_watch;
+mod file_delete;
 mod showconfig;
 mod tsbuild_a;
 mod tsbuild_b;
