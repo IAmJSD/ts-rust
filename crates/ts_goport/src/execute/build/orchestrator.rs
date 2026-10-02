@@ -965,10 +965,11 @@ impl Orchestrator {
         // G4 gives. Else W comes first: B is taken after a finish frees its
         // slot (P1), or its upstream tasks finish after W. In Go too, B is
         // taken only when the same number of tasks finished (G1), and W can
-        // be one of them or come before them. The finishes come in the order
-        // in which the checks and emits end (or in build order, see
-        // `in_build_order`), and Go can finish its tasks in that order. So
-        // each order of a load and a write here is one that Go can make.
+        // be one of them or come before them. A task finishes after its
+        // check and emit ended (the first in build order of those that
+        // ended, or in build order, see `in_build_order`), and Go can finish
+        // its tasks in that order. So each order of a load and a write here
+        // is one that Go can make.
         // Tasks taken (Go `currentTaskIndex`), taken and not built, and
         // reported. The tasks before `next_report` are built.
         let mut next_take = 0;
