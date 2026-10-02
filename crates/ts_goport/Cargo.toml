@@ -38,7 +38,7 @@ miow = "=0.6.1"
 same-file = "=1.0.6"
 
 # `process`: prctl(PR_SET_THP_DISABLE) in thp_guard.rs. `signal`: the
-# signal mask at start in bin/tsgo.rs (`unblock_go_signals`).
+# signal mask at start in bin/tsgo.rs (`start_signal_mask`).
 [target.'cfg(target_os = "linux")'.dependencies]
 nix = { version = "=0.31.3", default-features = false, features = ["process", "signal"] }
 

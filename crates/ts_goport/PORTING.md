@@ -534,7 +534,7 @@ goroutine.
 ## Process start
 
 `tsgo` starts as the Go runtime and the Go `syscall` package start a Go
-process (bin/tsgo.rs `unblock_go_signals`, `go_signal_handlers`,
+process (bin/tsgo.rs `start_signal_mask`, `go_signal_handlers`,
 `go_runtime_start`).
 
 - Signals (Linux, Go runtime/sigtab_linux_generic.go): the signals that Go
