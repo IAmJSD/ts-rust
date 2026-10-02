@@ -761,10 +761,10 @@ fn drop_go_signals() {
 /// nothing (`drop_go_signals`), a signal that Go throws (`GO_THROWN`) ends
 /// the process (`throw`), and SIGHUP ends it by SIGHUP (`die_from_signal`;
 /// as a pid 1 it exits 129, where the default action would do nothing).
-/// SIGINT and SIGTERM end it in the same way until `run_main` sets
-/// `notify_context` (`NOTIFYING`; Go `NotifyContext`), but not in a worker:
-/// its launcher holds them until `notify_context` catches them
-/// (`wait_until_caught`). A SIGHUP or SIGINT that was ignored at start
+/// SIGINT and SIGTERM end it in the same way when they come before
+/// `notify_context` (Go `NotifyContext`) takes them (`CAME_BEFORE`), but
+/// not in a worker: its launcher holds them until `notify_context` catches
+/// them (`wait_until_caught`). A SIGHUP or SIGINT that was ignored at start
 /// stays ignored (`ignored_at_start`). `main` calls it once, after the
 /// exec of `set_malloc_tunables`, as Go sets its handlers in its last
 /// image, and then unblocks `HELD`. The thread waits on a pipe until a
@@ -791,6 +791,14 @@ fn go_signal_handlers() {
     }
     // Go keeps only an ignored SIGHUP or SIGINT (`sigInstallGoHandler`).
     ended.retain(|&signal| !matches!(signal, SIGHUP | SIGINT) || !ignored_at_start(signal));
+    // Before the thread's own actions, so each flag is set when the
+    // thread reads the signal.
+    let notified: Vec<i32> = ended
+        .iter()
+        .copied()
+        .filter(|&signal| matches!(signal, SIGINT | SIGTERM))
+        .collect();
+    let _ = CAME_BEFORE.set(Arrivals::register(&notified));
     if let Ok(mut signals) = signal_hook::iterator::Signals::new(ended) {
         ts_goport::core::GoThread::new()
             .name(GO_SIGNALS_THREAD.to_string())
@@ -801,9 +809,10 @@ fn go_signal_handlers() {
                     if let Some((_, name)) = GO_THROWN.iter().find(|(s, _)| s.as_raw() == signal) {
                         throw(name);
                     }
-                    // `notify_context` takes SIGINT and SIGTERM now (Go
-                    // `Notify`).
-                    if signal != SIGHUP && NOTIFYING.load(std::sync::atomic::Ordering::SeqCst) {
+                    // A SIGINT or SIGTERM that came after `notify_context`
+                    // took it goes there only (Go `Notify`).
+                    if signal != SIGHUP && !CAME_BEFORE.get().is_some_and(|came| came.took(signal))
+                    {
                         continue;
                     }
                     die_from_signal(signal);
@@ -819,9 +828,101 @@ fn go_signal_handlers() {
 #[cfg(target_os = "linux")]
 const GO_SIGNALS_THREAD: &str = "go-signals";
 
-/// Set once `run_main` has set `notify_context` (see `go_signal_handlers`).
+/// The SIGINT and SIGTERM that came before `notify_context` took them, in a
+/// run without a worker (`go_signal_handlers`). Go decides in its signal
+/// handler, when the signal comes: one that comes before `signal.Notify`
+/// asks for it ends the run (`_SigKill`, `dieFromSignal`), and a later one
+/// goes to the channel only. The `go-signals` thread acts later, maybe
+/// after `notify_context` has taken the signal. So the handler records it:
+/// a flag action, registered before the thread's own action, is set when
+/// the signal comes, and the thread ends the run only at a signal whose
+/// flag it takes (`Arrivals::took`). `run_main` removes these actions
+/// around `notify_context` (`notify_starts`, `notify_started`).
+/// signal-hook runs the actions of a signal in the order of their
+/// registration, and each run of its handler uses one list of actions
+/// (signal-hook-registry 1.4.8 `handler`).
 #[cfg(target_os = "linux")]
-static NOTIFYING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static CAME_BEFORE: std::sync::OnceLock<Arrivals> = std::sync::OnceLock::new();
+
+/// A flag action for each of some signals (`CAME_BEFORE`): its handler sets
+/// the signal's flag each time the signal comes, until `unregister`.
+#[cfg(target_os = "linux")]
+struct Arrivals(
+    Vec<(
+        i32,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+        signal_hook::SigId,
+    )>,
+);
+
+#[cfg(target_os = "linux")]
+impl Arrivals {
+    /// Registers a flag action for each signal of `signals`.
+    fn register(signals: &[i32]) -> Self {
+        let flags = signals.iter().filter_map(|&signal| {
+            let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let id = signal_hook::flag::register(signal, flag.clone()).ok()?;
+            Some((signal, flag, id))
+        });
+        Arrivals(flags.collect())
+    }
+
+    /// The signals of these actions.
+    fn signals(&self) -> Vec<i32> {
+        self.0.iter().map(|(signal, _, _)| *signal).collect()
+    }
+
+    /// Whether `signal` came while its action was registered, since the
+    /// last call. It clears the flag.
+    fn took(&self, signal: i32) -> bool {
+        self.0.iter().any(|(s, flag, _)| {
+            *s == signal && flag.swap(false, std::sync::atomic::Ordering::SeqCst)
+        })
+    }
+
+    /// Removes the actions. Then no flag changes: signal-hook returns only
+    /// once each run of its handler that has the old list has ended.
+    fn unregister(&self) {
+        for (_, _, id) in &self.0 {
+            signal_hook::low_level::unregister(*id);
+        }
+    }
+}
+
+/// Called by `run_main` just before `notify_context`: from now on a
+/// SIGINT or SIGTERM that comes is recorded as one that came while
+/// `notify_context` ran (the returned actions), not before it
+/// (`CAME_BEFORE`). The new actions are registered before the old ones are
+/// removed, so each signal is in one of them or in both. A signal in both
+/// came before `notify_context` started, and ends the run.
+#[cfg(target_os = "linux")]
+fn notify_starts() -> Arrivals {
+    let Some(before) = CAME_BEFORE.get() else {
+        return Arrivals(Vec::new());
+    };
+    let during = Arrivals::register(&before.signals());
+    before.unregister();
+    during
+}
+
+/// Called by `run_main` once `notify_context` has returned, with the
+/// actions of `notify_starts`. A signal that came while `notify_context`
+/// ran may have come before or after it registered, so this sends it
+/// again, now to `notify_context` only (Go: a signal that comes while
+/// `Notify` runs goes one way or the other). A second copy of a signal
+/// that `notify_context` took does nothing: its thread ends after the
+/// first.
+#[cfg(target_os = "linux")]
+fn notify_started(during: &Arrivals) {
+    during.unregister();
+    for signal in during.signals() {
+        if during.took(signal)
+            && let Some(signal) = rustix::process::Signal::from_named_raw(signal)
+        {
+            let _ = rustix::process::kill_process(rustix::process::getpid(), signal);
+        }
+    }
+}
 
 /// The rest of the start of a process that runs the work, as the Go
 /// runtime and the Go `syscall` package start (the handlers come earlier,
@@ -968,9 +1069,11 @@ fn run_main(start: Instant) -> i32 {
     }
 
     // Go: ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+    #[cfg(target_os = "linux")]
+    let during = notify_starts();
     let (ctx, stop) = notify_context(&context::background());
     #[cfg(target_os = "linux")]
-    NOTIFYING.store(true, std::sync::atomic::Ordering::SeqCst);
+    notify_started(&during);
     // PORT: Go `newSystem()` calls `os.Exit` on this error, so `stop` does
     // not run there either.
     let sys = match new_os_system() {

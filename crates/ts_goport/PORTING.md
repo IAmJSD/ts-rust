@@ -552,7 +552,18 @@ process (bin/tsgo.rs `unblock_go_signals`, `go_signal_handlers`,
   keeps it ignored, so a process that tsgo starts gets it ignored too).
   Before `notify_context` (Go `NotifyContext` in `runMain`), SIGINT and
   SIGTERM end the process in the same way (Go `_SigKill`); an ignored
-  SIGINT stays ignored there, as in Go. PORT: SIGABRT and SIGTRAP keep
+  SIGINT stays ignored there, as in Go. Go decides in its signal handler,
+  when the signal comes; tsgo acts on the `go-signals` thread, which can
+  read a signal only after `notify_context` has started. So a flag action
+  records each SIGINT and SIGTERM when it comes (bin/tsgo.rs
+  `CAME_BEFORE`), and the thread ends the run only at a signal that came
+  before `notify_context`. One that comes while `notify_context` runs is
+  sent again once it has returned, so it goes to `notify_context` (in Go
+  such a signal can go either way). Before, the thread read
+  `notify_context`'s state when it read the signal, so a signal that came
+  before `notify_context` and that the thread read after it was lost:
+  under CPU load on cup2, 81 of 300 SIGINT 1 to 10 ms after the start of
+  `tsgo -w` (followups9 round b skeptic). PORT: SIGABRT and SIGTRAP keep
   their default actions. Other systems keep the default actions.
 - The start window: Go sets these handlers once, before `main`, in its
   last image. tsgo sets them once too (bin/tsgo.rs `main`), after
