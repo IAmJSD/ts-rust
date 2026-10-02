@@ -463,18 +463,84 @@ fn a_launcher_holds_a_signal_until_its_worker_catches_it() {
     eprintln!("skipped: no worker was stopped before it caught SIGQUIT");
 }
 
+/// A signal that comes while tsgo sets its handler for it waits for that
+/// handler (bin/tsgo.rs `HELD`). signal-hook sets a handler a moment before
+/// it publishes the action that the handler runs, and a signal in between
+/// did nothing, so the run went on. The test makes that moment long: tsgo
+/// runs under `strace -e inject=rt_sigaction:delay_exit=...`, so each
+/// `rt_sigaction` call of its first thread returns 5 ms late, and the test
+/// sends SIGQUIT as soon as /proc shows that tsgo catches it. The run ends
+/// with Go's text and exit 2, with and without a worker (a launcher sets
+/// its handlers on its first thread). Where strace cannot run, the test
+/// says so and passes.
+#[test]
+fn a_signal_while_tsgo_sets_its_handler() {
+    const STRACE: [&str; 6] = [
+        "-o",
+        "/dev/null",
+        "-e",
+        "trace=rt_sigaction",
+        "-e",
+        "inject=rt_sigaction:delay_exit=5000",
+    ];
+    let probe = Command::new("strace")
+        .args(STRACE)
+        .arg("true")
+        .stderr(Stdio::null())
+        .status();
+    if !probe.is_ok_and(|status| status.success()) {
+        eprintln!("skipped: strace cannot run here");
+        return;
+    }
+    let tsgo = env!("CARGO_BIN_EXE_tsgo");
+    for launch in ["0", "1"] {
+        let case = format!("GOPORT_LAUNCH={launch}");
+        let (_read, write, _) = small_pipe();
+        let mut child = Command::new("strace")
+            .args(STRACE)
+            .args([tsgo, "--all"])
+            .env("GOPORT_LAUNCH", launch)
+            .stdout(Stdio::from(write))
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let start = Instant::now();
+        let traced = loop {
+            // strace's child, once it is tsgo.
+            let traced = child_of(child.id()).filter(|pid| {
+                std::fs::read_link(format!("/proc/{pid}/exe"))
+                    .is_ok_and(|exe| exe == Path::new(tsgo))
+            });
+            if let Some(pid) = traced {
+                break pid;
+            }
+            assert!(child.try_wait().unwrap().is_none(), "{case}: ended");
+            assert!(start.elapsed() < LIMIT, "{case}: no tsgo in {LIMIT:?}");
+        };
+        loop {
+            let status = std::fs::read_to_string(format!("/proc/{traced}/status")).unwrap();
+            if mask(&status, "SigCgt:") & bit(Signal::QUIT) != 0 {
+                break;
+            }
+            assert!(start.elapsed() < LIMIT, "{case}: no handler in {LIMIT:?}");
+        }
+        let pid = Pid::from_raw(traced.cast_signed()).unwrap();
+        rustix::process::kill_process(pid, Signal::QUIT).unwrap();
+        // strace exits as tsgo does.
+        let (status, stderr) = end_of(child, &case);
+        assert_eq!(status.code(), Some(2), "{case}: {status} {stderr}");
+        assert!(stderr.starts_with("SIGQUIT: quit"), "{case}: {stderr}");
+    }
+}
+
 /// A launcher whose worker cannot start runs the work itself (bin/tsgo.rs
-/// `launch`). SIGINT, SIGTERM and the signals that Go throws get their
-/// default actions back (`restore_default_actions`) until the run sets its
-/// own handlers, which end those default actions (`end_default_actions`):
-/// as in a run that never was a launcher, a plain compile goes on after
-/// SIGINT and SIGTERM, and SIGQUIT ends it with Go's text and exit 2. The
-/// test runs tsgo from a memfd, whose path (`/memfd:tsgo (deleted)`) cannot
-/// start a worker, and where the exec of `set_malloc_tunables` fails too:
-/// the run then ended by SIGPIPE at the second signal (that exec gave
+/// `launch`), as a run that never was a launcher: a plain compile goes on
+/// after SIGINT and SIGTERM, and SIGQUIT ends it with Go's text and exit 2.
+/// The test runs tsgo from a memfd, whose path (`/memfd:tsgo (deleted)`)
+/// cannot start a worker, and where the exec of `set_malloc_tunables` fails
+/// too: the run then ended by SIGPIPE at the second signal (that exec gave
 /// SIGPIPE its default action). Where a memfd cannot run, the test says so
-/// and passes. The time between the failed start and the run's handlers is
-/// too short for a test to send a signal in it.
+/// and passes.
 #[test]
 fn a_launcher_whose_worker_cannot_start() {
     let memfd = rustix::fs::memfd_create("tsgo", rustix::fs::MemfdFlags::CLOEXEC).unwrap();

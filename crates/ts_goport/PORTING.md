@@ -561,17 +561,28 @@ process (bin/tsgo.rs `unblock_go_signals`, `go_signal_handlers`,
   handler set before that exec could take a signal that the exec then
   loses, as the exec ends the `go-signals` thread before it acts
   (followups9 round a set them before the exec: SIGQUIT was lost in 3 to 6
-  of 1000 runs on a quiet host and in up to 14% under CPU load). A signal
-  that comes before the handlers has the caller's action, as one that
-  comes before Go's runtime start. A worker sets no SIGINT and SIGTERM
-  handlers there: its launcher holds every signal until the worker
-  catches it, SIGINT and SIGTERM until `notify_context`. The start before
-  `main` (the dynamic loader and std) is about 0.6 ms longer than Go's
-  (mini-743d, followups9). A build without `JEMALLOC_CONF` built in (the
-  test and evidence bins) runs the exec of `set_malloc_tunables` first.
-  PORT: with `--lsp` and `--api`, SIGINT and SIGTERM keep their default
-  actions until their own `notify_context` (in cmd/tsgo/lsp.rs and
-  api.rs), which `go_signal_handlers` cannot see.
+  of 1000 runs on a quiet host and in up to 14% under CPU load).
+- The signals whose handlers act on a thread (`HELD`: SIGHUP, SIGINT,
+  SIGQUIT, SIGTERM, SIGSTKFLT, SIGSYS) are blocked from the start of
+  `main` until their handlers are set (`start_signal_mask`,
+  `unblock_held`), so one that comes before the handlers waits for them,
+  also across the exec of `set_malloc_tunables` (an exec keeps the mask
+  and the waiting signals). signal-hook sets a handler a moment before it
+  publishes the action that the handler runs, and a signal in between did
+  nothing: a thread that the OS stopped there made that moment
+  milliseconds long, and a SIGQUIT was lost in about 1 of 1000 runs under
+  CPU load (R157 too; followups9 round b). In Go, a signal that comes
+  before its handlers has its default action; in tsgo it waits for them.
+  A launcher unblocks them once the thread of `forward_signals` has taken
+  SIGHUP too; a worker starts with them blocked and sets its own. A worker
+  sets no SIGINT and SIGTERM handlers before `notify_context`: its
+  launcher holds every signal until the worker catches it, SIGINT and
+  SIGTERM until the thread of `notify_context` runs. PORT: the `thp_guard`
+  watcher thread starts before the handlers and keeps them blocked. PORT:
+  with `--lsp` and `--api`, SIGINT and SIGTERM keep their default actions
+  until their own `notify_context` (in cmd/tsgo/lsp.rs and api.rs), which
+  `go_signal_handlers` cannot see; a signal that comes while that sets its
+  handler can be lost there.
 - A failed exec of `set_malloc_tunables` (a binary that is gone, for
   example) leaves SIGPIPE with its default action (std `Command` sets it
   for the new image). tsgo then gives SIGPIPE a handler that does nothing,
@@ -662,14 +673,10 @@ process (bin/tsgo.rs `unblock_go_signals`, `go_signal_handlers`,
     launcher ends the worker, a zombie one gives a plain tsgo), and the
     launcher takes the code from the worker's exit, which waits for the
     worker's memory to unmap.
-  - When the worker cannot start, the launcher runs the work itself.
-    SIGINT, SIGTERM, SIGQUIT and SIGSYS get their default actions back
-    until the run sets its own handlers, as in a run that never was a
-    launcher. PORT: SIGSTKFLT does nothing there (signal-hook has no
-    default action for it). In a pid 1 they do nothing there, as their
-    default actions do. PORT: a signal that came while the launcher tried
-    to start the worker (after `forward_signals`) is lost when the start
-    fails: the thread that took it ends without a worker to send it to.
+  - When the worker cannot start, the launcher runs the work itself, as a
+    run that never was a launcher. `HELD` is still blocked there, so a
+    signal that came while the start was tried waits for the run's
+    handlers.
 - Stdout (execute/tsc/stdio.rs): each write of the tsc output is one write
   of fd 1, in Go's pieces (Go `fmt.Fprint` on the unbuffered
   `os.Stdout`). PORT: when fd 1 is a regular file, the writes of one report
