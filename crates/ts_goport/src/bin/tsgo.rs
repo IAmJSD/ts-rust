@@ -446,13 +446,17 @@ struct OwnStatus {
 /// to the returned sender; a signal that comes first waits for it. The
 /// thread then answers on the returned receiver once it has taken SIGHUP,
 /// so `launch` can unblock `HELD`. When no worker starts, `launch` drops
-/// the sender and the thread ends. Each
-/// signal also waits until the worker catches it (`wait_until_caught`),
-/// for at most `HOLD_LIMIT` after the worker starts, and only with this
-/// process's own /proc (`own_proc`). Otherwise it goes on at once, and so
-/// does a signal that the worker was seen to catch before (the thread of
+/// the sender and the thread ends.
+/// Each signal also waits until the worker catches it (`caught`), for at
+/// most `HOLD_LIMIT` after the worker starts, and only with this process's
+/// own /proc (`own_proc`). Otherwise it goes on at once, and so does a
+/// signal that the worker was seen to catch before (the thread of
 /// `notify_context`, which the wait looks for, ends after its first
-/// signal).
+/// signal). Each signal waits on its own, so one that waits does not hold
+/// a later one: after a SIGINT to the whole process group (a terminal's
+/// Ctrl-C), the worker's `notify_context` thread has ended at its own copy,
+/// so the launcher's copy waits until `HOLD_LIMIT`, and a SIGQUIT or SIGHUP
+/// that then comes to the launcher only goes on at once, as in Go.
 /// The thread starts as a Go runtime thread does (`GoThread`): when the OS
 /// refuses it, the launcher ends with Go's text and exit 2, before there is
 /// a worker. Go has no launcher, so its process gets every signal; a
@@ -476,7 +480,7 @@ fn forward_signals() -> Option<(
                 return;
             };
             // The worker has started.
-            let hold = own_proc().then(|| Instant::now() + HOLD_LIMIT);
+            let limit = own_proc().then(|| Instant::now() + HOLD_LIMIT);
             if !ignored_at_start(signal_hook::consts::SIGHUP) {
                 let _ = signals.add_signal(signal_hook::consts::SIGHUP);
             }
@@ -485,81 +489,97 @@ fn forward_signals() -> Option<(
             unblock_held();
             // The signals that the worker was seen to catch (a bit per
             // signal, as in `SigCgt`): they go on at once.
-            let mut caught = 0u64;
-            for signal in signals.forever() {
-                if let Some(signal) = rustix::process::Signal::from_named_raw(signal) {
-                    let bit = 1u64 << (signal.as_raw() - 1).unsigned_abs();
-                    if let Some(until) = hold
-                        && caught & bit == 0
-                        && wait_until_caught(pid, signal, until)
-                    {
-                        caught |= bit;
+            let mut caught_before = 0u64;
+            // The signals that wait, in the order they came, each once.
+            let mut held: Vec<rustix::process::Signal> = Vec::new();
+            // The files are read at once, then after pauses of 1, 2, 4
+            // and 8 ms, then every 8 ms.
+            let mut pause = std::time::Duration::from_millis(1);
+            loop {
+                let came = if held.is_empty() {
+                    signals.wait()
+                } else {
+                    signals.pending()
+                };
+                for signal in came.filter_map(rustix::process::Signal::from_named_raw) {
+                    if !held.contains(&signal) {
+                        held.push(signal);
+                        pause = std::time::Duration::from_millis(1);
                     }
-                    let _ = rustix::process::kill_process(pid, signal);
+                }
+                held.retain(|&signal| {
+                    let bit = 1u64 << (signal.as_raw() - 1).unsigned_abs();
+                    let wait = match limit {
+                        Some(until) if caught_before & bit == 0 => {
+                            match caught(pid, signal, until) {
+                                Some(true) => {
+                                    caught_before |= bit;
+                                    false
+                                }
+                                Some(false) => true,
+                                None => false,
+                            }
+                        }
+                        _ => false,
+                    };
+                    if !wait {
+                        let _ = rustix::process::kill_process(pid, signal);
+                    }
+                    wait
+                });
+                if !held.is_empty() {
+                    std::thread::sleep(pause);
+                    pause = (pause * 2).min(std::time::Duration::from_millis(8));
                 }
             }
         });
     Some((send, ready))
 }
 
-/// Waits until the worker `pid` catches `signal` and returns true, so a
+/// Whether the worker `pid` catches `signal` now (`forward_signals`), so a
 /// forwarded signal finds the handlers that the worker sets at its start
 /// (`go_signal_handlers`, `notify_context`) and does not end it by the
 /// default action. A signal that came before them (soon after the start,
-/// or while the start of `forward_signals` was tried again) waits here: Go
+/// or while the start of `forward_signals` was tried again) waits: Go
 /// sets its handlers before `main`, and `runMain` calls `NotifyContext`
 /// before any work (cmd/tsc/main.go:29).
 /// The kernel lists the caught signals in /proc/<pid>/status (`SigCgt`, a
 /// hex mask with bit N-1 for signal N). signal-hook sets the handler (the
 /// bit) a moment before it publishes the action that the handler runs
 /// (signal-hook-registry 1.4.8 `register_unchecked_impl`), and a signal in
-/// between does nothing. So the wait also needs the thread that the worker
+/// between does nothing. So it also needs the thread that the worker
 /// starts after it has registered the signal (`ready_thread`). The caller
-/// calls it only with this process's own /proc (`own_proc`). It reads the
-/// files at once, then after pauses of 1, 2, 4 and 8 ms, then every 8 ms.
-/// The wait ends with false when the worker has ended, when that file does
-/// not show a live child of this process, and at `until`.
+/// calls it only with this process's own /proc (`own_proc`).
+/// None when the signal must not wait any longer: the worker has ended,
+/// that file does not show a live child of this process, or it is `until`.
 #[cfg(target_os = "linux")]
-fn wait_until_caught(
+fn caught(
     pid: rustix::process::Pid,
     signal: rustix::process::Signal,
     until: Instant,
-) -> bool {
-    let path = format!("/proc/{}/status", pid.as_raw_pid());
-    let launcher = rustix::process::getpid().as_raw_pid().to_string();
-    let bit = 1u64 << (signal.as_raw() - 1).unsigned_abs();
-    let mut pause = std::time::Duration::from_millis(1);
-    loop {
-        let left = until.saturating_duration_since(Instant::now());
-        if left.is_zero() {
-            return false;
-        }
-        let Ok(status) = std::fs::read_to_string(&path) else {
-            return false;
-        };
-        let field = |name: &str| {
-            status
-                .lines()
-                .find_map(|line| line.strip_prefix(name))
-                .map(str::trim)
-        };
-        let child = field("PPid:") == Some(launcher.as_str());
-        let live = field("State:").is_some_and(|state| !state.starts_with(['Z', 'X']));
-        let caught = field("SigCgt:").and_then(|mask| u64::from_str_radix(mask, 16).ok());
-        let Some(caught) = caught.filter(|_| child && live) else {
-            return false;
-        };
-        if caught & bit != 0 && has_thread(pid, ready_thread(signal)) {
-            return true;
-        }
-        std::thread::sleep(pause.min(left));
-        pause = (pause * 2).min(std::time::Duration::from_millis(8));
+) -> Option<bool> {
+    if Instant::now() >= until {
+        return None;
     }
+    let status = std::fs::read_to_string(format!("/proc/{}/status", pid.as_raw_pid())).ok()?;
+    let field = |name: &str| {
+        status
+            .lines()
+            .find_map(|line| line.strip_prefix(name))
+            .map(str::trim)
+    };
+    let launcher = rustix::process::getpid().as_raw_pid().to_string();
+    let child = field("PPid:") == Some(launcher.as_str());
+    let live = field("State:").is_some_and(|state| !state.starts_with(['Z', 'X']));
+    let mask = field("SigCgt:").and_then(|mask| u64::from_str_radix(mask, 16).ok());
+    let mask = mask.filter(|_| child && live)?;
+    let bit = 1u64 << (signal.as_raw() - 1).unsigned_abs();
+    Some(mask & bit != 0 && has_thread(pid, ready_thread(signal)))
 }
 
 /// The name of the thread that a worker starts once its action for
 /// `signal`, a signal that a launcher sends on, is published
-/// (`wait_until_caught`): `notify_context` registers SIGINT and SIGTERM
+/// (`caught`): `notify_context` registers SIGINT and SIGTERM
 /// and then starts `signal.NotifyContext` (cmd/tsgo/main.rs), and
 /// `go_signal_handlers` registers the others and then starts
 /// `GO_SIGNALS_THREAD`.
@@ -590,7 +610,7 @@ fn has_thread(pid: rustix::process::Pid, name: &str) -> bool {
 }
 
 /// How long after the worker starts a forwarded signal can wait for the
-/// worker's handlers (`wait_until_caught`). The worker sets them a few
+/// worker's handlers (`caught`). The worker sets them a few
 /// milliseconds after its start. After this time a signal goes on at once,
 /// as without the wait, so no wait lasts the whole run (a worker that is
 /// stopped at its start, for example).
@@ -764,7 +784,7 @@ fn drop_go_signals() {
 /// SIGINT and SIGTERM end it in the same way when they come before
 /// `notify_context` (Go `NotifyContext`) takes them (`CAME_BEFORE`), but
 /// not in a worker: its launcher holds them until `notify_context` catches
-/// them (`wait_until_caught`). A SIGHUP or SIGINT that was ignored at start
+/// them (`caught`). A SIGHUP or SIGINT that was ignored at start
 /// stays ignored (`ignored_at_start`). `main` calls it once, after the
 /// exec of `set_malloc_tunables`, as Go sets its handlers in its last
 /// image, and then unblocks `HELD`. The thread waits on a pipe until a

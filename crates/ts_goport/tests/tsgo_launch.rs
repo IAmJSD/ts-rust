@@ -22,6 +22,10 @@
 //! launcher whose caller ignores SIGCHLD still gets its worker's exit
 //! (`drop_go_signals`); and the signals that Go unblocks at start end the
 //! run also when the caller blocked them (`GO_UNBLOCKED`).
+//!
+//! The holds: a launcher holds each signal until its worker catches it,
+//! each on its own (`caught`), and tsgo blocks the signals it handles until
+//! their handlers are set (`HELD`).
 #![cfg(target_os = "linux")]
 
 use std::io::{Read, Seek, Write};
@@ -382,20 +386,19 @@ fn a_tsgo_whose_caller_ignores_sighup() {
 }
 
 /// A signal that a launcher gets before its worker has set its handlers
-/// waits until the worker catches it (bin/tsgo.rs `wait_until_caught`), as
-/// Go sets its handlers before `main`: SIGTERM waits for `notify_context`
-/// (a plain compile goes on after it, as in Go), and SIGQUIT for the
-/// handlers of `go_signal_handlers`, so the run ends with Go's text and
-/// exit 2, not by SIGTERM or SIGQUIT. The test stops the worker (SIGSTOP)
-/// as soon as it has started (its `arg0` is a worker's), sends SIGTERM and
-/// then SIGQUIT to the launcher, checks that neither reached the worker
-/// (`ShdPnd` in /proc), and lets the worker go on. The wait ends soon after
-/// the worker has its handlers, well before its limit (`HOLD_LIMIT`, 2 s):
-/// SIGQUIT waits behind SIGTERM, so a wait for the thread of SIGTERM's
-/// handler (`ready_thread`) that did not end would hold it too. A worker
-/// that the test stopped too late (it catches SIGQUIT) ends with its
-/// launcher and the run starts again, up to `ATTEMPTS` times; where no
-/// attempt is in time, the test says so and passes.
+/// waits until the worker catches it (bin/tsgo.rs `caught`), as Go sets its
+/// handlers before `main`: SIGTERM waits for `notify_context` (a plain
+/// compile goes on after it, as in Go), whose thread ends at it. The test
+/// stops the worker (SIGSTOP) as soon as it has started (its `arg0` is a
+/// worker's), sends SIGTERM to the launcher, checks that it did not reach
+/// the worker (`ShdPnd` in /proc), and lets the worker go on. The thread of
+/// `notify_context` must then end well before the wait's limit
+/// (`HOLD_LIMIT`, 2 s after the worker's start), so a wait for another
+/// thread (`ready_thread`) fails the test. SIGQUIT to the launcher then
+/// ends the run with Go's text and exit 2. A worker that the test stopped
+/// too late (it catches SIGTERM) ends with its launcher and the run starts
+/// again, up to `ATTEMPTS` times; where no attempt is in time, the test
+/// says so and passes.
 #[test]
 fn a_launcher_holds_a_signal_until_its_worker_catches_it() {
     const ATTEMPTS: usize = 20;
@@ -430,7 +433,7 @@ fn a_launcher_holds_a_signal_until_its_worker_catches_it() {
             }
             assert!(start.elapsed() < LIMIT, "the worker did not stop");
         };
-        if mask(&status, "SigCgt:") & bit(Signal::QUIT) != 0 {
+        if mask(&status, "SigCgt:") & bit(Signal::TERM) != 0 {
             // Too late. The worker gets its parent-death SIGKILL.
             child.kill().unwrap();
             child.wait().unwrap();
@@ -438,29 +441,78 @@ fn a_launcher_holds_a_signal_until_its_worker_catches_it() {
         }
         let launcher = Pid::from_child(&child);
         rustix::process::kill_process(launcher, Signal::TERM).unwrap();
-        std::thread::sleep(Duration::from_millis(100));
-        rustix::process::kill_process(launcher, Signal::QUIT).unwrap();
         std::thread::sleep(Duration::from_millis(200));
         assert!(
             child.try_wait().unwrap().is_none(),
             "the launcher ended while its worker was stopped"
         );
         let status = std::fs::read_to_string(format!("/proc/{worker}/status")).unwrap();
-        let pending = mask(&status, "ShdPnd:") & (bit(Signal::TERM) | bit(Signal::QUIT));
-        assert_eq!(pending, 0, "sent on before the worker caught them");
+        let pending = mask(&status, "ShdPnd:") & bit(Signal::TERM);
+        assert_eq!(pending, 0, "sent on before the worker caught it");
         rustix::process::kill_process(worker_pid, Signal::CONT).unwrap();
         let resumed = Instant::now();
+        // The worker catches SIGTERM and has no `notify_context` thread, now
+        // and 50 ms later (it starts a moment after the handler).
+        let mut ended_once = false;
+        loop {
+            let status = std::fs::read_to_string(format!("/proc/{worker}/status")).unwrap();
+            let ended = mask(&status, "SigCgt:") & bit(Signal::TERM) != 0
+                && !has_thread(worker, "signal.NotifyContext");
+            if ended && ended_once {
+                break;
+            }
+            ended_once = ended;
+            assert!(
+                resumed.elapsed() < Duration::from_secs(1),
+                "the thread of notify_context still runs 1 s after the worker went on"
+            );
+            std::thread::sleep(Duration::from_millis(if ended { 50 } else { 1 }));
+        }
+        rustix::process::kill_process(launcher, Signal::QUIT).unwrap();
         let (status, stderr) = end_of(child, "hold");
-        let ended = resumed.elapsed();
         assert_eq!(status.code(), Some(2), "{status} {stderr}");
         assert!(stderr.starts_with("SIGQUIT: quit"), "{stderr}");
-        assert!(
-            ended < Duration::from_secs(1),
-            "ended {ended:?} after the worker went on"
-        );
         return;
     }
-    eprintln!("skipped: no worker was stopped before it caught SIGQUIT");
+    eprintln!("skipped: no worker was stopped before it caught SIGTERM");
+}
+
+/// A SIGINT to the whole process group (a terminal's Ctrl-C) reaches the
+/// launcher and its worker. The worker's `notify_context` thread ends at its
+/// own copy, so the launcher's copy waits for that thread until the wait's
+/// limit (bin/tsgo.rs `HOLD_LIMIT`, 2 s after the worker's start). A signal
+/// that then comes to the launcher only does not wait behind it: SIGQUIT
+/// ends the run at once with Go's text and exit 2, and SIGHUP ends it by
+/// SIGHUP, as in Go. Where `env --default-signal` cannot run, the test says
+/// so and passes.
+#[test]
+fn a_launcher_does_not_hold_a_signal_behind_another() {
+    let probe = Command::new("env").args(DEFAULT_HUP).arg("true").status();
+    if !probe.is_ok_and(|status| status.success()) {
+        eprintln!("skipped: `env --default-signal=HUP` cannot run here");
+        return;
+    }
+    for signal in [Signal::QUIT, Signal::HUP] {
+        let case = format!("SIGINT to the group, then {signal:?} to the launcher");
+        // `env` execs tsgo, so the started process is the launcher.
+        let mut command = Command::new(DEFAULT_HUP[0]);
+        command
+            .args(&DEFAULT_HUP[1..])
+            .arg(env!("CARGO_BIN_EXE_tsgo"))
+            .process_group(0);
+        let signals = [(GROUP, Signal::INT), (0, signal)];
+        let (status, stderr, ended) = signal_run(command, "1", &signals, &case);
+        if signal == Signal::QUIT {
+            assert_eq!(status.code(), Some(2), "{case}: {status} {stderr}");
+            assert!(stderr.starts_with("SIGQUIT: quit"), "{case}: {stderr}");
+        } else {
+            assert_eq!(status.signal(), Some(1), "{case}: {status} {stderr}");
+        }
+        assert!(
+            ended < Duration::from_secs(1),
+            "{case}: ended {ended:?} after the signal"
+        );
+    }
 }
 
 /// A signal that comes while tsgo sets its handler for it waits for that
@@ -638,7 +690,8 @@ fn quit_launcher(command: Command, depth: usize, case: &str) {
 
 /// Starts `command` with `--all` and `GOPORT_LAUNCH=launch`, sends each
 /// signal of `signals` to the started process's descendant `depth` levels
-/// down once tsgo has written some output, 300 ms apart, and returns how
+/// down (or to its process group: `GROUP`, for a command that starts in a
+/// group of its own) once tsgo has written some output, 300 ms apart, and returns how
 /// the run ended, its stderr and the time from the last signal to the end.
 /// The output is more than the stdout pipe holds (`small_pipe`) and the
 /// test does not read it, so tsgo cannot end before the first signal
@@ -690,6 +743,11 @@ fn signal_run_with(
             child.try_wait().unwrap().is_none(),
             "{case}: ended before {signal:?}"
         );
+        if depth == GROUP {
+            let group = Pid::from_raw(child.id().cast_signed()).unwrap();
+            rustix::process::kill_process_group(group, signal).unwrap();
+            continue;
+        }
         let mut target = child.id();
         for _ in 0..depth {
             target = child_of(target).unwrap_or_else(|| panic!("{case}: no process to signal"));
@@ -730,6 +788,10 @@ fn end_of(mut child: Child, case: &str) -> (ExitStatus, String) {
 /// How long a test waits for output or for the end of a run.
 const LIMIT: Duration = Duration::from_secs(60);
 
+/// The `depth` of `signal_run` that sends a signal to the process group of
+/// the started process.
+const GROUP: usize = usize::MAX;
+
 /// A pipe whose write end takes 4 KiB more and then waits, with any page
 /// size, and the bytes it holds already. `--all` writes about 19 KB. The
 /// smallest pipe is one page (4 KiB, or 64 KiB on some hosts), so the test
@@ -761,6 +823,19 @@ fn field<'a>(status: &'a str, name: &str) -> &'a str {
 /// /proc/<pid>/status `status`.
 fn mask(status: &str, name: &str) -> u64 {
     u64::from_str_radix(field(status, name), 16).unwrap()
+}
+
+/// Whether the process `pid` has a thread named `name` (the kernel keeps
+/// the first 15 bytes of a name).
+fn has_thread(pid: u32, name: &str) -> bool {
+    let name = &name.as_bytes()[..name.len().min(15)];
+    let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) else {
+        return false;
+    };
+    tasks.flatten().any(|task| {
+        std::fs::read(task.path().join("comm"))
+            .is_ok_and(|comm| comm.strip_suffix(b"\n") == Some(name))
+    })
 }
 
 /// A thread that opens the FIFO at `path` for writing (`writer`) or for
