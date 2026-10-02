@@ -43,8 +43,7 @@
 //! orchestrator thread with the parse cache of the build, beside the loads
 //! of the builders. When the forecast is not known as the first task
 //! compiles, that task waits for the decision while the orchestrator checks
-//! the next tasks, or loads on the orchestrator thread when no other task
-//! can start. The builders of the earlier tasks write only when the
+//! the next tasks. The builders of the earlier tasks write only when the
 //! orchestrator finishes them, so the read rule holds for them.
 
 use crate::execute::build::build_task::*;

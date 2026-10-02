@@ -879,12 +879,11 @@ impl Orchestrator {
         let mut later_on_builders = None;
         // PORT: not in Go (perf). The forecast was not known when the first
         // task that compiled was a light rebuild: the next task that
-        // compiles decides (`undecided`). Until then that first task waits
-        // (`State::Deferred`, `deferred`), or it loads on this thread when
-        // no other task can start (`load_here`).
+        // compiles decides (`undecided`), or the end of the pass when no
+        // other task can start. Until then that first task waits
+        // (`State::Deferred`, `deferred`).
         let mut undecided = false;
         let mut deferred = false;
-        let mut load_here = false;
         if !clean {
             *self.build_info_prefetch.borrow_mut() =
                 self.start_build_info_prefetch(&paths, builders_setting == BuildersSetting::Light);
@@ -958,7 +957,8 @@ impl Orchestrator {
         //      this thread. There are as many builders as routines, so no
         //      task waits for a builder. A deferred task (the first that
         //      compiles, while the forecast is not known) waits only for
-        //      other checks and loads, never for a write. A load on this
+        //      other checks and loads and for the forecast, never for a
+        //      write. A load on this
         //      thread ends before this thread starts a finish, and a finish
         //      waits for the loads on builders (the read rule, builders.rs).
         //      So the load of each such task comes before the next write: G4.
@@ -1002,7 +1002,7 @@ impl Orchestrator {
                 // A deferred task loads once the builders are decided.
                 let resumed = match states[index] {
                     State::Waiting => false,
-                    State::Deferred if later_on_builders.is_some() || load_here => true,
+                    State::Deferred if later_on_builders.is_some() => true,
                     _ => continue,
                 };
                 deferred &= !resumed;
@@ -1119,20 +1119,17 @@ impl Orchestrator {
             }
             // PORT: not in Go (perf). The deferred task loads before any
             // finish (SLOTS, P4). No second task that compiles decided the
-            // builders, so the forecast decides now when it is known. Else no
-            // other task can start, and none compiles, so this thread loads
-            // it at once, and the next task that compiles decides.
+            // builders, and no other task can start, so the forecast decides
+            // now. This thread loads no program before the decision: once
+            // builders start, every program of the build gets its parses
+            // from one cache (`BuildHost::builder_shared`).
             if deferred {
                 if later_on_builders.is_none() {
-                    later_on_builders = self.known_later_tasks_use_builders(builders_setting);
-                    match later_on_builders {
-                        Some(on_builders) => {
-                            self.end_forecast();
-                            if on_builders {
-                                builders = self.start_builders(num_routines, &ready);
-                            }
-                        }
-                        None => load_here = true,
+                    let on_builders = self.later_tasks_use_builders(builders_setting);
+                    later_on_builders = Some(on_builders);
+                    self.end_forecast();
+                    if on_builders {
+                        builders = self.start_builders(num_routines, &ready);
                     }
                 }
                 continue;
@@ -1289,8 +1286,8 @@ impl Orchestrator {
     /// (`build_all_tasks`): it does when the later tasks use builders too
     /// (`known_later_tasks_use_builders`). When the forecast is not known
     /// yet, the task waits while this thread checks the next tasks, and the
-    /// second task that compiles decides (`later_tasks_use_builders`); when
-    /// no other task can start first, the task loads on this thread.
+    /// second task that compiles decides (`later_tasks_use_builders`), or
+    /// the end of the pass when no other task can start.
     fn first_task_uses_builder(&self, setting: BuildersSetting, first: &BuildTask) -> bool {
         match setting {
             BuildersSetting::Off => false,
@@ -1346,7 +1343,8 @@ impl Orchestrator {
     }
 
     /// PORT: not in Go (perf). `later_tasks_use_builders` when the forecast
-    /// is known without a wait, else None.
+    /// is known, or when only mtimes are missing (then it waits for them,
+    /// `RebuildForecast::known_light`), else None.
     fn known_later_tasks_use_builders(&self, setting: BuildersSetting) -> Option<bool> {
         match setting {
             BuildersSetting::Off => Some(false),
@@ -2102,12 +2100,18 @@ impl RebuildForecast {
         }
     }
 
-    /// `light` when it would not wait, else None.
+    /// `light` when it would not wait, else None. When the light rebuilds
+    /// have enough files and only the mtimes of some reads are not read,
+    /// it waits for them: a changed input (an edit) shows there.
     fn known_light(&self) -> Option<bool> {
-        self.state
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .light_now()
+        let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        match state.light_now() {
+            None if state.parallel_files() >= MIN_PARALLEL_FILES => {
+                drop(state);
+                Some(self.light())
+            }
+            known => known,
+        }
     }
 }
 
@@ -2256,7 +2260,8 @@ impl BuildInfoPrefetch {
             .is_some_and(|forecast| forecast.light())
     }
 
-    /// `light_rebuilds` when the threads know it already, else None.
+    /// `light_rebuilds` when the threads know it already or only the mtimes
+    /// are missing (`RebuildForecast::known_light`), else None.
     fn known_light_rebuilds(&self) -> Option<bool> {
         self.forecast
             .as_ref()
