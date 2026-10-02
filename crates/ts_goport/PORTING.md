@@ -554,26 +554,24 @@ process (bin/tsgo.rs `unblock_go_signals`, `go_signal_handlers`,
   SIGTERM end the process in the same way (Go `_SigKill`); an ignored
   SIGINT stays ignored there, as in Go. PORT: SIGABRT and SIGTRAP keep
   their default actions. Other systems keep the default actions.
-- The start window: Go sets these handlers before `main`. tsgo sets them
-  as early as the heap allows: after `thp_guard` (which runs before the
-  first heap allocation) and the launcher choice, before the thread
-  budget and the exec of `set_malloc_tunables` (the new image sets them
-  again at the same point). A signal that comes before them has its
-  default action, as one that comes before Go's runtime start. A worker
-  sets them after the exec: its launcher holds a signal until the worker
-  catches it, so a handler of the image before the exec would end the hold
-  too soon. It sets no early SIGINT and SIGTERM handlers: its launcher
-  holds them until `notify_context` in the worker catches them. Measured
-  on mini-743d (followups9, medians of two runs of 40): a run without a
-  worker catches SIGHUP, SIGINT and SIGTERM about 2.0 ms after the spawn
-  (before: 2.5 ms for SIGHUP, 2.9 ms for SIGINT and SIGTERM; Go N
-  1.5 ms). `main` sets them 0.1 ms after its start; the rest is the start
-  before `main` (the dynamic loader and std). A build without
-  `JEMALLOC_CONF` built in (the test and evidence bins) runs the exec of
-  `set_malloc_tunables`, and leaves them uncaught for 3.1 ms in all
-  (before: 3.9 ms for SIGHUP). PORT: with `--lsp` and `--api`, SIGINT and
-  SIGTERM keep their default actions until their own `notify_context` (in
-  cmd/tsgo/lsp.rs and api.rs), which the early handlers cannot see.
+- The start window: Go sets these handlers once, before `main`, in its
+  last image. tsgo sets them once too (bin/tsgo.rs `main`), after
+  `thp_guard` (which runs before the first heap allocation), the launcher
+  choice, the thread budget and the exec of `set_malloc_tunables`. A
+  handler set before that exec could take a signal that the exec then
+  loses, as the exec ends the `go-signals` thread before it acts
+  (followups9 round a set them before the exec: SIGQUIT was lost in 3 to 6
+  of 1000 runs on a quiet host and in up to 14% under CPU load). A signal
+  that comes before the handlers has the caller's action, as one that
+  comes before Go's runtime start. A worker sets no SIGINT and SIGTERM
+  handlers there: its launcher holds every signal until the worker
+  catches it, SIGINT and SIGTERM until `notify_context`. The start before
+  `main` (the dynamic loader and std) is about 0.6 ms longer than Go's
+  (mini-743d, followups9). A build without `JEMALLOC_CONF` built in (the
+  test and evidence bins) runs the exec of `set_malloc_tunables` first.
+  PORT: with `--lsp` and `--api`, SIGINT and SIGTERM keep their default
+  actions until their own `notify_context` (in cmd/tsgo/lsp.rs and
+  api.rs), which `go_signal_handlers` cannot see.
 - The pid 1 of a PID namespace (`docker run` without `--init`, `unshare
   -pf`, `bwrap --as-pid-1`): the kernel drops each signal with the default
   action that such a process gets from its namespace or sends itself. Go

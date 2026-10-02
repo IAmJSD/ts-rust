@@ -102,27 +102,22 @@ fn main() {
     // A worker gets its parent-death signal here, or ends when its
     // launcher has ended (`worker`).
     #[cfg(target_os = "linux")]
-    let in_worker = worker().is_some();
-    // Go sets its handlers before `main`. A run without a launcher sets
-    // them as early as the heap allows and after `launch` (a launcher sends
-    // the signals on). An exec in `set_malloc_tunables` resets them, and the
-    // new image sets them here again. A worker sets them after that exec:
-    // its launcher holds a signal until the worker catches it
-    // (`wait_until_caught`), so the worker must catch it in its last image.
-    #[cfg(target_os = "linux")]
-    if !in_worker {
-        go_signal_handlers();
-    }
+    let _ = worker();
     // One budget sets the parse and bind threads and the malloc arenas.
     // tsgo has one more thread with an arena than goport: the
     // `notify_context` signal thread.
     let budget = ThreadBudget::one_program(1);
     set_malloc_tunables(&budget);
-    budget.install();
+    // Go sets its handlers once, before `main`, in its last image. tsgo
+    // sets them after `launch` (a launcher sends the signals on) and after
+    // the exec of `set_malloc_tunables`: a signal that a handler took
+    // before that exec would be lost, as the exec ends the `go-signals`
+    // thread before it acts. Until here a signal has the caller's action,
+    // as before Go's runtime start. In a worker, its launcher holds a
+    // signal until the worker catches it (`wait_until_caught`).
     #[cfg(target_os = "linux")]
-    if in_worker {
-        go_signal_handlers();
-    }
+    go_signal_handlers();
+    budget.install();
     // After the exec in `set_malloc_tunables`: a raised limit would read as
     // the original one there.
     go_runtime_start();
@@ -697,8 +692,9 @@ fn drop_go_signals() {
 /// `notify_context` (`NOTIFYING`; Go `NotifyContext`), but not in a worker:
 /// its launcher holds them until `notify_context` catches them
 /// (`wait_until_caught`). A SIGHUP or SIGINT that was ignored at start
-/// stays ignored (`ignored_at_start`). `main` calls it as early as the heap
-/// allows, a worker after the exec of `set_malloc_tunables`. The thread
+/// stays ignored (`ignored_at_start`). `main` calls it once, after the
+/// exec of `set_malloc_tunables`, as Go sets its handlers in its last
+/// image. The thread
 /// waits on a pipe until a signal comes; Go acts in the signal handler,
 /// with no thread. The thread starts as a Go runtime thread does
 /// (`GoThread`): when the OS refuses it, the run ends with Go's text and
