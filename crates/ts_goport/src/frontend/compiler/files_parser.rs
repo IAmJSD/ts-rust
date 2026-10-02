@@ -3,7 +3,7 @@
 
 use crate::frontend::prelude::*;
 use crate::program::ThreadBudget;
-use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 // Go: filesparser.go:19 parseTask
@@ -452,12 +452,25 @@ impl FilesParser {
                 .collect();
         }
         let prefetch = PrefetchGuard::install(pool.shared.clone());
+        // A load that shares the workers counts itself among the loads that
+        // parse now (`SHARED_LOADS`).
+        let _shared = PARSE_WORKER_SHARE.get().map(|_| SharedLoad::start());
         self.start(loader, tasks, 0);
         pool.shared
             .rank_roots(tasks, ROOT_RANK_PER_WORKER * pool.threads.len());
         // The root jobs are queued now, so the added workers start at once.
         pool.add_workers(extra_worker_count(large));
-        self.run_queue(loader);
+        match unshared_large_worker_count(large) {
+            // A large load that shares the workers gets the workers of a
+            // load that does not once it parses alone.
+            Some(unshared) => self.run_queue_growing(loader, || {
+                if pool.threads.len() < unshared && SHARED_LOADS.load(AtomicOrdering::Relaxed) == 1
+                {
+                    pool.add_workers(unshared - pool.threads.len());
+                }
+            }),
+            None => self.run_queue(loader),
+        }
         // Closes the queue, then waits for the workers.
         drop(prefetch);
         drop(pool);
@@ -477,6 +490,23 @@ impl FilesParser {
     // ends the run as it does in Go.
     fn run_queue(&mut self, loader: &FileLoader) {
         while let Some(queued) = self.queue.pop() {
+            if self.single_threaded {
+                self.run_queued(loader, queued);
+            } else {
+                crate::core::go_work_group_task(|| self.run_queued(loader, queued));
+            }
+        }
+    }
+
+    /// PORT: not in Go (perf). `run_queue` that calls `grow` before the
+    /// first queued func and then every `GROW_CHECK` of them.
+    fn run_queue_growing(&mut self, loader: &FileLoader, mut grow: impl FnMut()) {
+        let mut ran = 0usize;
+        while let Some(queued) = self.queue.pop() {
+            if ran % GROW_CHECK == 0 {
+                grow();
+            }
+            ran += 1;
             if self.single_threaded {
                 self.run_queued(loader, queued);
             } else {
@@ -1298,7 +1328,9 @@ fn prefetch_worker_count() -> usize {
 /// PORT: not in Go (perf). Gives the program loads on this thread their
 /// share of the parse workers: the loads of `loads` threads can run at the
 /// same time (a `tsc -b` builder thread, execute/build/builders.rs). A
-/// large load (`extra_worker_count`) gets twice the share. Go's parse tasks
+/// large load (`extra_worker_count`) gets twice the share, and the workers
+/// of a load that does not share them once no other such load parses
+/// (`unshared_large_worker_count`). Go's parse tasks
 /// of programs that load at the same time share one set of threads
 /// (GOMAXPROCS); here each load starts its own workers.
 // PERF (tscbpar1 round f, mini-743d, stable bins against R155, 4 builders,
@@ -1335,6 +1367,47 @@ fn extra_worker_count(large: bool) -> usize {
             .parse_threads(large)
             .saturating_sub(budget.parse_threads(false)),
     }
+}
+
+/// PORT: not in Go (perf). The program loads that share the parse workers
+/// (`share_parse_workers`: the builder threads of a parallel `tsc -b`) and
+/// parse now, in the process (`SharedLoad`).
+static SHARED_LOADS: AtomicUsize = AtomicUsize::new(0);
+
+/// Counts a load in `SHARED_LOADS` until it drops.
+struct SharedLoad;
+
+impl SharedLoad {
+    fn start() -> Self {
+        SHARED_LOADS.fetch_add(1, AtomicOrdering::Relaxed);
+        SharedLoad
+    }
+}
+
+impl Drop for SharedLoad {
+    fn drop(&mut self) {
+        SHARED_LOADS.fetch_sub(1, AtomicOrdering::Relaxed);
+    }
+}
+
+/// How many queued funcs a large load that shares the workers runs between
+/// two checks of `SHARED_LOADS` (`FilesParser::run_queue_growing`).
+const GROW_CHECK: usize = 64;
+
+/// PORT: not in Go (perf). For a large load that shares the parse workers
+/// (`share_parse_workers`): the parse workers of a large load that does
+/// not, which it gets once no other such load parses. None for other
+/// loads, and when `GOPORT_PARSE_THREADS` sets the count.
+// PERF (tscbpar1 round f, agent 2): in small8-big1 (8 packages of 15 files,
+// then one of 1,500) the large load comes last, beside the ends of the
+// small ones, and parsed with 4 workers where a serial build has 7 (mini-743d
+// and mini-abf9: 16 threads). Its builders gained 4.9% and 5.7% (rule: more
+// than 5%).
+fn unshared_large_worker_count(large: bool) -> Option<usize> {
+    if !large || PARSE_WORKER_SHARE.get().is_none() || parse_threads_from_env().is_some() {
+        return None;
+    }
+    Some(ThreadBudget::current().parse_threads(true) - 1)
 }
 
 /// The parse thread count that `GOPORT_PARSE_THREADS` sets, if any.
