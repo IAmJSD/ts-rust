@@ -632,9 +632,14 @@ process (bin/tsgo.rs `unblock_go_signals`, `go_signal_handlers`,
   - A forwarded signal waits until the worker catches it (its `SigCgt` in
     /proc), so a signal that comes before the worker's handlers does what
     it does in Go after the start: a plain compile goes on after SIGINT
-    and SIGTERM, and SIGQUIT prints its name and exits 2. The wait ends
-    2 s after the worker starts (`HOLD_LIMIT`); a later signal goes on at
-    once.
+    and SIGTERM, and SIGQUIT prints its name and exits 2. signal-hook sets
+    the handler (the bit) a moment before it publishes the action that the
+    handler runs, and a signal in between does nothing, so the wait also
+    needs the thread that the worker starts after it has registered the
+    signal (`ready_thread`: `signal.NotifyContext` for SIGINT and SIGTERM,
+    `go-signals` for the others). A signal that the worker was seen to
+    catch goes on at once after that. The wait ends 2 s after the worker
+    starts (`HOLD_LIMIT`); a later signal goes on at once.
   - The worker ends with its launcher: a parent-death SIGKILL, and a
     worker whose launcher died before that (its parent is not the named
     launcher, and the named launcher is gone or a zombie) kills itself. A

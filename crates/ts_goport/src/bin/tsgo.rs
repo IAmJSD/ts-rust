@@ -430,7 +430,10 @@ struct OwnStatus {
 /// worker starts, `launch` drops the sender and the thread ends. Each
 /// signal also waits until the worker catches it (`wait_until_caught`),
 /// for at most `HOLD_LIMIT` after the worker starts, and only with this
-/// process's own /proc (`own_proc`). Otherwise it goes on at once.
+/// process's own /proc (`own_proc`). Otherwise it goes on at once, and so
+/// does a signal that the worker was seen to catch before (the thread of
+/// `notify_context`, which the wait looks for, ends after its first
+/// signal).
 /// The thread starts as a Go runtime thread does (`GoThread`): when the OS
 /// refuses it, the launcher ends with Go's text and exit 2, before there is
 /// a worker. Go has no launcher, so its process gets every signal; a
@@ -454,10 +457,17 @@ fn forward_signals() -> Option<std::sync::mpsc::Sender<rustix::process::Pid>> {
             if !ignored_at_start(signal_hook::consts::SIGHUP) {
                 let _ = signals.add_signal(signal_hook::consts::SIGHUP);
             }
+            // The signals that the worker was seen to catch (a bit per
+            // signal, as in `SigCgt`): they go on at once.
+            let mut caught = 0u64;
             for signal in signals.forever() {
                 if let Some(signal) = rustix::process::Signal::from_named_raw(signal) {
-                    if let Some(until) = hold {
-                        wait_until_caught(pid, signal, until);
+                    let bit = 1u64 << (signal.as_raw() - 1).unsigned_abs();
+                    if let Some(until) = hold
+                        && caught & bit == 0
+                        && wait_until_caught(pid, signal, until)
+                    {
+                        caught |= bit;
                     }
                     let _ = rustix::process::kill_process(pid, signal);
                 }
@@ -466,21 +476,29 @@ fn forward_signals() -> Option<std::sync::mpsc::Sender<rustix::process::Pid>> {
     Some(send)
 }
 
-/// Waits until the worker `pid` catches `signal`, so a forwarded signal
-/// finds the handlers that the worker sets at its start
+/// Waits until the worker `pid` catches `signal` and returns true, so a
+/// forwarded signal finds the handlers that the worker sets at its start
 /// (`go_signal_handlers`, `notify_context`) and does not end it by the
 /// default action. A signal that came before them (soon after the start,
 /// or while the start of `forward_signals` was tried again) waits here: Go
 /// sets its handlers before `main`, and `runMain` calls `NotifyContext`
 /// before any work (cmd/tsc/main.go:29).
 /// The kernel lists the caught signals in /proc/<pid>/status (`SigCgt`, a
-/// hex mask with bit N-1 for signal N). The caller calls it only with
-/// this process's own /proc (`own_proc`). It reads the file at once, then
-/// after pauses of 1, 2, 4 and 8 ms, then every 8 ms. The wait ends when
-/// the worker catches the signal or has ended, when that file does not
-/// show a live child of this process, and at `until`.
+/// hex mask with bit N-1 for signal N). signal-hook sets the handler (the
+/// bit) a moment before it publishes the action that the handler runs
+/// (signal-hook-registry 1.4.8 `register_unchecked_impl`), and a signal in
+/// between does nothing. So the wait also needs the thread that the worker
+/// starts after it has registered the signal (`ready_thread`). The caller
+/// calls it only with this process's own /proc (`own_proc`). It reads the
+/// files at once, then after pauses of 1, 2, 4 and 8 ms, then every 8 ms.
+/// The wait ends with false when the worker has ended, when that file does
+/// not show a live child of this process, and at `until`.
 #[cfg(target_os = "linux")]
-fn wait_until_caught(pid: rustix::process::Pid, signal: rustix::process::Signal, until: Instant) {
+fn wait_until_caught(
+    pid: rustix::process::Pid,
+    signal: rustix::process::Signal,
+    until: Instant,
+) -> bool {
     let path = format!("/proc/{}/status", pid.as_raw_pid());
     let launcher = rustix::process::getpid().as_raw_pid().to_string();
     let bit = 1u64 << (signal.as_raw() - 1).unsigned_abs();
@@ -488,10 +506,10 @@ fn wait_until_caught(pid: rustix::process::Pid, signal: rustix::process::Signal,
     loop {
         let left = until.saturating_duration_since(Instant::now());
         if left.is_zero() {
-            return;
+            return false;
         }
         let Ok(status) = std::fs::read_to_string(&path) else {
-            return;
+            return false;
         };
         let field = |name: &str| {
             status
@@ -502,12 +520,47 @@ fn wait_until_caught(pid: rustix::process::Pid, signal: rustix::process::Signal,
         let child = field("PPid:") == Some(launcher.as_str());
         let live = field("State:").is_some_and(|state| !state.starts_with(['Z', 'X']));
         let caught = field("SigCgt:").and_then(|mask| u64::from_str_radix(mask, 16).ok());
-        if !(child && live && caught.is_some_and(|caught| caught & bit == 0)) {
-            return;
+        let Some(caught) = caught.filter(|_| child && live) else {
+            return false;
+        };
+        if caught & bit != 0 && has_thread(pid, ready_thread(signal)) {
+            return true;
         }
         std::thread::sleep(pause.min(left));
         pause = (pause * 2).min(std::time::Duration::from_millis(8));
     }
+}
+
+/// The name of the thread that a worker starts once its action for
+/// `signal`, a signal that a launcher sends on, is published
+/// (`wait_until_caught`): `notify_context` registers SIGINT and SIGTERM
+/// and then starts `signal.NotifyContext` (cmd/tsgo/main.rs), and
+/// `go_signal_handlers` registers the others and then starts
+/// `GO_SIGNALS_THREAD`.
+#[cfg(target_os = "linux")]
+fn ready_thread(signal: rustix::process::Signal) -> &'static str {
+    use rustix::process::Signal;
+    if signal == Signal::INT || signal == Signal::TERM {
+        "signal.NotifyContext"
+    } else {
+        GO_SIGNALS_THREAD
+    }
+}
+
+/// Whether the process `pid` has a thread named `name`, from
+/// /proc/<pid>/task (the kernel keeps the first 15 bytes of a name). True
+/// when that directory cannot be read: a wait for it would last until its
+/// limit.
+#[cfg(target_os = "linux")]
+fn has_thread(pid: rustix::process::Pid, name: &str) -> bool {
+    let name = &name.as_bytes()[..name.len().min(15)];
+    let Ok(tasks) = std::fs::read_dir(format!("/proc/{}/task", pid.as_raw_pid())) else {
+        return true;
+    };
+    tasks.flatten().any(|task| {
+        std::fs::read(task.path().join("comm"))
+            .is_ok_and(|comm| comm.strip_suffix(b"\n") == Some(name))
+    })
 }
 
 /// How long after the worker starts a forwarded signal can wait for the
@@ -721,7 +774,7 @@ fn go_signal_handlers() {
     if let Ok(mut signals) = signal_hook::iterator::Signals::new(ended) {
         end_default_actions(&THROWN_DEFAULT);
         ts_goport::core::GoThread::new()
-            .name("go-signals".to_string())
+            .name(GO_SIGNALS_THREAD.to_string())
             .spawn(move || {
                 for signal in signals.forever() {
                     if let Some((_, name)) = GO_THROWN.iter().find(|(s, _)| s.as_raw() == signal) {
@@ -739,6 +792,11 @@ fn go_signal_handlers() {
     // After those: the many handlers that do nothing.
     drop_go_signals();
 }
+
+/// The thread of `go_signal_handlers`. A launcher looks for it
+/// (`ready_thread`).
+#[cfg(target_os = "linux")]
+const GO_SIGNALS_THREAD: &str = "go-signals";
 
 /// Set once `run_main` has set `notify_context` (see `go_signal_handlers`).
 #[cfg(target_os = "linux")]
