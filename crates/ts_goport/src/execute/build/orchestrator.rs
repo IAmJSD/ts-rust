@@ -853,6 +853,9 @@ impl Orchestrator {
         enum State {
             NotTaken,
             Waiting,
+            /// PORT: not in Go (perf). Checked: it compiles on a builder
+            /// when one is free.
+            Checked,
             Compiling,
             Done,
         }
@@ -927,18 +930,13 @@ impl Orchestrator {
             // builder (Go `close(task.built)`).
             let mut progressed = false;
             for index in next_report..next_take {
-                if states[index] != State::Waiting {
-                    continue;
-                }
-                // PORT: not in Go (perf). A task that can go to a builder
-                // waits while every builder is busy (`start_builders`).
-                if later_on_builders != Some(false)
-                    && builders.as_ref().is_some_and(Builders::all_busy)
-                {
-                    continue;
-                }
+                let checked = match states[index] {
+                    State::Waiting => false,
+                    State::Checked => true,
+                    _ => continue,
+                };
                 let task = self.get_task(&paths[index]);
-                if !clean {
+                if !clean && !checked {
                     let upstream_done = task.borrow().up_stream.iter().all(|upstream| {
                         let path = self.to_path(&upstream.task.borrow().config);
                         index_of
@@ -949,7 +947,7 @@ impl Orchestrator {
                         continue;
                     }
                 }
-                let compiles = {
+                let compiles = checked || {
                     let mut task = task.borrow_mut();
                     task.result = Some(TaskResult::new(
                         self.create_task_builder_status_reporter(),
@@ -962,7 +960,7 @@ impl Orchestrator {
                         task.build_project_check(self, &paths[index])
                     }
                 };
-                if compiles && !testing && num_routines > 1 {
+                if compiles && !checked && !testing && num_routines > 1 {
                     if !overlap_checked {
                         overlap_checked = true;
                         in_build_order = self.outputs_overlap(&paths);
@@ -984,6 +982,17 @@ impl Orchestrator {
                         later_on_builders = Some(self.later_tasks_use_builders(builders_setting));
                         self.end_forecast();
                     }
+                }
+                // PORT: not in Go (perf). A task that compiles on a builder
+                // waits while every builder is busy (`start_builders`). Its
+                // check runs first, so a task that is up to date or skipped
+                // does not wait.
+                if compiles
+                    && later_on_builders != Some(false)
+                    && builders.as_ref().is_some_and(Builders::all_busy)
+                {
+                    states[index] = State::Checked;
+                    continue;
                 }
                 // The read rule (builders.rs): beside builders, this thread
                 // loads a program only when no builder loads one.
