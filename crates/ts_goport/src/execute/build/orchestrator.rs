@@ -1922,6 +1922,8 @@ struct ForecastState {
     largest_paired: usize,
     /// A rebuild is heavy.
     heavy: bool,
+    /// The threads that wait in `RebuildForecast::light`.
+    waiting: usize,
 }
 
 /// A read with a light rebuild in a `ForecastState`.
@@ -1988,6 +1990,7 @@ impl RebuildForecast {
                 paired_files: 0,
                 largest_paired: 0,
                 heavy: false,
+                waiting: 0,
             }),
             changed: Condvar::new(),
             ended: std::sync::atomic::AtomicBool::new(false),
@@ -2005,14 +2008,24 @@ impl RebuildForecast {
     }
 
     /// Runs `update` on the state, ends the forecast when the answer is
-    /// "no", and wakes the waits.
+    /// "no", and wakes the waits. Once the forecast ended, nothing waits or
+    /// asks: the answer "no" stays, and after the decision the orchestrator
+    /// asks no more.
+    // PERF (tscbpar1 round f, agent 2): a notify is a futex call even with
+    // no waiter. In a noop (no wait) the reads made about 3 updates each,
+    // most of them after the end (wide-noop: 12 reads, 8.7 ms).
     fn update(&self, update: impl FnOnce(&mut ForecastState)) {
+        if self.ended() {
+            return;
+        }
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         update(&mut state);
         if state.light_now() == Some(false) {
             self.end();
         }
-        self.changed.notify_all();
+        if state.waiting > 0 {
+            self.changed.notify_all();
+        }
     }
 
     /// The mtimes of a read (`unchanged_inputs`).
@@ -2093,10 +2106,12 @@ impl RebuildForecast {
             if let Some(light) = state.light_now() {
                 return light;
             }
+            state.waiting += 1;
             state = self
                 .changed
                 .wait(state)
                 .unwrap_or_else(PoisonError::into_inner);
+            state.waiting -= 1;
         }
     }
 
