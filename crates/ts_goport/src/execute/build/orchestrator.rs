@@ -854,6 +854,9 @@ impl Orchestrator {
         enum State {
             NotTaken,
             Waiting,
+            /// PORT: not in Go (perf). Checked, and it compiles: it loads
+            /// when the builders are decided (`deferred`), before any finish.
+            Deferred,
             Compiling,
             Done,
         }
@@ -875,6 +878,10 @@ impl Orchestrator {
         // compiles (`later_tasks_use_builders`). With `Some(false)` they
         // compile on this thread.
         let mut later_on_builders = None;
+        // PORT: not in Go (perf). True while the first task that compiles
+        // waits for the builders decision (`State::Deferred`): the forecast
+        // was not known when it compiled.
+        let mut deferred = false;
         if !clean {
             *self.build_info_prefetch.borrow_mut() =
                 self.start_build_info_prefetch(&paths, builders_setting == BuildersSetting::Light);
@@ -932,13 +939,15 @@ impl Orchestrator {
         //      thread: `build_project_compile`, then `build_project_finish`).
         //      The emit keeps its writes in memory until the finish: G3.
         // (P4) this thread finishes a task only when the start loop made no
-        //      progress. Then every taken task whose upstream tasks are done
-        //      started: it loads at once, on a free builder or on this
-        //      thread. No task waits for a builder: when every builder is
-        //      busy, this thread loads the task. A load on this thread ends
-        //      before this thread starts a finish, and a finish waits for the
-        //      loads on builders (the read rule, builders.rs). So the load of
-        //      each such task comes before the next write: G4.
+        //      progress and no task is deferred. Then every taken task whose
+        //      upstream tasks are done started: it loads on a builder or on
+        //      this thread. There are as many builders as routines, so no
+        //      task waits for a builder. A deferred task (the first that
+        //      compiles, while the forecast is not known) waits only for
+        //      other checks and loads, never for a write. A load on this
+        //      thread ends before this thread starts a finish, and a finish
+        //      waits for the loads on builders (the read rule, builders.rs).
+        //      So the load of each such task comes before the next write: G4.
         // (P5) a pseudo build (`updateTimeStamps` in the check) changes
         //      mtimes only. No load reads an mtime, so its order with a load
         //      does not change the output (as in R155).
@@ -975,11 +984,16 @@ impl Orchestrator {
             // builder (Go `close(task.built)`).
             let mut progressed = false;
             for index in next_report..next_take {
-                if states[index] != State::Waiting {
-                    continue;
-                }
+                // A deferred task loads once the builders are decided.
+                let decided = builders.is_some() || later_on_builders.is_some();
+                let resumed = match states[index] {
+                    State::Waiting => false,
+                    State::Deferred if decided => true,
+                    _ => continue,
+                };
+                deferred &= !resumed;
                 let task = self.get_task(&paths[index]);
-                if !clean {
+                if !clean && !resumed {
                     let upstream_done = task.borrow().up_stream.iter().all(|upstream| {
                         let path = self.to_path(&upstream.task.borrow().config);
                         index_of
@@ -990,7 +1004,7 @@ impl Orchestrator {
                         continue;
                     }
                 }
-                let compiles = {
+                let compiles = resumed || {
                     let mut task = task.borrow_mut();
                     task.result = Some(TaskResult::new(
                         self.create_task_builder_status_reporter(),
@@ -1003,7 +1017,7 @@ impl Orchestrator {
                         task.build_project_check(self, &paths[index])
                     }
                 };
-                if compiles && !testing && num_routines > 1 {
+                if compiles && !resumed && !testing && num_routines > 1 {
                     if !overlap_checked {
                         overlap_checked = true;
                         in_build_order = self.outputs_overlap(&paths);
@@ -1011,27 +1025,37 @@ impl Orchestrator {
                             && self.first_task_uses_builder(builders_setting, &task.borrow())
                         {
                             // A forecast that is known already decides for
-                            // every task now.
+                            // every task now. Else this task waits for the
+                            // decision, and this thread checks the next
+                            // tasks meanwhile.
                             later_on_builders =
                                 self.known_later_tasks_use_builders(builders_setting);
-                            if later_on_builders != Some(false) {
-                                builders = self.start_builders(num_routines, &ready);
+                            match later_on_builders {
+                                Some(true) => builders = self.start_builders(num_routines, &ready),
+                                Some(false) => {}
+                                None => {
+                                    states[index] = State::Deferred;
+                                    deferred = true;
+                                    continue;
+                                }
                             }
                         }
-                        if builders.is_none() || later_on_builders.is_some() {
-                            self.end_forecast();
-                        }
-                    } else if builders.is_some() && later_on_builders.is_none() {
-                        later_on_builders = Some(self.later_tasks_use_builders(builders_setting));
                         self.end_forecast();
+                    } else if later_on_builders.is_none() && (deferred || builders.is_some()) {
+                        let on_builders = self.later_tasks_use_builders(builders_setting);
+                        later_on_builders = Some(on_builders);
+                        self.end_forecast();
+                        if on_builders && builders.is_none() {
+                            builders = self.start_builders(num_routines, &ready);
+                        }
                     }
                 }
                 // PORT: not in Go (perf). SLOTS (P4): a task that compiles
-                // loads now, on a free builder when the tasks use builders,
-                // else on this thread, beside the loads of the builders.
-                let on_builder = builders.as_mut().filter(|builders| {
-                    compiles && later_on_builders != Some(false) && !builders.all_busy()
-                });
+                // loads now, on a builder when the tasks use builders, else
+                // on this thread, beside the loads of the builders.
+                let on_builder = builders
+                    .as_mut()
+                    .filter(|_| compiles && later_on_builders != Some(false));
                 let mut task = task.borrow_mut();
                 states[index] = if !compiles {
                     State::Done
@@ -1068,6 +1092,26 @@ impl Orchestrator {
                 progressed = true;
             }
             if progressed {
+                continue;
+            }
+            // PORT: not in Go (perf). The deferred task loads before any
+            // finish (SLOTS, P4). No second task that compiles decided the
+            // builders, so the forecast decides now when it is known. Else
+            // the task goes to a builder, and the tasks after it decide
+            // when the next one compiles.
+            if deferred {
+                if !(builders.is_some() || later_on_builders.is_some()) {
+                    later_on_builders = self.known_later_tasks_use_builders(builders_setting);
+                    if later_on_builders != Some(false) {
+                        builders = self.start_builders(num_routines, &ready);
+                    }
+                    if builders.is_none() {
+                        later_on_builders = Some(false);
+                    }
+                    if later_on_builders.is_some() {
+                        self.end_forecast();
+                    }
+                }
                 continue;
             }
             // No task can start or report, so a taken task compiles (the
@@ -1285,10 +1329,10 @@ impl Orchestrator {
 
     /// PORT: not in Go (perf). The builder threads of a parallel build
     /// (builders.rs), which send the index of each task whose check and emit
-    /// are done to `ready` (`first_task_uses_builder`). There are one fewer
-    /// builders than `num_routines`, and at least 2. Go builds on
-    /// `num_routines` goroutines: a task that compiles while every builder
-    /// is busy loads on this thread (SLOTS in `build_all_tasks`).
+    /// are done to `ready` (`first_task_uses_builder`). There are at most
+    /// `num_routines` builders, as Go builds on `num_routines` goroutines, so
+    /// a task that compiles always finds a free builder (SLOTS in
+    /// `build_all_tasks`).
     /// None when a config cannot go to a builder (`BuildHost::builder_shared`).
     /// The output is the same with or without builders.
     /// This thread then publishes the stores of the configs that it parsed,
@@ -1314,15 +1358,15 @@ impl Orchestrator {
                 .unwrap_or_else(std::time::Instant::now),
             ends_process: self.ends_process.get(),
         };
-        // PERF (tscbpar1 round d, mini-743d, fresh copies of the stable
-        // bins against R153, 30 rounds): with 4 routines, a 4th builder
-        // added 6 to 7 points of peak RSS where 4 or more light rebuilds
-        // compile together (mixlib5s +11.3% against +4.0% with 3 builders,
-        // sametypes5s +6.1% against -0.6%, bigfan8 +8.4% against +1.6%) and
-        // 10% to 20% of the sys CPU. Its wall gain was -3.5 to +3 points
-        // (wide-4err 23.6% against 20.7%), and 5.5 in bigfan8 (8 light
-        // leaves of a 1,500 file root: 29.2% against 23.7%).
-        let max = num_routines.saturating_sub(1).max(2).min(num_routines);
+        // PERF (tscbpar1 round f, mini-743d, stable bins against R155, 30
+        // rounds): round d started one fewer builder than routines, and a
+        // task waited for a free builder, so it could load after another
+        // task wrote (not Go). With the 4th task on this thread, beside the
+        // builders, fan8 was -17.5%, tiny16 -15.6%, sizes6 -16.7% and
+        // mixlib5s -14.2%; with 4 builders -27.4%, -26.5%, -23.5% and
+        // -20.3%, for about the same peak RSS (this thread's load blocks the
+        // finishes).
+        let max = num_routines;
         Some(Builders::new(setup, max, ready.clone()))
     }
 
@@ -2730,7 +2774,7 @@ mod tests {
 
     /// The slots of a parallel build (`SLOTS`): with 4 routines, the 4
     /// tasks below run at once, so each loads before any of them writes,
-    /// also when every builder is busy. The tscbpar1e skeptic's wait4n
+    /// beside the other builders. The tscbpar1e skeptic's wait4n
     /// shape: p1's pending emit adds `v2` to its `.d.ts`; p2 and p3 have
     /// 60 files of pending emit; p4 has no reference to p1 and reads its
     /// `.d.ts` through `node_modules/p1` (a link to p1, whose package.json

@@ -41,10 +41,10 @@
 //! heavy one (`Orchestrator::first_task_uses_builder`,
 //! `later_tasks_use_builders`). Else the later ones compile on the
 //! orchestrator thread with the parse cache of the build, beside the loads
-//! of the builders. A task that compiles while every builder is busy
-//! compiles on the orchestrator thread too. The builders of the earlier
-//! tasks write only when the orchestrator finishes them, so the read rule
-//! holds for them.
+//! of the builders. When the forecast is not known as the first task
+//! compiles, that task waits for the decision while the orchestrator checks
+//! the next tasks. The builders of the earlier tasks write only when the
+//! orchestrator finishes them, so the read rule holds for them.
 
 use crate::execute::build::build_task::*;
 use crate::execute::build::command_line::{ParsedBuildCommandLine, SendBuildCommandLine};
@@ -141,9 +141,8 @@ struct Builder {
 /// The builder threads of one build, on the orchestrator thread. A task
 /// goes to the first idle builder (`compile`), so a chain of tasks stays on
 /// the first builder and its parse cache. A builder starts with its first
-/// task. There are at most `max` builders (`Orchestrator::start_builders`).
-/// When all of them are busy, a task that compiles loads on the
-/// orchestrator thread (`all_busy`).
+/// task. There are at most `max` builders (`Orchestrator::start_builders`),
+/// as many as the tasks that can compile at the same time.
 pub(crate) struct Builders {
     setup: Arc<BuilderSetup>,
     max: usize,
@@ -198,13 +197,6 @@ impl Builders {
         }
         self.builders[builder].busy = true;
         self.builder_of.insert(index, builder);
-    }
-
-    /// True when every builder is busy and no other can start: then a task
-    /// that compiles loads on the orchestrator thread (orchestrator.rs
-    /// `build_all_tasks`).
-    pub(crate) fn all_busy(&self) -> bool {
-        self.builders.len() >= self.max && self.builders.iter().all(|builder| builder.busy)
     }
 
     /// True when the task at build order index `index` compiles on a
