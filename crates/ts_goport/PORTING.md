@@ -571,7 +571,14 @@ process (bin/tsgo.rs `unblock_go_signals`, `go_runtime_start`).
   the port the process ends by the signal (128 + N, a core dump where the
   limit allows it). A SIGILL, SIGBUS, SIGFPE, SIGABRT or SIGTRAP that was
   ignored at start stays ignored, also in a process that tsgo starts; Go
-  catches it, so a process that Go starts gets the default action.
+  catches it, so a process that Go starts gets the default action. There
+  is no safe way to give the child the default actions: std `Command` has
+  no attribute for them (it resets only SIGPIPE), rustix has no
+  `posix_spawn`, a `pre_exec` hook is `unsafe`, and signal-hook refuses a
+  handler for SIGILL and SIGFPE (and a handler that returns from a real
+  fault runs the fault again). nix's `posix_spawn` (with
+  `PosixSpawnAttr::set_sigdefault`) is safe, but its file actions have no
+  `chdir`, which the content mapper start needs (Go `cmd.Dir`).
 - The signal mask. At start, before any thread, tsgo unblocks the signals
   that Go unblocks on each of its threads (`GO_UNBLOCKED`: sigtab
   `_SigUnblock`, `_SigKill` or `_SigThrow`, and SIGURG: SIGHUP, SIGINT,
