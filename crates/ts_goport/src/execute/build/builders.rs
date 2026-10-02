@@ -124,6 +124,9 @@ pub(crate) struct BuilderSetup {
     /// The process ends after the build (`Orchestrator::ends_process`):
     /// then a builder frees nothing at the end.
     pub(crate) ends_process: bool,
+    /// The most builders (`Orchestrator::start_builders`): the loads that
+    /// can run at the same time.
+    pub(crate) builders: usize,
 }
 
 enum Message {
@@ -263,6 +266,8 @@ fn run_builder(
     finished: &Sender<CompiledTask>,
 ) {
     crate::ast::reserve_file_ids();
+    // The loads of the builders run at the same time.
+    crate::frontend::compiler::files_parser::share_parse_workers(setup.builders);
     let sys: Rc<dyn System> = Rc::new(OsSystem::for_thread(
         setup.cwd.clone(),
         setup.default_library_path.clone(),

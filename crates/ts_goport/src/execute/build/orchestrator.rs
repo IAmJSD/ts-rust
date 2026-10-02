@@ -1357,6 +1357,7 @@ impl Orchestrator {
                 .checked_sub(self.opts.sys.since_start())
                 .unwrap_or_else(std::time::Instant::now),
             ends_process: self.ends_process.get(),
+            builders: num_routines,
         };
         // PERF (tscbpar1 round f, mini-743d, stable bins against R155, 30
         // rounds): round d started one fewer builder than routines, and a
@@ -1366,8 +1367,7 @@ impl Orchestrator {
         // mixlib5s -14.2%; with 4 builders -27.4%, -26.5%, -23.5% and
         // -20.3%, for about the same peak RSS (this thread's load blocks the
         // finishes).
-        let max = num_routines;
-        Some(Builders::new(setup, max, ready.clone()))
+        Some(Builders::new(setup, num_routines, ready.clone()))
     }
 
     /// PORT: not in Go (perf). Keeps `released` to free later (see

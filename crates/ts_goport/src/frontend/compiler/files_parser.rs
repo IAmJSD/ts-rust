@@ -1281,26 +1281,60 @@ pub(crate) fn new_unknown_reference_processing_diagnostic(
 
 /// Number of parse workers next to the loading thread at the start of a
 /// load: the parse threads of a program that is not large
-/// (`ThreadBudget::parse_threads`), less the loading thread.
-/// `GOPORT_PARSE_THREADS` sets it (0 turns prefetch off).
+/// (`ThreadBudget::parse_threads`), less the loading thread, or its share
+/// of them (`share_parse_workers`). `GOPORT_PARSE_THREADS` sets it (0 turns
+/// prefetch off).
 fn prefetch_worker_count() -> usize {
     if let Some(count) = parse_threads_from_env() {
         return count;
     }
-    ThreadBudget::current().parse_threads(false) - 1
+    let count = ThreadBudget::current().parse_threads(false) - 1;
+    match PARSE_WORKER_SHARE.get() {
+        Some(loads) => count.div_ceil(loads).max(1),
+        None => count,
+    }
+}
+
+/// PORT: not in Go (perf). Gives the program loads on this thread their
+/// share of the parse workers: the loads of `loads` threads can run at the
+/// same time (a `tsc -b` builder thread, execute/build/builders.rs). A
+/// large load (`extra_worker_count`) gets twice the share. Go's parse tasks
+/// of programs that load at the same time share one set of threads
+/// (GOMAXPROCS); here each load starts its own workers.
+// PERF (tscbpar1 round f, mini-743d, stable bins against R155, 4 builders,
+// 20 rounds): with 7 parse workers per builder load, peak RSS was +9% to
+// +13% in the small shapes (ind5x5, ind3x62, ind4x21, mixlib5s,
+// samelib5s) and sys CPU +55% to +93%. With 2 workers per load they were
+// +1% to +7%, and the wall gains grew (ind3x62 -12% to -23%, mixlib5s -18%
+// to -30%), but loads of large programs slowed (hono-b-2light -21% to -9%,
+// big1-small8 -9% to +13%). With 2 workers and 4 for a large load, every
+// cell of 25 gained 7.7% to 47.7% and kept peak RSS within +7.0%; with 4
+// for every load, mixlib5s was +9.6%.
+pub(crate) fn share_parse_workers(loads: usize) {
+    PARSE_WORKER_SHARE.set(Some(loads.max(1)));
 }
 
 /// The parse workers that `FilesParser::parse` adds for a large program
-/// (`note_program_load`), up to `ThreadBudget::parse_large` parse threads.
-/// None when `GOPORT_PARSE_THREADS` sets the count.
+/// (`note_program_load`), up to `ThreadBudget::parse_large` parse threads,
+/// or up to twice the share of the thread (`share_parse_workers`). None
+/// when `GOPORT_PARSE_THREADS` sets the count.
 fn extra_worker_count(large: bool) -> usize {
     if parse_threads_from_env().is_some() {
         return 0;
     }
     let budget = ThreadBudget::current();
-    budget
-        .parse_threads(large)
-        .saturating_sub(budget.parse_threads(false))
+    match PARSE_WORKER_SHARE.get() {
+        // A large load beside other loads gets twice the share of the
+        // others.
+        Some(_) if large => {
+            let share = prefetch_worker_count();
+            share.min((budget.parse_threads(true) - 1).saturating_sub(share))
+        }
+        Some(_) => 0,
+        None => budget
+            .parse_threads(large)
+            .saturating_sub(budget.parse_threads(false)),
+    }
 }
 
 /// The parse thread count that `GOPORT_PARSE_THREADS` sets, if any.
@@ -1674,6 +1708,10 @@ thread_local! {
     /// loader exists. The next `FilesParser::parse` on this thread takes
     /// them.
     static EARLY_POOL: RefCell<Option<PrefetchPool>> = const { RefCell::new(None) };
+
+    /// The loads that can run at the same time as one on this thread
+    /// (`share_parse_workers`).
+    static PARSE_WORKER_SHARE: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
 }
 
 impl PrefetchShared {
