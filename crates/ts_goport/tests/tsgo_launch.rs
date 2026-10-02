@@ -182,15 +182,16 @@ fn a_tsgo_with_the_proc_of_another_pid_namespace() {
 
 /// tsgo as the pid 1 of a PID namespace (`unshare -pf --mount-proc`, as
 /// `docker run` without `--init`): the kernel drops each signal with the
-/// default action that such a process gets or sends itself. As in Go N,
-/// SIGHUP ends the run with exit 129 (Go `dieFromSignal`: 128 + N): sent
-/// to tsgo with and without a worker, and sent to the worker, which the
-/// signal ends. A launcher that raised the worker's signal again in a pid 1
-/// went on to `abort`, which ends a pid 1 by SIGSEGV. And a launcher whose
-/// caller ignores SIGCHLD takes the exit code from the worker's exit in a
-/// PID namespace with the /proc of another one (`own_proc`), as Go gives
-/// it. Where `unshare -U`, `env --default-signal` or `env --ignore-signal`
-/// cannot run, the test says so and passes.
+/// default action that such a process gets or sends itself. SIGHUP ends
+/// the run with exit 129, as Go at pin N does (Go `dieFromSignal`: 128 plus
+/// the signal number): sent to tsgo with and without a worker, and sent to
+/// the worker, which the signal ends. A launcher that raised the worker's
+/// signal again in a pid 1 went on to `abort`, which ends a pid 1 by
+/// SIGSEGV. And a launcher whose caller ignores SIGCHLD takes the exit code
+/// from the worker's exit in a PID namespace with the /proc of another one
+/// (`own_proc`), as Go gives it. Where `unshare -U`, `env
+/// --default-signal` or `env --ignore-signal` cannot run, the test says so
+/// and passes.
 #[test]
 fn a_tsgo_that_is_pid_1_of_a_pid_namespace() {
     if !unshare_runs(&DEFAULT_HUP) {
@@ -512,6 +513,178 @@ fn a_launcher_does_not_hold_a_signal_behind_another() {
             ended < Duration::from_secs(1),
             "{case}: ended {ended:?} after the signal"
         );
+    }
+}
+
+/// A SIGHUP that comes to a pid 1 launcher before it starts its worker
+/// waits for the launcher's handler (bin/tsgo.rs `HELD`) and ends the run
+/// with exit 129, as Go does. Without the wait, the kernel dropped it (the
+/// default action in a pid 1) and the run went on. The test stops the
+/// launcher (SIGSTOP) once it blocks `HELD` and before it has a child,
+/// sends SIGHUP and lets it go on. A launcher that the test stopped too
+/// late (it has a child) ends and the run starts again, up to `ATTEMPTS`
+/// times; where no attempt is in time, or where `unshare -U` or `env
+/// --default-signal` cannot run, the test says so and passes.
+#[test]
+fn a_pid_1_launcher_keeps_a_sighup_from_before_its_worker() {
+    const ATTEMPTS: usize = 40;
+    if !unshare_runs(&DEFAULT_HUP) {
+        eprintln!(
+            "skipped: `unshare -Upf --map-root-user --mount-proc env --default-signal=HUP` cannot run here"
+        );
+        return;
+    }
+    let tsgo = env!("CARGO_BIN_EXE_tsgo");
+    // SIGHUP, SIGINT, SIGQUIT, SIGTERM, SIGSTKFLT and SIGSYS.
+    let held = [1, 2, 3, 15, 16, 31]
+        .into_iter()
+        .map(|signal| 1u64 << (signal - 1))
+        .sum::<u64>();
+    for _ in 0..ATTEMPTS {
+        let (_read, write, _) = small_pipe();
+        let mut child = Command::new("unshare")
+            .args(UNSHARE)
+            .args(DEFAULT_HUP)
+            .args([tsgo, "--all"])
+            .env("GOPORT_LAUNCH", "1")
+            .stdout(Stdio::from(write))
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let start = Instant::now();
+        // unshare's child, tsgo once it blocks `HELD`: pid 1 there.
+        let launcher = loop {
+            let blocking = child_of(child.id()).filter(|pid| {
+                std::fs::read_link(format!("/proc/{pid}/exe"))
+                    .is_ok_and(|exe| exe == Path::new(tsgo))
+                    && std::fs::read_to_string(format!("/proc/{pid}/status"))
+                        .is_ok_and(|status| mask(&status, "SigBlk:") & held == held)
+            });
+            if let Some(pid) = blocking {
+                break pid;
+            }
+            assert!(child.try_wait().unwrap().is_none(), "ended before tsgo");
+            assert!(start.elapsed() < LIMIT, "no tsgo in {LIMIT:?}");
+        };
+        let launcher_pid = Pid::from_raw(launcher.cast_signed()).unwrap();
+        if child_of(launcher).is_none() {
+            rustix::process::kill_process(launcher_pid, Signal::STOP).unwrap();
+            loop {
+                let status = std::fs::read_to_string(format!("/proc/{launcher}/status")).unwrap();
+                if field(&status, "State:").starts_with('T') {
+                    break;
+                }
+                assert!(start.elapsed() < LIMIT, "the launcher did not stop");
+            }
+            if child_of(launcher).is_none() {
+                rustix::process::kill_process(launcher_pid, Signal::HUP).unwrap();
+                rustix::process::kill_process(launcher_pid, Signal::CONT).unwrap();
+                let (status, stderr) = end_of(child, "SIGHUP before the worker");
+                // unshare exits with its child's exit code.
+                assert_eq!(status.code(), Some(129), "{status} {stderr}");
+                return;
+            }
+        }
+        // Too late. unshare kills its child (`--kill-child`).
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+    eprintln!("skipped: no launcher was stopped before it started its worker");
+}
+
+/// SIGHUP ends tsgo by SIGHUP, as Go's `dieFromSignal` does: sent to tsgo
+/// without a worker, to a launcher and to its worker. Where `env
+/// --default-signal` cannot run, the test says so and passes.
+#[test]
+fn a_sighup_ends_tsgo_by_sighup() {
+    let probe = Command::new("env").args(DEFAULT_HUP).arg("true").status();
+    if !probe.is_ok_and(|status| status.success()) {
+        eprintln!("skipped: `env --default-signal=HUP` cannot run here");
+        return;
+    }
+    // `env` execs tsgo; the worker is its child.
+    for (launch, depth, case) in [
+        ("0", 0, "SIGHUP to tsgo without a worker"),
+        ("1", 0, "SIGHUP to the launcher"),
+        ("1", 1, "SIGHUP to the worker"),
+    ] {
+        let mut command = Command::new(DEFAULT_HUP[0]);
+        command
+            .args(&DEFAULT_HUP[1..])
+            .arg(env!("CARGO_BIN_EXE_tsgo"));
+        let (status, stderr, ended) = signal_run(command, launch, &[(depth, Signal::HUP)], case);
+        assert_eq!(status.signal(), Some(1), "{case}: {status} {stderr}");
+        assert_eq!(stderr, "", "{case}: stderr");
+        assert!(
+            ended < Duration::from_secs(1),
+            "{case}: ended {ended:?} after the signal"
+        );
+    }
+}
+
+/// tsgo catches SIGURG and SIGWINCH and drops them, as Go does (bin/tsgo.rs
+/// `GO_DROPPED`), also when they were ignored at start: Go sets its handler
+/// for them anyway, so a process that tsgo starts gets their default
+/// actions. /proc shows them caught and not ignored in tsgo, in a launcher
+/// and in its worker, and when they come the run goes on; SIGQUIT then ends
+/// it with Go's text and exit 2. Where `env --ignore-signal` cannot run,
+/// the test says so and passes.
+#[test]
+fn tsgo_catches_sigurg_and_sigwinch() {
+    const IGNORE: [&str; 2] = ["env", "--ignore-signal=URG,WINCH"];
+    let probe = Command::new(IGNORE[0])
+        .args(&IGNORE[1..])
+        .arg("true")
+        .status();
+    if !probe.is_ok_and(|status| status.success()) {
+        eprintln!("skipped: `env --ignore-signal=URG,WINCH` cannot run here");
+        return;
+    }
+    let dropped = bit(Signal::URG) | bit(Signal::WINCH);
+    let runs: [(&str, &[(usize, Signal)]); 2] = [
+        (
+            "0",
+            &[(0, Signal::URG), (0, Signal::WINCH), (0, Signal::QUIT)],
+        ),
+        (
+            "1",
+            &[
+                (0, Signal::URG),
+                (0, Signal::WINCH),
+                (1, Signal::URG),
+                (1, Signal::WINCH),
+                (0, Signal::QUIT),
+            ],
+        ),
+    ];
+    for (launch, signals) in runs {
+        let case = format!("SIGURG and SIGWINCH ignored at start, GOPORT_LAUNCH={launch}");
+        // `env` execs tsgo; the worker is its child.
+        let mut command = Command::new(IGNORE[0]);
+        command.args(&IGNORE[1..]).arg(env!("CARGO_BIN_EXE_tsgo"));
+        let check = |pid: u32| {
+            let mut pids = vec![pid];
+            if launch == "1" {
+                pids.extend(child_of(pid));
+                assert_eq!(pids.len(), 2, "{case}: no worker");
+            }
+            for pid in pids {
+                let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
+                assert_eq!(
+                    mask(&status, "SigCgt:") & dropped,
+                    dropped,
+                    "{case}: {pid} caught"
+                );
+                assert_eq!(
+                    mask(&status, "SigIgn:") & dropped,
+                    0,
+                    "{case}: {pid} ignored"
+                );
+            }
+        };
+        let (status, stderr, _) = signal_run_with(command, launch, signals, &case, check);
+        assert_eq!(status.code(), Some(2), "{case}: {status} {stderr}");
+        assert!(stderr.starts_with("SIGQUIT: quit"), "{case}: {stderr}");
     }
 }
 
