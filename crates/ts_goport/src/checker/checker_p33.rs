@@ -274,48 +274,57 @@ impl Checker {
     // Returns the effective arguments for an expression that works like a function invocation.
     // Go: checker/checker.go:29794 getEffectiveCallArguments
     pub fn get_effective_call_arguments(&mut self, node: Node) -> EffectiveArgs {
-        if is_jsx_opening_fragment(node) {
-            // This attributes Type does not include a children property yet, the same way a fragment created with <React.Fragment> does not at this stage
-            let empty_fresh_jsx_object_type = self.empty_fresh_jsx_object_type;
-            return EffectiveArgs::Owned(vec![self.create_synthetic_expression(
-                node,
-                empty_fresh_jsx_object_type,
-                false,
-                Node::NIL,
-            )]);
-        } else if is_tagged_template_expression(node) {
-            let template = node.template();
-            let get_global_template_strings_array_type =
-                self.get_global_template_strings_array_type.clone();
-            let template_strings_array_type = get_global_template_strings_array_type(self);
-            let first_arg = self.create_synthetic_expression(
-                template,
-                template_strings_array_type,
-                false,
-                Node::NIL,
-            );
-            if !is_template_expression(template) {
-                return EffectiveArgs::Owned(vec![first_arg]);
+        // PERF: chkB1. One kind read for the five kind tests of Go (they
+        // name distinct kinds, so a match gives the same branch).
+        match node.kind() {
+            SyntaxKind::JsxOpeningFragment => {
+                // This attributes Type does not include a children property yet, the same way a fragment created with <React.Fragment> does not at this stage
+                let empty_fresh_jsx_object_type = self.empty_fresh_jsx_object_type;
+                return EffectiveArgs::Owned(vec![self.create_synthetic_expression(
+                    node,
+                    empty_fresh_jsx_object_type,
+                    false,
+                    Node::NIL,
+                )]);
             }
-            let spans = template.template_spans().nodes();
-            let mut args = Vec::with_capacity(spans.len() + 1);
-            args.push(first_arg);
-            for span in spans.iter() {
-                args.push(span.expression());
+            SyntaxKind::TaggedTemplateExpression => {
+                let template = node.template();
+                let get_global_template_strings_array_type =
+                    self.get_global_template_strings_array_type.clone();
+                let template_strings_array_type = get_global_template_strings_array_type(self);
+                let first_arg = self.create_synthetic_expression(
+                    template,
+                    template_strings_array_type,
+                    false,
+                    Node::NIL,
+                );
+                if !is_template_expression(template) {
+                    return EffectiveArgs::Owned(vec![first_arg]);
+                }
+                let spans = template.template_spans().nodes();
+                let mut args = Vec::with_capacity(spans.len() + 1);
+                args.push(first_arg);
+                for span in spans.iter() {
+                    args.push(span.expression());
+                }
+                return EffectiveArgs::Owned(args);
             }
-            return EffectiveArgs::Owned(args);
-        } else if is_decorator(node) {
-            return EffectiveArgs::Owned(self.get_effective_decorator_arguments(node));
-        } else if is_binary_expression(node) {
-            // Handles instanceof operator
-            return EffectiveArgs::Owned(vec![node.left()]);
-        } else if is_jsx_opening_like_element(node) {
-            if node.attributes().properties().len() != 0
-                || (is_jsx_opening_element(node) && node.parent().children().nodes().len() != 0)
-            {
-                return EffectiveArgs::Owned(vec![node.attributes()]);
+            SyntaxKind::Decorator => {
+                return EffectiveArgs::Owned(self.get_effective_decorator_arguments(node));
             }
-            return EffectiveArgs::Owned(Vec::new());
+            SyntaxKind::BinaryExpression => {
+                // Handles instanceof operator
+                return EffectiveArgs::Owned(vec![node.left()]);
+            }
+            SyntaxKind::JsxOpeningElement | SyntaxKind::JsxSelfClosingElement => {
+                if node.attributes().properties().len() != 0
+                    || (is_jsx_opening_element(node) && node.parent().children().nodes().len() != 0)
+                {
+                    return EffectiveArgs::Owned(vec![node.attributes()]);
+                }
+                return EffectiveArgs::Owned(Vec::new());
+            }
+            _ => {}
         }
         // PERF: callcopy1. Without a spread the result is the argument list
         // itself (`NodeSlice` is program data), like Go, which returns
@@ -373,8 +382,13 @@ impl Checker {
 }
 
 // Go: checker/checker.go:29864 isSpreadArgument
+// PERF: chkB1. One kind read per argument.
 pub fn is_spread_argument(arg: Node) -> bool {
-    is_spread_element(arg) || is_synthetic_expression(arg) && arg.is_spread()
+    match arg.kind() {
+        SyntaxKind::SpreadElement => true,
+        SyntaxKind::SyntheticExpression => arg.is_spread(),
+        _ => false,
+    }
 }
 
 impl Checker {

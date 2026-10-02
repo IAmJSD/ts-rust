@@ -140,7 +140,10 @@ impl Checker {
         // is empty for a nil list.
         let properties = node.properties();
         for prop in properties {
-            if prop.kind() == SyntaxKind::SpreadAssignment {
+            // PERF: chkB1. One kind read for the property and one for its
+            // name.
+            let prop_kind = prop.kind();
+            if prop_kind == SyntaxKind::SpreadAssignment {
                 let spread_expression = prop.expression();
                 if in_destructuring {
                     // a rest property cannot be destructured any further
@@ -158,12 +161,13 @@ impl Checker {
                 continue;
             }
             let name = prop.name();
-            if name.kind() == SyntaxKind::ComputedPropertyName {
+            let name_kind = name.kind();
+            if name_kind == SyntaxKind::ComputedPropertyName {
                 // If the name is not a ComputedPropertyName, the grammar checking will skip it
                 self.check_grammar_computed_property_name(name);
             }
 
-            if prop.kind() == SyntaxKind::ShorthandPropertyAssignment && !in_destructuring {
+            if prop_kind == SyntaxKind::ShorthandPropertyAssignment && !in_destructuring {
                 let object_assignment_initializer = prop.object_assignment_initializer();
                 if object_assignment_initializer.is_some() {
                     // having objectAssignmentInitializer is only valid in an ObjectAssignmentPattern.
@@ -188,7 +192,7 @@ impl Checker {
                 }
             }
 
-            if name.kind() == SyntaxKind::PrivateIdentifier {
+            if name_kind == SyntaxKind::PrivateIdentifier {
                 self.grammar_error_on_node(
                     name,
                     diag::Private_identifiers_are_not_allowed_outside_class_bodies,
@@ -203,7 +207,7 @@ impl Checker {
                     for m in modifiers.iter() {
                         if is_modifier(m)
                             && (m.kind() != SyntaxKind::AsyncKeyword
-                                || prop.kind() != SyntaxKind::MethodDeclaration)
+                                || prop_kind != SyntaxKind::MethodDeclaration)
                         {
                             self.grammar_error_on_node(
                                 m,
@@ -234,7 +238,7 @@ impl Checker {
             //    d.IsAccessorDescriptor(previous) is true and IsAccessorDescriptor(propId.descriptor) is true
             // and either both previous and propId.descriptor have[[Get]] fields or both previous and propId.descriptor have[[Set]] fields
             let current_kind: DeclarationMeaning;
-            match prop.kind() {
+            match prop_kind {
                 SyntaxKind::ShorthandPropertyAssignment | SyntaxKind::PropertyAssignment => {
                     // PORT: Go reads `NamedMemberBase.PostfixToken` from the concrete
                     // node; `postfix_token()` (Go `Node.PostfixToken()`) reads the same
@@ -252,11 +256,11 @@ impl Checker {
                         diag::An_object_member_cannot_be_declared_optional,
                     );
 
-                    if name.kind() == SyntaxKind::NumericLiteral {
+                    if name_kind == SyntaxKind::NumericLiteral {
                         self.check_grammar_numeric_literal(name);
                     }
 
-                    if name.kind() == SyntaxKind::BigIntLiteral {
+                    if name_kind == SyntaxKind::BigIntLiteral {
                         self.add_error_or_suggestion(
                             true,
                             create_diagnostic_for_node(

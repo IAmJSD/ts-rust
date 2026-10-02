@@ -120,16 +120,39 @@ impl Checker {
     }
 
     // Go: checker/checker.go:30683 isContextSensitiveFunctionLikeDeclaration
+    // PERF: chkB1. Go `hasContextSensitiveParameters` and
+    // `hasContextSensitiveReturnExpression` both start with a test of the
+    // type parameters, and the first reads the parameters twice. The port
+    // reads each list from the node data at each call, so this reads the
+    // type parameters and the parameters once and runs the two tests on
+    // them (`has_context_sensitive_parameters_in`,
+    // `has_context_sensitive_return_expression_in`).
     pub fn is_context_sensitive_function_like_declaration(&mut self, node: Node) -> bool {
-        has_context_sensitive_parameters(node)
-            || self.has_context_sensitive_return_expression(node)
+        if !node.type_parameters().is_empty() {
+            // Both tests are false for a node with type parameters.
+            debug_assert!(!has_context_sensitive_parameters(node));
+            return self.has_context_sensitive_yield_expression(node);
+        }
+        let parameters_sensitive = has_context_sensitive_parameters_in(node, node.parameters());
+        debug_assert_eq!(parameters_sensitive, has_context_sensitive_parameters(node));
+        parameters_sensitive
+            || self.has_context_sensitive_return_expression_in(node)
             || self.has_context_sensitive_yield_expression(node)
     }
 
     // Go: checker/checker.go:30687 hasContextSensitiveReturnExpression
     pub fn has_context_sensitive_return_expression(&mut self, node: Node) -> bool {
-        if !node.type_parameters().is_empty() || node.type_().is_some() {
+        if !node.type_parameters().is_empty() {
             // PORT: Go `node.TypeParameters() != nil`; NodeSlice is empty when nil.
+            return false;
+        }
+        self.has_context_sensitive_return_expression_in(node)
+    }
+
+    /// `has_context_sensitive_return_expression` of a node that has no type
+    /// parameters.
+    fn has_context_sensitive_return_expression_in(&mut self, node: Node) -> bool {
+        if node.type_().is_some() {
             return false;
         }
         let body = node.body();
@@ -1289,4 +1312,25 @@ impl Checker {
             _ => SymbolId::NIL,
         }
     }
+}
+
+/// Go `ast.HasContextSensitiveParameters(node)` for a node with no type
+/// parameters, on `parameters`, the parameters of `node`.
+// PERF: chkB1. One read of the parameter list (the ast version reads the
+// type parameters and then the parameters twice).
+fn has_context_sensitive_parameters_in(node: Node, parameters: NodeSlice) -> bool {
+    // Functions with any parameters that lack type annotations are context sensitive.
+    if parameters.iter().any(|p| p.type_().is_nil()) {
+        return true;
+    }
+    if !is_arrow_function(node) {
+        // If the first parameter is not an explicit 'this' parameter, then the function has
+        // an implicit 'this' parameter which is subject to contextual typing.
+        // Go: core.FirstOrNil(node.Parameters())
+        let parameter = parameters.first().unwrap_or(Node::NIL);
+        if parameter.is_nil() || !is_this_parameter(parameter) {
+            return node.flags().intersects(NodeFlags::CONTAINS_THIS);
+        }
+    }
+    false
 }
