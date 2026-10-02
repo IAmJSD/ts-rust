@@ -33,15 +33,14 @@
 //! Outside tests each program is released when its task is built, as Go
 //! drops it there; in tests when its task reports. Its checker threads
 //! free it in the background. In a build where the output does not depend
-//! on it, a first task that compiles as a light rebuild compiles on a
-//! builder thread instead (`first_task_uses_builder`), which also checks,
-//! emits, writes and releases its program (builders.rs). When every task
-//! that compiles is a light rebuild (`later_tasks_use_builders`), the
-//! later ones do too, and load at the same time with the parses of the
-//! first program; else they compile on this thread with those parses. The
-//! schedule above does not change: a task that compiles while every
-//! builder is busy loads on this thread, and a finish waits for the loads
-//! that run on builders (see SLOTS in `build_all_tasks`). Where Go does task
+//! on it, and where the light rebuilds that can compile at the same time
+//! have enough files (`later_tasks_use_builders`), the tasks compile on
+//! builder threads instead (`first_task_uses_builder`), which also check,
+//! emit, write and release their programs (builders.rs), and load at the
+//! same time with one parse cache; else they compile on this thread. The
+//! schedule above does not change: there is a builder for each routine,
+//! and a finish waits for the loads that run on builders (see SLOTS in
+//! `build_all_tasks`). Where Go does task
 //! work on its goroutines that needs no task state, threads do it ahead of
 //! this thread: the file name match of each config (config_prefetch.rs),
 //! and the build info read, its check parts and the source mtimes of each
@@ -878,10 +877,14 @@ impl Orchestrator {
         // compiles (`later_tasks_use_builders`). With `Some(false)` they
         // compile on this thread.
         let mut later_on_builders = None;
-        // PORT: not in Go (perf). True while the first task that compiles
-        // waits for the builders decision (`State::Deferred`): the forecast
-        // was not known when it compiled.
+        // PORT: not in Go (perf). The forecast was not known when the first
+        // task that compiled was a light rebuild: the next task that
+        // compiles decides (`undecided`). Until then that first task waits
+        // (`State::Deferred`, `deferred`), or it loads on this thread when
+        // no other task can start (`load_here`).
+        let mut undecided = false;
         let mut deferred = false;
+        let mut load_here = false;
         if !clean {
             *self.build_info_prefetch.borrow_mut() =
                 self.start_build_info_prefetch(&paths, builders_setting == BuildersSetting::Light);
@@ -985,10 +988,9 @@ impl Orchestrator {
             let mut progressed = false;
             for index in next_report..next_take {
                 // A deferred task loads once the builders are decided.
-                let decided = builders.is_some() || later_on_builders.is_some();
                 let resumed = match states[index] {
                     State::Waiting => false,
-                    State::Deferred if decided => true,
+                    State::Deferred if later_on_builders.is_some() || load_here => true,
                     _ => continue,
                 };
                 deferred &= !resumed;
@@ -1035,17 +1037,18 @@ impl Orchestrator {
                                 Some(false) => {}
                                 None => {
                                     states[index] = State::Deferred;
+                                    undecided = true;
                                     deferred = true;
                                     continue;
                                 }
                             }
                         }
                         self.end_forecast();
-                    } else if later_on_builders.is_none() && (deferred || builders.is_some()) {
+                    } else if undecided && later_on_builders.is_none() {
                         let on_builders = self.later_tasks_use_builders(builders_setting);
                         later_on_builders = Some(on_builders);
                         self.end_forecast();
-                        if on_builders && builders.is_none() {
+                        if on_builders {
                             builders = self.start_builders(num_routines, &ready);
                         }
                     }
@@ -1096,20 +1099,20 @@ impl Orchestrator {
             }
             // PORT: not in Go (perf). The deferred task loads before any
             // finish (SLOTS, P4). No second task that compiles decided the
-            // builders, so the forecast decides now when it is known. Else
-            // the task goes to a builder, and the tasks after it decide
-            // when the next one compiles.
+            // builders, so the forecast decides now when it is known. Else no
+            // other task can start, and none compiles, so this thread loads
+            // it at once, and the next task that compiles decides.
             if deferred {
-                if !(builders.is_some() || later_on_builders.is_some()) {
+                if later_on_builders.is_none() {
                     later_on_builders = self.known_later_tasks_use_builders(builders_setting);
-                    if later_on_builders != Some(false) {
-                        builders = self.start_builders(num_routines, &ready);
-                    }
-                    if builders.is_none() {
-                        later_on_builders = Some(false);
-                    }
-                    if later_on_builders.is_some() {
-                        self.end_forecast();
+                    match later_on_builders {
+                        Some(on_builders) => {
+                            self.end_forecast();
+                            if on_builders {
+                                builders = self.start_builders(num_routines, &ready);
+                            }
+                        }
+                        None => load_here = true,
                     }
                 }
                 continue;
@@ -1161,8 +1164,9 @@ impl Orchestrator {
             in_flight -= 1;
         }
         // The builders end; they free their programs unless the process
-        // ends after this build.
+        // ends after this build. A forecast that no task decided ends.
         drop(builders);
+        self.end_forecast();
         self.host.end_shared_parses();
         // The kept released programs free now, unless the process ends
         // after this build (`start_exported`).
@@ -1248,9 +1252,12 @@ impl Orchestrator {
     /// PORT: not in Go (perf). True when the first task that compiles,
     /// `first`, compiles on a builder thread (builders.rs). With
     /// `BuildersSetting::Light`: when it only reports the errors of its
-    /// build info or makes its pending emit. Unless the forecast knows the
-    /// answer for the later tasks already, their decision waits for the
-    /// second task that compiles (`later_tasks_use_builders`).
+    /// build info or makes its pending emit, and the forecast says that the
+    /// later tasks use builders too (`known_later_tasks_use_builders`).
+    /// When the forecast is not known yet, the task waits while this thread
+    /// checks the next tasks, and the second task that compiles decides
+    /// (`later_tasks_use_builders`); when no other task can start first,
+    /// the task loads on this thread (`build_all_tasks`).
     fn first_task_uses_builder(&self, setting: BuildersSetting, first: &BuildTask) -> bool {
         match setting {
             BuildersSetting::Off => false,
