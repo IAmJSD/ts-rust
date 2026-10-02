@@ -1189,10 +1189,11 @@ impl Orchestrator {
     /// first one compile on builder threads too, decided when the second
     /// one has its status. With `BuildersSetting::Light`: when the build
     /// info threads forecast no heavy rebuild (no task with changed inputs)
-    /// and light ones in two tasks that can compile at the same time
+    /// and light ones in tasks that can compile at the same time, with
+    /// enough files to load beside the largest one
     /// (`RebuildForecast::light`). Else they compile on this thread, after
-    /// the first program loads, with the parse cache of the build
-    /// (host.rs `SharedSourceFiles`), as in a serial build.
+    /// the first program loads, with the parse cache of the build (host.rs
+    /// `SharedSourceFiles`), as in a serial build.
     // PERF (tscbpar1, stable bins): parallel loads cut hono-b noop (3 light
     // rebuilds) from about 122 to 101 ms on the minis. Where a task checks,
     // the checkers keep the cores busy, and before the builders shared the
@@ -1765,8 +1766,9 @@ impl TaskGraph {
 /// forecast for the tasks of a build (`Rebuild`), for
 /// `Orchestrator::later_tasks_use_builders`. Builders gain only where the
 /// loads of two or more tasks run at the same time and little is checked:
-/// two light rebuilds whose tasks can compile at the same time (`graph`),
-/// and no heavy one. A changed input shows in the mtimes alone
+/// light rebuilds whose tasks can compile at the same time (`graph`) with
+/// enough files to load beside the largest one (`MIN_PARALLEL_FILES`), and
+/// no heavy rebuild. A changed input shows in the mtimes alone
 /// (`unchanged_inputs`), so it is known before a large build info is
 /// parsed. Once the answer is "no", the forecast ends itself (`ended`), so
 /// the threads do no more forecast work than a serial build.
@@ -1789,20 +1791,55 @@ struct ForecastState {
     /// By read: whether its build info makes a light rebuild, once parsed.
     classes: Vec<Option<bool>>,
     /// The reads with a light rebuild.
-    light: Vec<usize>,
-    /// Two reads of `light` can compile at the same time.
-    pair: bool,
+    light: Vec<LightRebuild>,
+    /// The files of the light rebuilds that can compile at the same time
+    /// as another one, in all and of the largest one.
+    paired_files: usize,
+    largest_paired: usize,
     /// A rebuild is heavy.
     heavy: bool,
 }
 
+/// A read with a light rebuild in a `ForecastState`.
+struct LightRebuild {
+    read: usize,
+    /// The files of its program (`RebuildForecast::add_class`).
+    files: usize,
+    /// It can compile at the same time as another light rebuild.
+    paired: bool,
+}
+
+/// PORT: not in Go (perf). The program files of the light rebuilds that
+/// can compile beside the largest one (`ForecastState::parallel_files`)
+/// below which builders gain too little for their cost. Each builder costs
+/// a thread, a system and a build host, 3 to 7 MiB of peak RSS, and 40% to
+/// 80% more sys CPU in small builds.
+// PERF (tscbpar1 round e; files from the build infos, gains against R153
+// on the minis from tscbpar1 round d): a small package with the default
+// libs has 68 files, most of them lib files. 2 or 3 of them (indep2t,
+// indep2s, indep3t, dtsrole: 68 to 142 files) gained 3% to 7% of the wall
+// time with builders, for 5% to 10% more RSS and 40% to 80% more sys CPU.
+// From 300 files on, builders gained 12% to 35% (hono-b-2light 302,
+// jsonmod 338, wide-2err 363, mixlib5s 376, samelib5s 382, errfirst 436,
+// big1-small8 624, tiny16 1,020, fan8 2,401). tiny2-of-12 (68 files) gained
+// 8% to 12%; it now builds on this thread.
+const MIN_PARALLEL_FILES: usize = 250;
+
 impl ForecastState {
+    /// The program files of the light rebuilds that can compile at the
+    /// same time as another one, without the largest one: what the
+    /// builders can load beside it.
+    fn parallel_files(&self) -> usize {
+        self.paired_files - self.largest_paired
+    }
+
     /// `RebuildForecast::light` from what is known now, or None when it
     /// waits.
     fn light_now(&self) -> Option<bool> {
-        if self.heavy || (!self.pair && self.unclassed == 0) {
+        let enough = self.parallel_files() >= MIN_PARALLEL_FILES;
+        if self.heavy || (!enough && self.unclassed == 0) {
             Some(false)
-        } else if self.pair && self.unstated == 0 {
+        } else if enough && self.unstated == 0 {
             Some(true)
         } else {
             None
@@ -1820,7 +1857,8 @@ impl RebuildForecast {
                 unparsed: reads,
                 classes: vec![None; reads],
                 light: Vec::new(),
-                pair: false,
+                paired_files: 0,
+                largest_paired: 0,
                 heavy: false,
             }),
             changed: Condvar::new(),
@@ -1859,18 +1897,39 @@ impl RebuildForecast {
 
     /// Whether the build info of read `read` makes a light rebuild, as soon
     /// as it is parsed: before the thread reads the source mtimes of a
-    /// check that reads them (`forecast_rebuild` tells the rest).
-    fn add_class(&self, read: usize, light: bool) {
+    /// check that reads them (`forecast_rebuild` tells the rest). `files`:
+    /// the files of its program, as the build info lists them.
+    fn add_class(&self, read: usize, light: bool, files: usize) {
         self.update(|state| {
             state.unclassed -= 1;
             state.classes[read] = Some(light);
-            if light {
-                state.pair |= state
-                    .light
-                    .iter()
-                    .any(|&other| self.graph.independent(read, other));
-                state.light.push(read);
+            if !light {
+                return;
             }
+            state.light.push(LightRebuild {
+                read,
+                files,
+                paired: false,
+            });
+            let (new, others) = state.light.split_last_mut().expect("just pushed");
+            let mut paired_files = 0;
+            let mut largest = 0;
+            for other in others {
+                if self.graph.independent(read, other.read) {
+                    if !new.paired {
+                        new.paired = true;
+                        paired_files += new.files;
+                        largest = new.files;
+                    }
+                    if !other.paired {
+                        other.paired = true;
+                        paired_files += other.files;
+                        largest = largest.max(other.files);
+                    }
+                }
+            }
+            state.paired_files += paired_files;
+            state.largest_paired = state.largest_paired.max(largest);
         });
     }
 
@@ -1892,11 +1951,11 @@ impl RebuildForecast {
         });
     }
 
-    /// True when no rebuild is heavy and two light ones can compile at the
-    /// same time. Waits until a rebuild is heavy, until every build info is
-    /// parsed with no such two light rebuilds, or until there are two and
-    /// the mtimes of every read are read. So a build with no such two
-    /// light rebuilds waits for no mtime.
+    /// True when no rebuild is heavy and light ones that can compile at the
+    /// same time have enough files (`ForecastState::parallel_files`). Waits
+    /// until a rebuild is heavy, until every build info is parsed without
+    /// such light rebuilds, or until there are and the mtimes of every read
+    /// are read. So a build without such light rebuilds waits for no mtime.
     /// A heavy rebuild that only a later parse shows (another version or
     /// options with no newer config file) is missed; that task compiles on
     /// a builder thread with the same output.
@@ -2126,7 +2185,17 @@ fn parse_build_info_job(
             .as_ref()
             .map(|build_info| read.check.early_return(build_info));
         if let Some(forecast) = forecast {
-            forecast.add_class(index, early == Some(EarlyReturn::ErrorsOrPendingEmit));
+            // A build info of a program that is not incremental lists no
+            // files: then its root files count.
+            let files = build_info
+                .as_ref()
+                .and_then(|build_info| build_info.file_names.as_ref())
+                .map_or(read.input_files.len(), Vec::len);
+            forecast.add_class(
+                index,
+                early == Some(EarlyReturn::ErrorsOrPendingEmit),
+                files,
+            );
         }
         // A check that returns before the input mtimes reads neither the
         // check parts nor the mtimes.
@@ -2445,6 +2514,9 @@ mod tests {
         TaskGraph::new((0..reads).collect(), vec![TaskSet::new(reads); reads])
     }
 
+    /// The program files of a light rebuild of a 300-file package.
+    const WIDE: usize = 363;
+
     /// `RebuildForecast::light`: builders start only with no heavy rebuild
     /// and two light ones that can compile at the same time.
     #[test]
@@ -2455,7 +2527,7 @@ mod tests {
                 .iter()
                 .for_each(|&unchanged| forecast.add_mtimes(unchanged));
             for (read, &rebuild) in parses.iter().enumerate() {
-                forecast.add_class(read, rebuild == Rebuild::Light);
+                forecast.add_class(read, rebuild == Rebuild::Light, WIDE);
                 forecast.add_parse(rebuild);
             }
             forecast.light()
@@ -2500,10 +2572,33 @@ mod tests {
         let forecast = RebuildForecast::new(fan);
         (0..3).for_each(|_| forecast.add_mtimes(true));
         // Task 0 and task 1 cannot compile together.
-        forecast.add_class(0, true);
-        forecast.add_class(1, true);
+        forecast.add_class(0, true, WIDE);
+        forecast.add_class(1, true, WIDE);
         assert_eq!(forecast.known_light(), None);
-        forecast.add_class(2, true);
+        forecast.add_class(2, true, WIDE);
         assert!(forecast.light());
+    }
+
+    /// Light rebuilds count by the files of their programs: builders start
+    /// only when those beside the largest one have `MIN_PARALLEL_FILES`.
+    #[test]
+    fn rebuild_forecast_weighs_the_files_beside_the_largest_rebuild() {
+        let light = |files: &[usize]| {
+            let forecast = RebuildForecast::new(independent(files.len()));
+            for (read, &files) in files.iter().enumerate() {
+                forecast.add_mtimes(true);
+                forecast.add_class(read, true, files);
+                forecast.add_parse(Rebuild::Light);
+            }
+            forecast.light()
+        };
+        // Small packages with the default libs (68 files each).
+        assert!(!light(&[68, 68]));
+        assert!(!light(&[68, 68, 68]));
+        assert!(light(&[68; 5]));
+        // A large rebuild beside a small one: only the small one is loaded
+        // beside it.
+        assert!(!light(&[1563, 78]));
+        assert!(light(&[WIDE, WIDE]));
     }
 }
