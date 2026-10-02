@@ -34,14 +34,15 @@
 //!
 //! The orchestrator uses builders only where the output is the serial
 //! output (`Orchestrator::builders_setting`): for a first task that
-//! compiles as a light rebuild, and for the later ones only when two tasks
-//! that can compile at the same time are light rebuilds and no task is a
-//! heavy one (`Orchestrator::first_task_uses_builder`,
-//! `later_tasks_use_builders`). Else the later ones compile on the
-//! orchestrator thread with the parse cache of the build, after the first
-//! program is made (`Builders::wait_for_loads`). The builder of the first
-//! task writes only when the orchestrator finishes it, so the read rule
-//! holds for them.
+//! compiles as a light rebuild, for the later light rebuilds with unchanged
+//! inputs that compile before the decision, and for the later ones only when
+//! two tasks that can compile at the same time are light rebuilds and no
+//! task is a heavy one (`Orchestrator::first_task_uses_builder`,
+//! `light_unchanged`, `later_tasks_use_builders`). Else the later ones
+//! compile on the orchestrator thread with the parse cache of the build,
+//! after the programs of the builders are made (`Builders::wait_for_loads`).
+//! The builders of the earlier tasks write only when the orchestrator
+//! finishes them, so the read rule holds for them.
 
 use crate::execute::build::build_task::*;
 use crate::execute::build::command_line::{ParsedBuildCommandLine, SendBuildCommandLine};
