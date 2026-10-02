@@ -387,14 +387,15 @@ fn a_tsgo_whose_caller_ignores_sighup() {
 /// (a plain compile goes on after it, as in Go), and SIGQUIT for the
 /// handlers of `go_signal_handlers`, so the run ends with Go's text and
 /// exit 2, not by SIGTERM or SIGQUIT. The test stops the worker (SIGSTOP)
-/// as soon as it shows, sends both signals to the launcher, checks that
-/// neither reached the worker (`ShdPnd` in /proc), and lets the worker go
-/// on. The wait ends soon after the worker has its handlers, well before
-/// its limit (`HOLD_LIMIT`, 2 s), also for SIGTERM, whose handler thread
-/// the wait looks for (`ready_thread`). A worker that the test stopped too
-/// late (it catches SIGQUIT) ends with its launcher and the run starts
-/// again, up to `ATTEMPTS` times; where no attempt is in time, the test
-/// says so and passes.
+/// as soon as it has started (its `arg0` is a worker's), sends SIGTERM and
+/// then SIGQUIT to the launcher, checks that neither reached the worker
+/// (`ShdPnd` in /proc), and lets the worker go on. The wait ends soon after
+/// the worker has its handlers, well before its limit (`HOLD_LIMIT`, 2 s):
+/// SIGQUIT waits behind SIGTERM, so a wait for the thread of SIGTERM's
+/// handler (`ready_thread`) that did not end would hold it too. A worker
+/// that the test stopped too late (it catches SIGQUIT) ends with its
+/// launcher and the run starts again, up to `ATTEMPTS` times; where no
+/// attempt is in time, the test says so and passes.
 #[test]
 fn a_launcher_holds_a_signal_until_its_worker_catches_it() {
     const ATTEMPTS: usize = 20;
@@ -409,7 +410,12 @@ fn a_launcher_holds_a_signal_until_its_worker_catches_it() {
             .unwrap();
         let start = Instant::now();
         let worker = loop {
-            if let Some(worker) = child_of(child.id()) {
+            // Before its exec, the child is the launcher's copy.
+            let started = child_of(child.id()).filter(|worker| {
+                std::fs::read(format!("/proc/{worker}/cmdline"))
+                    .is_ok_and(|cmdline| cmdline.starts_with(b"tsgo-worker "))
+            });
+            if let Some(worker) = started {
                 break worker;
             }
             assert!(child.try_wait().unwrap().is_none(), "ended before a worker");
@@ -424,10 +430,7 @@ fn a_launcher_holds_a_signal_until_its_worker_catches_it() {
             }
             assert!(start.elapsed() < LIMIT, "the worker did not stop");
         };
-        // Before its exec, the worker is the launcher's copy.
-        let cmdline = std::fs::read(format!("/proc/{worker}/cmdline")).unwrap();
-        if cmdline.starts_with(b"tsgo-worker ") && mask(&status, "SigCgt:") & bit(Signal::QUIT) != 0
-        {
+        if mask(&status, "SigCgt:") & bit(Signal::QUIT) != 0 {
             // Too late. The worker gets its parent-death SIGKILL.
             child.kill().unwrap();
             child.wait().unwrap();
