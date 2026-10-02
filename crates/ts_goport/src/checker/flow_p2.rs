@@ -963,7 +963,17 @@ impl Checker {
                 || is_call_expression(parent.parent())
                     && is_identifier(parent.name())
                     && is_push_or_unshift_identifier(parent.name()));
-        let is_element_assignment = is_element_access_expression(parent)
+        let is_element_assignment = self.is_evolving_array_element_assignment(root, parent);
+        is_length_push_or_unshift || is_element_assignment
+    }
+
+    /// The Go `isElementAssignment` part of `isEvolvingArrayOperationTarget`
+    /// for `root` (the reference root) and its `parent`. Unlike the length,
+    /// push and unshift part, it can make types (`get_type_of_expression`),
+    /// so a caller that does not need the answer still calls it at the same
+    /// point (`check_identifier`).
+    pub fn is_evolving_array_element_assignment(&mut self, root: Node, parent: Node) -> bool {
+        is_element_access_expression(parent)
             && parent.expression() == root
             && is_binary_expression(parent.parent())
             && parent.parent().operator_token().kind() == SyntaxKind::EqualsToken
@@ -972,8 +982,7 @@ impl Checker {
             && {
                 let argument_type = self.get_type_of_expression(parent.argument_expression());
                 self.is_type_assignable_to_kind(argument_type, TypeFlags::NUMBER_LIKE)
-            };
-        is_length_push_or_unshift || is_element_assignment
+            }
     }
 
     // When adding evolving array element types we do not perform subtype reduction. Instead,
@@ -1096,7 +1105,44 @@ impl Checker {
     // PERF: the kind of `target` is read once (`target_kind`). This runs
     // about 2.2M times on effect, mostly with an identifier `source`.
     pub fn is_matching_reference(&mut self, source: Node, target: Node) -> bool {
-        let target_kind = target.kind();
+        self.is_matching_reference_kind(source, target, target.kind())
+    }
+
+    /// True when the memo already shows that `is_matching_reference(source,
+    /// target)` is false for a variable or binding declaration `target` (see
+    /// the declaration test in `is_matching_reference_kind`): the memo holds
+    /// `source` with its export symbol, and `target` is not one of that
+    /// symbol's declarations. It only reads; any other case is false, and the
+    /// caller makes the full call.
+    // PERF: chkA. `get_type_at_flow_assignment` tests each assignment of a
+    // walk against one reference, so after the first call the memo holds it.
+    #[inline]
+    pub fn matching_reference_memo_says_no(
+        &self,
+        source: Node,
+        target: Node,
+        target_kind: SyntaxKind,
+    ) -> bool {
+        let memo = &self.matching_reference_memo;
+        matches!(
+            target_kind,
+            SyntaxKind::VariableDeclaration | SyntaxKind::BindingElement
+        ) && memo.node == source
+            && source.is_some()
+            && !memo.this_in_type_query
+            && memo.export.is_some()
+            && memo.export_merge_version == self.merge_version
+            && !self.sym(memo.export).declarations.contains(&target)
+    }
+
+    /// `is_matching_reference` for a caller that has read `target_kind`
+    /// (`target.kind()`).
+    pub fn is_matching_reference_kind(
+        &mut self,
+        source: Node,
+        target: Node,
+        target_kind: SyntaxKind,
+    ) -> bool {
         match target_kind {
             SyntaxKind::ParenthesizedExpression | SyntaxKind::NonNullExpression => {
                 return self.is_matching_reference(source, target.expression());
@@ -1152,6 +1198,20 @@ impl Checker {
                     || target_kind == SyntaxKind::BindingElement
                 {
                     let export_symbol = self.memo_export_symbol(source);
+                    // PERF: chkA. Go compares `export_symbol` with
+                    // `getMergedSymbol(target.Symbol())`. The binder puts
+                    // `target` in the declarations of its symbol, and only a
+                    // merge (`merge_symbol`, `clone_symbol`) gives a symbol
+                    // another merged symbol. Both copy the declarations of
+                    // their source into the merged symbol, which only grows.
+                    // So the two are equal only when `target` is one of the
+                    // declarations of `export_symbol`. Any other target gives
+                    // false with no read of its symbol and no merge lookup.
+                    if export_symbol.is_some()
+                        && !self.sym(export_symbol).declarations.contains(&target)
+                    {
+                        return false;
+                    }
                     // PERF: Go `getSymbolOfDeclaration(target)` without its
                     // `getLateBoundSymbol` step, which returns its argument
                     // here: the binder symbol of a variable or binding

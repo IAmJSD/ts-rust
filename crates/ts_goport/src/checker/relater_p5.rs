@@ -8,8 +8,8 @@ use crate::diagnostics::Message;
 // passes `r.reportError` and `r.isRelatedTo` as func values into
 // `compareSignaturesRelated` (a 'static `TypeComparer`), so each borrow of the
 // relater is kept short and never held across a checker call. Go `r.c` is
-// `self`. Go `r.relation == r.c.xxxRelation` is `Rc::ptr_eq` on the
-// `Rc<RefCell<Relation>>` handles.
+// `self`. Go `r.relation == r.c.xxxRelation` compares the relater's
+// `RelationKind`.
 // PORT: Go `*ErrorChain` is `Option<Rc<ErrorChain>>` (the chain is shared by
 // saved error states). `ErrorChain { next, message, args: Vec<String> }`.
 
@@ -30,8 +30,8 @@ impl Checker {
         report_errors: bool,
         intersection_state: IntersectionState,
     ) -> Ternary {
-        let relation = r.borrow().relation.clone();
-        if sources.len() != targets.len() && Rc::ptr_eq(&relation, &self.identity_relation) {
+        let relation = r.borrow().kind;
+        if sources.len() != targets.len() && relation == RelationKind::Identity {
             return Ternary::FALSE;
         }
         let length = sources.len().min(targets.len());
@@ -54,7 +54,7 @@ impl Checker {
                     // Even an `Unmeasurable` variance works out without a structural check if the source and target are _identical_.
                     // We can't simply assume invariance, because `Unmeasurable` marks nonlinear relations, for example, a relation tainted by
                     // the `-?` modifier in a mapped type (where, no matter how the inputs are related, the outputs still might not be)
-                    if Rc::ptr_eq(&relation, &self.identity_relation) {
+                    if relation == RelationKind::Identity {
                         related = self.is_related_to(
                             r,
                             s,
@@ -162,11 +162,11 @@ impl Checker {
         target: TypeId,
         report_errors: bool,
     ) -> Ternary {
-        let relation = r.borrow().relation.clone();
-        let modifiers_related = Rc::ptr_eq(&relation, &self.comparable_relation)
-            || Rc::ptr_eq(&relation, &self.identity_relation)
+        let relation = r.borrow().kind;
+        let modifiers_related = relation == RelationKind::Comparable
+            || relation == RelationKind::Identity
                 && self.get_mapped_type_modifiers(source) == self.get_mapped_type_modifiers(target)
-            || !Rc::ptr_eq(&relation, &self.identity_relation)
+            || relation != RelationKind::Identity
                 && self.get_combined_mapped_type_optionality(source)
                     <= self.get_combined_mapped_type_optionality(target);
         if modifiers_related {
@@ -227,7 +227,7 @@ impl Checker {
         //
         // NOTE: See ~/tests/cases/conformance/types/typeRelationships/assignmentCompatibility/assignmentCompatWithDiscriminatedUnion.ts
         //       for examples.
-        let relation = r.borrow().relation.clone();
+        let relation = r.borrow().kind;
         let source_properties = self.get_properties_of_type(source);
         let source_properties_filtered =
             self.find_discriminant_properties(&source_properties, target);
@@ -288,8 +288,7 @@ impl Checker {
         // constituents of 'target'. If any combination does not have a match then 'source' is not relatable.
         let mut matching_types: Vec<TypeId> = Vec::new();
         let target_types = self.ty(target).types_list();
-        let skip_optional =
-            self.strict_null_checks || Rc::ptr_eq(&relation, &self.comparable_relation);
+        let skip_optional = self.strict_null_checks || relation == RelationKind::Comparable;
         for combination in &discriminant_combinations {
             let mut has_match = false;
             'outer: for &t in &target_types {
@@ -398,8 +397,8 @@ impl Checker {
         optionals_only: bool,
         intersection_state: IntersectionState,
     ) -> Ternary {
-        let relation = r.borrow().relation.clone();
-        if Rc::ptr_eq(&relation, &self.identity_relation) {
+        let relation = r.borrow().kind;
+        if relation == RelationKind::Identity {
             return self.properties_identical_to(r, source, target, excluded_properties);
         }
         let mut result = Ternary::TRUE;
@@ -615,8 +614,8 @@ impl Checker {
                 return Ternary::FALSE;
             }
         }
-        let require_optional_properties = (Rc::ptr_eq(&relation, &self.subtype_relation)
-            || Rc::ptr_eq(&relation, &self.strict_subtype_relation))
+        let require_optional_properties = (relation == RelationKind::Subtype
+            || relation == RelationKind::StrictSubtype)
             && !self.is_object_literal_type(source)
             && !self.is_empty_array_literal_type(source)
             && !self.is_tuple_type(source);
@@ -672,7 +671,7 @@ impl Checker {
             {
                 let source_prop = self.get_property_of_type_name(source, &name);
                 if source_prop.is_some() && source_prop != target_prop {
-                    let skip_optional = Rc::ptr_eq(&relation, &self.comparable_relation);
+                    let skip_optional = relation == RelationKind::Comparable;
                     let related = self.property_related_to(
                         r,
                         source,
@@ -707,7 +706,7 @@ impl Checker {
         intersection_state: IntersectionState,
         skip_optional: bool,
     ) -> Ternary {
-        let relation = r.borrow().relation.clone();
+        let relation = r.borrow().kind;
         let source_prop_flags = self.get_declaration_modifier_flags_from_symbol(source_prop);
         let target_prop_flags = self.get_declaration_modifier_flags_from_symbol(target_prop);
         if source_prop_flags.intersects(ModifierFlags::PRIVATE)
@@ -788,7 +787,7 @@ impl Checker {
         // from deciding which type "wins" in union subtype reduction.
         // They're still assignable to one another, since `readonly` doesn't affect assignability.
         // This is only applied during the strictSubtypeRelation -- currently used in subtype reduction
-        if Rc::ptr_eq(&relation, &self.strict_subtype_relation)
+        if relation == RelationKind::StrictSubtype
             && self.is_readonly_symbol(source_prop)
             && !self.is_readonly_symbol(target_prop)
         {
@@ -854,7 +853,7 @@ impl Checker {
         report_errors: bool,
         intersection_state: IntersectionState,
     ) -> Ternary {
-        let relation = r.borrow().relation.clone();
+        let relation = r.borrow().kind;
         let target_is_optional = self.strict_null_checks
             && self
                 .sym(target_prop)
@@ -864,7 +863,7 @@ impl Checker {
         let effective_target =
             self.add_optionality_ex(target_type, false /*isProperty*/, target_is_optional);
         // source could resolve to `any` and that's not related to `unknown` target under strict subtype relation
-        let mask = if Rc::ptr_eq(&relation, &self.strict_subtype_relation) {
+        let mask = if relation == RelationKind::StrictSubtype {
             TypeFlags::ANY
         } else {
             TypeFlags::ANY_OR_UNKNOWN
@@ -1096,8 +1095,8 @@ impl Checker {
         report_errors: bool,
         intersection_state: IntersectionState,
     ) -> Ternary {
-        let relation = r.borrow().relation.clone();
-        if Rc::ptr_eq(&relation, &self.identity_relation) {
+        let relation = r.borrow().kind;
+        if relation == RelationKind::Identity {
             return self.signatures_identical_to(r, source, target, kind);
         }
         // With respect to signatures, the anyFunctionType wildcard is a subtype of every other function type.
@@ -1176,7 +1175,7 @@ impl Checker {
             // in the context of the target signature before checking the relationship. Ideally we'd do
             // this regardless of the number of signatures, but the potential costs are prohibitive due
             // to the quadratic nature of the logic below.
-            let erase_generics = Rc::ptr_eq(&relation, &self.comparable_relation);
+            let erase_generics = relation == RelationKind::Comparable;
             result = self.signature_related_to(
                 r,
                 source_signatures[0],
@@ -1276,11 +1275,11 @@ impl Checker {
         report_errors: bool,
         intersection_state: IntersectionState,
     ) -> Ternary {
-        let relation = r.borrow().relation.clone();
+        let relation = r.borrow().kind;
         let mut check_mode = SignatureCheckMode::NONE;
-        if Rc::ptr_eq(&relation, &self.subtype_relation) {
+        if relation == RelationKind::Subtype {
             check_mode = SignatureCheckMode::STRICT_TOP_SIGNATURE;
-        } else if Rc::ptr_eq(&relation, &self.strict_subtype_relation) {
+        } else if relation == RelationKind::StrictSubtype {
             check_mode =
                 SignatureCheckMode::STRICT_TOP_SIGNATURE | SignatureCheckMode::STRICT_ARITY;
         }
@@ -1365,8 +1364,8 @@ impl Checker {
         report_errors: bool,
         intersection_state: IntersectionState,
     ) -> Ternary {
-        let relation = r.borrow().relation.clone();
-        if Rc::ptr_eq(&relation, &self.identity_relation) {
+        let relation = r.borrow().kind;
+        if relation == RelationKind::Identity {
             return self.index_signatures_identical_to(r, source, target);
         }
         let index_infos = self.get_index_infos_of_type(target);
@@ -1377,7 +1376,7 @@ impl Checker {
         for &target_info in &index_infos {
             let related: Ternary;
             let target_value_type = self.index_info(target_info).value_type;
-            if !Rc::ptr_eq(&relation, &self.strict_subtype_relation)
+            if relation != RelationKind::StrictSubtype
                 && !source_is_primitive
                 && target_has_string_index
                 && self.ty(target_value_type).flags.intersects(TypeFlags::ANY)
@@ -1418,7 +1417,7 @@ impl Checker {
         report_errors: bool,
         intersection_state: IntersectionState,
     ) -> Ternary {
-        let relation = r.borrow().relation.clone();
+        let relation = r.borrow().kind;
         let target_key_type = self.index_info(target_info).key_type;
         let source_info = self.get_applicable_index_info(source, target_key_type);
         if source_info.is_some() {
@@ -1434,7 +1433,7 @@ impl Checker {
         // only fresh object literals are considered to have inferred index signatures. This ensures { [x: string]: xxx } <: {} but
         // not vice-versa. Without this rule, those types would be mutual strict subtypes.
         if !intersection_state.intersects(IntersectionState::SOURCE)
-            && (!Rc::ptr_eq(&relation, &self.strict_subtype_relation)
+            && (relation != RelationKind::StrictSubtype
                 || self
                     .ty(source)
                     .object_flags
@@ -1840,9 +1839,9 @@ impl Checker {
                 );
             }
         }
-        let relation = r.borrow().relation.clone();
+        let relation = r.borrow().kind;
         if message.is_none() {
-            if Rc::ptr_eq(&relation, &self.comparable_relation) {
+            if relation == RelationKind::Comparable {
                 message = Some(diag::Type_0_is_not_comparable_to_type_1);
             } else if source_type == target_type {
                 message = Some(diag::Type_0_is_not_assignable_to_type_1_Two_different_types_with_this_name_exist_but_they_are_unrelated);

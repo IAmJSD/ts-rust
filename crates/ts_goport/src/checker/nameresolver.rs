@@ -207,8 +207,15 @@ impl NameResolver {
         // `IsFunctionLike`, `getIsDeferredContext`, the switch and
         // `isSelfReferenceLocation`) read the kind about 8 times per scope.
         // It is read again each time `location` changes.
+        // PERF: chkA. The step to the parent at the end of the loop reads
+        // the parent's kind with it (`node_parent_and_kind`, one store
+        // lookup); `next_kind` holds it for the next pass.
+        let mut next_kind: Option<SyntaxKind> = None;
         'loop_: while location.is_some() {
-            let mut kind = location.kind();
+            let mut kind = match next_kind.take() {
+                Some(kind) => kind,
+                None => location.kind(),
+            };
             if name_is_const && is_const_assertion(location) {
                 // `const` in an `as const` has no symbol, but issues no error because there is no *actual* lookup of the type
                 // (it refers to the constant type of the expression instead)
@@ -229,7 +236,14 @@ impl NameResolver {
                 let attributes = location.attributes();
                 attributes.is_some() && last_location == attributes
             };
-            let locals = location.locals();
+            // PERF: chkA. Only a locals container has locals; `kind` tells
+            // that with no second kind read in `locals()`.
+            let locals = if is_locals_container_kind(kind) {
+                location.locals()
+            } else {
+                debug_assert!(location.locals().is_nil());
+                SymbolTable::NIL
+            };
             // Locals of a source file are not in scope (because they get merged into the global symbol table)
             // PORT: `!is_global_source_file(location)` with the kind read.
             if locals.is_some()
@@ -665,7 +679,9 @@ impl NameResolver {
             // getEffectiveContainerForJSDocTemplateTag/getHostSignatureFromJSDoc instead of location.parent.
             // This is a no-op currently because JSDoc nodes have no locals and getEffectiveJSDocHost is not
             // fully ported for JS assignment patterns.
-            location = location.parent();
+            let (parent, parent_kind) = node_parent_and_kind(location);
+            location = parent;
+            next_kind = Some(parent_kind);
         }
         // We just climbed up parents looking for the name, meaning that we started in a descendant node of `lastLocation`.
         // If `result === lastSelfReferenceLocation.symbol`, that means that we are somewhere inside `lastSelfReferenceLocation` looking up a name, and resolving to `lastLocation` itself.
@@ -978,6 +994,44 @@ pub fn is_type_parameter_symbol_declared_in_container(
 
 // Go: binder/nameresolver.go:489 isSelfReferenceLocation
 // PERF: `kind` is `node.kind()`, which the caller has read.
+/// True for the kinds of the locals containers (`locals_container_variants!`
+/// in `ast/node.rs`, Go `LocalsContainerData`): only a node of one of these
+/// kinds can have locals.
+pub fn is_locals_container_kind(kind: SyntaxKind) -> bool {
+    matches!(
+        kind,
+        SyntaxKind::ArrowFunction
+            | SyntaxKind::Block
+            | SyntaxKind::CallSignature
+            | SyntaxKind::CaseBlock
+            | SyntaxKind::CatchClause
+            | SyntaxKind::ClassDeclaration
+            | SyntaxKind::ClassExpression
+            | SyntaxKind::ClassStaticBlockDeclaration
+            | SyntaxKind::ConditionalType
+            | SyntaxKind::ConstructSignature
+            | SyntaxKind::Constructor
+            | SyntaxKind::ConstructorType
+            | SyntaxKind::ForInStatement
+            | SyntaxKind::ForOfStatement
+            | SyntaxKind::ForStatement
+            | SyntaxKind::FunctionDeclaration
+            | SyntaxKind::FunctionExpression
+            | SyntaxKind::FunctionType
+            | SyntaxKind::GetAccessor
+            | SyntaxKind::IndexSignature
+            | SyntaxKind::JsDocSignature
+            | SyntaxKind::MappedType
+            | SyntaxKind::MethodDeclaration
+            | SyntaxKind::MethodSignature
+            | SyntaxKind::ModuleDeclaration
+            | SyntaxKind::SetAccessor
+            | SyntaxKind::SourceFile
+            | SyntaxKind::TypeAliasDeclaration
+            | SyntaxKind::JsTypeAliasDeclaration
+    )
+}
+
 pub fn is_self_reference_location(node: Node, kind: SyntaxKind, last_location: Node) -> bool {
     match kind {
         SyntaxKind::Parameter => last_location.is_some() && last_location == node.name(),

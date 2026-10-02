@@ -22,12 +22,13 @@ pub struct CallState {
     pub node: Node,
     pub type_arguments: SmallVec<[Node; 4]>,
     pub args: SmallVec<[Node; 8]>,
-    pub candidates: Vec<SignatureId>,
+    // PERF: the candidate lists live on the stack up to 4 signatures.
+    pub candidates: SmallVec<[SignatureId; 4]>,
     pub arg_check_mode: CheckMode,
     pub is_single_non_generic_candidate: bool,
     pub signature_help_trailing_comma: bool,
     pub recursive_resolution: bool,
-    pub candidates_for_argument_error: Vec<SignatureId>,
+    pub candidates_for_argument_error: SmallVec<[SignatureId; 4]>,
     pub candidate_for_argument_arity_error: SignatureId,
     pub candidate_for_type_argument_error: SignatureId,
 }
@@ -43,7 +44,7 @@ pub struct ConstructorAccessibilityError {
 /// moves the final candidates to the caller's array.
 fn set_candidates_out(out: Option<&mut Vec<SignatureId>>, s: &mut CallState) {
     if let Some(out) = out {
-        *out = std::mem::take(&mut s.candidates);
+        *out = std::mem::take(&mut s.candidates).into_vec();
     }
 }
 
@@ -885,14 +886,14 @@ impl Checker {
         &mut self,
         signatures: &[SignatureId],
         call_chain_flags: SignatureFlags,
-    ) -> Vec<SignatureId> {
+    ) -> SmallVec<[SignatureId; 4]> {
         let mut last_parent = Node::NIL;
         let mut last_symbol = SymbolId::NIL;
         let mut index: i32 = 0;
         let mut cutoff_index: i32 = 0;
         let mut splice_index: i32;
         let mut specialized_index: i32 = -1;
-        let mut result: Vec<SignatureId> = Vec::with_capacity(signatures.len());
+        let mut result: SmallVec<[SignatureId; 4]> = SmallVec::with_capacity(signatures.len());
         for &signature in signatures {
             let mut signature = signature;
             let mut symbol = SymbolId::NIL;
@@ -979,7 +980,7 @@ impl Checker {
         s: &mut CallState,
         relation: &Rc<RefCell<Relation>>,
     ) -> SignatureId {
-        s.candidates_for_argument_error = Vec::new();
+        s.candidates_for_argument_error.clear();
         s.candidate_for_argument_arity_error = SignatureId::NIL;
         s.candidate_for_type_argument_error = SignatureId::NIL;
         let args = &s.args;
@@ -999,7 +1000,7 @@ impl Checker {
                 false, /*reportErrors*/
                 None,  /*diagnosticOutput*/
             ) {
-                s.candidates_for_argument_error = vec![candidate];
+                s.candidates_for_argument_error.push(candidate);
                 return SignatureId::NIL;
             }
             return candidate;
@@ -1015,9 +1016,10 @@ impl Checker {
             }
             let mut check_candidate: SignatureId;
             let mut inference_context = InferenceContextId::NIL;
-            let candidate_type_parameters = self.sig(candidate).type_parameters.clone();
-            if !candidate_type_parameters.is_empty() {
-                let type_argument_types: Vec<TypeId>;
+            // PERF: the type parameters are read from the candidate in place
+            // (`new_inference_context_of_signature`), not copied.
+            if !self.sig(candidate).type_parameters.is_empty() {
+                let type_argument_types: SmallVec<[TypeId; 4]>;
                 if !s.type_arguments.is_empty() {
                     match self.check_type_arguments(
                         candidate,
@@ -1025,7 +1027,7 @@ impl Checker {
                         false, /*reportErrors*/
                         None,
                     ) {
-                        Some(types) => type_argument_types = types,
+                        Some(types) => type_argument_types = SmallVec::from_vec(types),
                         None => {
                             s.candidate_for_type_argument_error = candidate;
                             continue;
@@ -1041,12 +1043,7 @@ impl Checker {
                     if is_in_js_file(s.node) {
                         flags |= InferenceFlags::ANY_DEFAULT;
                     }
-                    inference_context = self.new_inference_context(
-                        &candidate_type_parameters,
-                        candidate,
-                        flags, /*flags*/
-                        None,
-                    );
+                    inference_context = self.new_inference_context_of_signature(candidate, flags);
                     type_argument_types = self.infer_type_arguments(
                         s.node,
                         candidate,

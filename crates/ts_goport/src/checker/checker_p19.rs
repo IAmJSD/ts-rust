@@ -1992,6 +1992,9 @@ impl Checker {
     }
 
     // Go: checker/checker.go:17520 getRelationKey
+    // PORT: perf. A plain key is returned as its key bytes, not hashed (see
+    // `RelationKey`).
+    #[inline]
     pub fn get_relation_key(
         &mut self,
         source: TypeId,
@@ -1999,7 +2002,7 @@ impl Checker {
         intersection_state: IntersectionState,
         is_identity: bool,
         ignore_constraints: bool,
-    ) -> (CacheHashKey, bool) {
+    ) -> (RelationKey, bool) {
         let (mut source, mut target) = (source, target);
         if is_identity && source > target {
             std::mem::swap(&mut source, &mut target);
@@ -2007,31 +2010,37 @@ impl Checker {
         if self.is_type_reference_with_generic_arguments(source)
             && self.is_type_reference_with_generic_arguments(target)
         {
-            let mut b = KeyBuilder::default();
-            b.write_byte(b'g');
-            let constrained =
-                b.write_generic_type_references(self, source, target, ignore_constraints);
-            b.write_uint32(intersection_state.0);
-            return (b.hash(), constrained);
+            return self.generic_relation_key(
+                source,
+                target,
+                intersection_state,
+                ignore_constraints,
+            );
         }
-        // PERF: the plain key is 13 bytes ('s', source, target, intersection
-        // state). It is built in a stack array and hashed with no
-        // `KeyBuilder`. Same bytes, so the same key.
-        let mut p = [0u8; 13];
-        p[0] = b's';
-        p[1..5].copy_from_slice(&source.0.to_le_bytes());
-        p[5..9].copy_from_slice(&target.0.to_le_bytes());
-        p[9..].copy_from_slice(&intersection_state.0.to_le_bytes());
-        let key = short_key_hash(&p);
-        debug_assert_eq!(key, {
-            let mut b = KeyBuilder::default();
-            b.write_byte(b's');
-            b.write_type(source);
-            b.write_type(target);
-            b.write_uint32(intersection_state.0);
-            b.hash()
-        });
-        (key, false)
+        (
+            RelationKey::Plain(PlainRelationKey {
+                source: source.0,
+                target: target.0,
+                intersection_state: intersection_state.0,
+            }),
+            false,
+        )
+    }
+
+    /// The generic branch of Go `getRelationKey`, out of line.
+    #[inline(never)]
+    fn generic_relation_key(
+        &mut self,
+        source: TypeId,
+        target: TypeId,
+        intersection_state: IntersectionState,
+        ignore_constraints: bool,
+    ) -> (RelationKey, bool) {
+        let mut b = KeyBuilder::default();
+        b.write_byte(b'g');
+        let constrained = b.write_generic_type_references(self, source, target, ignore_constraints);
+        b.write_uint32(intersection_state.0);
+        (RelationKey::Generic(b.hash()), constrained)
     }
 
     // Go: checker/checker.go:17538 getNodeListKey

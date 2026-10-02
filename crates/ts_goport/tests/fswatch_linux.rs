@@ -242,7 +242,7 @@ fn expect_contains(r: &Recorder, kind: EventKind, path: &str) {
 
 // ----- tests -------------------------------------------------------------
 
-// Go: watcher.go:219 Default (the linux case). Go has no test for it; its
+// Go: watcher.go:230 Default (the linux case). Go has no test for it; its
 // fanotify_linux_test.go:35 TestLinuxFanotifyBackendSelection checks only the
 // fanotify watcher.
 #[test]
@@ -256,7 +256,7 @@ fn default_watcher_is_the_go_choice() {
     assert!(fswatch::default().available());
 }
 
-// Go: watcher_test.go:729 TestWatchFileCreate
+// Go: watcher_test.go:853 TestWatchFileCreate
 #[test]
 fn file_create_is_an_update() {
     run_with_retry("TestWatchFileCreate", |attempt| {
@@ -269,7 +269,7 @@ fn file_create_is_an_update() {
     });
 }
 
-// Go: watcher_test.go:970 TestSubscribeSubfileUpdate
+// Go: watcher_test.go:1094 TestSubscribeSubfileUpdate
 #[test]
 fn recursive_watch_sees_a_subdirectory_file_update() {
     run_with_retry("TestSubscribeSubfileUpdate", |attempt| {

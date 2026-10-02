@@ -49,7 +49,7 @@ fn walk_all(walk: Walk, root: &str) -> HashMap<String, bool> {
     found.into_inner()
 }
 
-// Go: walkdir_test.go:28 TestWalkDirDoesNotFollowSymlinkedDir
+// Go: walkdir_test.go:30 TestWalkDirDoesNotFollowSymlinkedDir
 #[test]
 fn test_walk_dir_does_not_follow_symlinked_dir() {
     run_walk_dir_test(|name, walk| {
@@ -84,7 +84,7 @@ fn geteuid() -> u32 {
     std::os::unix::fs::MetadataExt::uid(&std::fs::metadata(&p).unwrap())
 }
 
-// Go: walkdir_test.go:64 TestWalkDirIgnoresUnreadableSubdir
+// Go: walkdir_test.go:85 TestWalkDirIgnoresUnreadableSubdir
 #[test]
 fn test_walk_dir_ignores_unreadable_subdir() {
     if geteuid() == 0 {
@@ -113,7 +113,7 @@ fn test_walk_dir_ignores_unreadable_subdir() {
     });
 }
 
-// Go: walkdir_test.go:103 TestWalkDirMissingDir
+// Go: walkdir_test.go:126 TestWalkDirMissingDir
 #[test]
 fn test_walk_dir_missing_dir() {
     run_walk_dir_test(|name, walk| {
@@ -126,7 +126,7 @@ fn test_walk_dir_missing_dir() {
     });
 }
 
-// Go: walkdir_test.go:111 TestWalkDirNotADir
+// Go: walkdir_test.go:134 TestWalkDirNotADir
 #[test]
 fn test_walk_dir_not_a_dir() {
     run_walk_dir_test(|name, walk| {
@@ -140,7 +140,7 @@ fn test_walk_dir_not_a_dir() {
     });
 }
 
-// Go: walkdir_test.go:122 TestWalkDirEntries
+// Go: walkdir_test.go:145 TestWalkDirEntries
 #[test]
 fn test_walk_dir_entries() {
     run_walk_dir_test(|name, walk| {
@@ -163,7 +163,7 @@ fn test_walk_dir_entries() {
     });
 }
 
-// Go: walkdir_test.go:150 TestWalkDirCallback
+// Go: walkdir_test.go:177 TestWalkDirCallback
 #[test]
 fn test_walk_dir_callback() {
     run_walk_dir_test(|name, walk| {
@@ -183,7 +183,7 @@ fn test_walk_dir_callback() {
     });
 }
 
-// Go: walkdir_test.go:180 TestWalkDirCallbackError
+// Go: walkdir_test.go:208 TestWalkDirCallbackError
 #[test]
 fn test_walk_dir_callback_error() {
     run_walk_dir_test(|name, walk| {

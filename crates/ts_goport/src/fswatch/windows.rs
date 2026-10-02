@@ -84,19 +84,19 @@ use crate::gostd::errors;
 //   Then call dirWatch.notify() to trigger the debouncer.
 // ---------------------------------------------------------------------------
 
-// Go: windows.go:108 errGetFileInfo
+// Go: windows.go:106 errGetFileInfo
 pub static ERR_GET_FILE_INFO: LazyLock<GoError> =
     LazyLock::new(|| errors::new("could not get file information"));
-// Go: windows.go:109 errReadChanges
+// Go: windows.go:107 errReadChanges
 pub static ERR_READ_CHANGES: LazyLock<GoError> =
     LazyLock::new(|| errors::new("failed to read changes"));
-// Go: windows.go:110 errGetOverlappedResult
+// Go: windows.go:108 errGetOverlappedResult
 pub static ERR_GET_OVERLAPPED_RESULT: LazyLock<GoError> =
     LazyLock::new(|| errors::new("GetOverlappedResult failed"));
-// Go: windows.go:111 errUnknown
+// Go: windows.go:109 errUnknown
 pub static ERR_UNKNOWN: LazyLock<GoError> = LazyLock::new(|| errors::new("unknown error"));
 
-// Go: windows.go:125 windowsBackend
+// Go: windows.go:123 windowsBackend
 /// windowsBackend.
 ///
 /// PORT: `self_` is the backend's own `Arc`, for fatal's goroutine.
@@ -105,7 +105,7 @@ pub struct WindowsBackend {
     self_: Weak<WindowsBackend>,
 }
 
-// Go: windows.go:129 init
+// Go: windows.go:127 init
 // PORT: Go's `init()` sets the factory on the package var `windowsWatcher`;
 // the port's package var calls this when it is built.
 pub fn init(windows_watcher: &mut WatcherStruct) {
@@ -113,7 +113,7 @@ pub fn init(windows_watcher: &mut WatcherStruct) {
     windows_watcher.factory = Some(factory);
 }
 
-// Go: windows.go:133 newWindowsBackend
+// Go: windows.go:131 newWindowsBackend
 pub fn new_windows_backend() -> Arc<WindowsBackend> {
     Arc::new_cyclic(|self_: &Weak<WindowsBackend>| {
         let b = WindowsBackend {
@@ -127,7 +127,7 @@ pub fn new_windows_backend() -> Arc<WindowsBackend> {
 }
 
 impl WatcherImpl for WindowsBackend {
-    // Go: windows.go:141 windowsBackend.start
+    // Go: windows.go:139 windowsBackend.start
     /// start notifies that the watcherImpl is ready. Each watch owns
     /// its own goroutine, so there's no shared event loop to start.
     fn start(&self) -> Result<(), GoError> {
@@ -135,7 +135,7 @@ impl WatcherImpl for WindowsBackend {
         Ok(())
     }
 
-    // Go: windows.go:435 windowsBackend.subscribe
+    // Go: windows.go:433 windowsBackend.subscribe
     /// subscribe mirrors `windowsBackend::subscribe`.
     fn subscribe(&self, w: &Arc<DirWatch>) -> Result<(), GoError> {
         let sub = new_windows_subscription(self, w)?;
@@ -150,7 +150,7 @@ impl WatcherImpl for WindowsBackend {
         Ok(())
     }
 
-    // Go: windows.go:456 windowsBackend.closeWatch
+    // Go: windows.go:459 windowsBackend.closeWatch
     /// closeWatch mirrors `windowsBackend::closeWatch`. Signals the watch
     /// goroutine to stop and waits for it to finish; that way the directory
     /// handle is guaranteed to be closed before this returns, so a follow-on
@@ -166,7 +166,7 @@ impl WatcherImpl for WindowsBackend {
         Ok(())
     }
 
-    // Go: windows.go:468 windowsBackend.shutdown
+    // Go: windows.go:471 windowsBackend.shutdown
     /// shutdown mirrors `windowsBackend::~windowsBackend`.
     fn shutdown(&self) {
         // Nothing to do; each watch owns its goroutine and is stopped
@@ -178,7 +178,7 @@ impl WatcherImpl for WindowsBackend {
     }
 }
 
-// Go: windows.go:147 windowsSubscription
+// Go: windows.go:145 windowsSubscription
 /// windowsSubscription.
 ///
 /// PORT: Go's `handle`, `bufBytes` and `first` are the `notify` watcher
@@ -220,7 +220,7 @@ fn watched_directory_removed() -> GoError {
     )
 }
 
-// Go: windows.go:165 newWindowsSubscription
+// Go: windows.go:163 newWindowsSubscription
 /// PORT: Go opens the directory handle here (CreateFile) and checks
 /// FILE_ATTRIBUTE_DIRECTORY. The `notify` watcher opens the handle in
 /// beginRead; the checks are `std::fs::metadata` (the same CreateFile open
@@ -269,7 +269,7 @@ impl Drop for DoneGuard<'_> {
 }
 
 impl WindowsSubscription {
-    // Go: windows.go:199 windowsSubscription.beginRead
+    // Go: windows.go:200 windowsSubscription.beginRead
     /// PORT: Go arms one ReadDirectoryChangesW and returns the request; the
     /// `notify` watcher arms the first one in `watch` and the next ones
     /// itself. Returns false where Go returns a nil request (stopped).
@@ -309,7 +309,7 @@ impl WindowsSubscription {
         Ok(true)
     }
 
-    // Go: windows.go:259 windowsSubscription.run
+    // Go: windows.go:261 windowsSubscription.run
     /// run is the per-watch goroutine. It loops on ReadDirectoryChangesW
     /// until the watch is stopped or an unrecoverable error occurs.
     ///
@@ -361,7 +361,7 @@ impl WindowsSubscription {
         }
     }
 
-    // Go: windows.go:318 windowsSubscription.processCompletion
+    // Go: windows.go:320 windowsSubscription.processCompletion
     /// processCompletion mirrors the body of `Watch::processEvents` for
     /// the cases that translate cleanly to Go's overlapped wrapper.
     ///
@@ -382,7 +382,7 @@ impl WindowsSubscription {
         self.dir_watch.notify();
     }
 
-    // Go: windows.go:374 windowsSubscription.processOne
+    // Go: windows.go:376 windowsSubscription.processOne
     /// PORT: Go switches on the FILE_ACTION_* code; `notify` names them
     /// ADDED `Create`, RENAMED_NEW_NAME `Modify(Name(To))`, MODIFIED
     /// `Modify(Any)`, REMOVED `Remove` and RENAMED_OLD_NAME `Modify(Name(From))`.
@@ -422,7 +422,7 @@ impl WindowsSubscription {
         }
     }
 
-    // Go: windows.go:409 windowsSubscription.fatal
+    // Go: windows.go:408 windowsSubscription.fatal
     /// fatal is invoked when the run goroutine hits an unrecoverable error.
     /// handleWatcherError eventually calls closeWatch which waits on doneCh,
     /// but doneCh isn't closed until run() returns. Calling handleWatcherError
@@ -439,7 +439,7 @@ impl WindowsSubscription {
         self.stop();
     }
 
-    // Go: windows.go:415 windowsSubscription.stopLocked
+    // Go: windows.go:414 windowsSubscription.stopLocked
     /// PORT: Go closes stopCh and cancels the read (CancelIoEx); dropping the
     /// `notify` watcher cancels it, closes the handle and ends run's wait.
     pub fn stop_locked(l: &mut WindowsSubscriptionLocked) {
@@ -450,7 +450,7 @@ impl WindowsSubscription {
         l.watcher = None;
     }
 
-    // Go: windows.go:427 windowsSubscription.stop
+    // Go: windows.go:426 windowsSubscription.stop
     pub fn stop(&self) {
         let mut l = self.mu.lock().unwrap();
         Self::stop_locked(&mut l);

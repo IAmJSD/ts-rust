@@ -815,7 +815,8 @@ impl Checker {
             return c;
         }
         // Order named types by name and, in the case of aliased types, by alias type arguments.
-        let c = self.compare_type_names(t1, t2);
+        // PERF: chkA. The two types are passed as read (`compare_type_names_of`).
+        let c = self.compare_type_names_of(ty1, ty2);
         if c != 0 {
             return c;
         }
@@ -1184,13 +1185,15 @@ pub fn get_sort_order_flags(t: &Type) -> i64 {
 impl Checker {
     // Go: checker/utilities.go:565 compareTypeNames
     pub fn compare_type_names(&self, t1: TypeId, t2: TypeId) -> i32 {
-        let s1 = self.get_type_name_symbol(t1);
-        let s2 = self.get_type_name_symbol(t2);
+        self.compare_type_names_of(self.ty(t1), self.ty(t2))
+    }
+
+    /// `compare_type_names` of two types already read from the arena.
+    pub fn compare_type_names_of(&self, ty1: &Type, ty2: &Type) -> i32 {
+        let s1 = type_name_symbol(ty1);
+        let s2 = type_name_symbol(ty2);
         if s1 == s2 {
-            return self.compare_type_lists(
-                self.ty(t1).alias.type_arguments(),
-                self.ty(t2).alias.type_arguments(),
-            );
+            return self.compare_type_lists(ty1.alias.type_arguments(), ty2.alias.type_arguments());
         }
         if s1.is_nil() {
             return 1;
@@ -1213,20 +1216,7 @@ impl Checker {
 
     // Go: checker/utilities.go:582 getTypeNameSymbol
     pub fn get_type_name_symbol(&self, t: TypeId) -> SymbolId {
-        let ty = self.ty(t);
-        if let Some(alias) = &ty.alias {
-            return alias.symbol;
-        }
-        if ty
-            .flags
-            .intersects(TypeFlags::TYPE_PARAMETER | TypeFlags::STRING_MAPPING)
-            || ty
-                .object_flags
-                .intersects(ObjectFlags::CLASS_OR_INTERFACE | ObjectFlags::REFERENCE)
-        {
-            return ty.symbol;
-        }
-        SymbolId::NIL
+        type_name_symbol(self.ty(t))
     }
 
     // Go: checker/utilities.go:592 getObjectTypeName
@@ -1240,6 +1230,23 @@ impl Checker {
         }
         SymbolId::NIL
     }
+}
+
+/// Go `getTypeNameSymbol` of a type already read from the arena.
+fn type_name_symbol(ty: &Type) -> SymbolId {
+    if let Some(alias) = &ty.alias {
+        return alias.symbol;
+    }
+    if ty
+        .flags
+        .intersects(TypeFlags::TYPE_PARAMETER | TypeFlags::STRING_MAPPING)
+        || ty
+            .object_flags
+            .intersects(ObjectFlags::CLASS_OR_INTERFACE | ObjectFlags::REFERENCE)
+    {
+        return ty.symbol;
+    }
+    SymbolId::NIL
 }
 
 // Go: checker/utilities.go:599 compareTupleTypes

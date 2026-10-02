@@ -110,7 +110,7 @@ const VNODE_FFLAGS: u32 = unix::NOTE_DELETE
     | unix::NOTE_RENAME
     | unix::NOTE_REVOKE;
 
-// Go: kqueue.go:85 openForEvents
+// Go: kqueue.go:88 openForEvents
 /// openForEvents opens a path for kqueue event monitoring. On darwin, O_EVTONLY
 /// opens the file for event notification without granting read access. On other
 /// BSDs, falls back to O_RDONLY.
@@ -124,7 +124,7 @@ pub fn open_for_events(path: &str) -> Result<i32, GoError> {
     unix::open(path, flags, 0)
 }
 
-// Go: kqueue.go:94 dirEntry
+// Go: kqueue.go:97 dirEntry
 /// dirEntry tracks a watched path for kqueue's fd↔path mapping.
 ///
 /// PORT: `is_dir` and `state` are atomics (see the file comment); `state`
@@ -161,7 +161,7 @@ impl DirEntry {
 /// PORT: Go `map[string]*dirEntry`, shared by pointer (see the file comment).
 pub type Entries = Arc<Mutex<FxHashMap<String, Arc<DirEntry>>>>;
 
-// Go: kqueue.go:102 kqueueSubscription
+// Go: kqueue.go:105 kqueueSubscription
 /// kqueueSubscription.
 pub struct KqueueSubscription {
     pub dir_watch: Arc<DirWatch>,
@@ -170,7 +170,7 @@ pub struct KqueueSubscription {
     pub fd: i32,
 }
 
-// Go: kqueue.go:111 kqueueBackend
+// Go: kqueue.go:114 kqueueBackend
 /// kqueueBackend. It embeds treeReaderBackend (via Go
 /// composition) just like the inheritance hierarchy.
 pub struct KqueueBackend {
@@ -204,7 +204,7 @@ pub struct KqueueLocked {
     pub fd_to_entry: FxHashMap<i32, Arc<DirEntry>>,
 }
 
-// Go: kqueue.go:130 init
+// Go: kqueue.go:133 init
 // PORT: Go's `init()` sets the factory on the package var `kqueueWatcher`;
 // the port's package var calls this when it is built.
 pub fn init(kqueue_watcher: &mut WatcherStruct) {
@@ -212,7 +212,7 @@ pub fn init(kqueue_watcher: &mut WatcherStruct) {
     kqueue_watcher.factory = Some(factory);
 }
 
-// Go: kqueue.go:134 newKqueueBackend
+// Go: kqueue.go:137 newKqueueBackend
 pub fn new_kqueue_backend() -> Arc<KqueueBackend> {
     Arc::new_cyclic(|self_: &Weak<KqueueBackend>| {
         let b = KqueueBackend {
@@ -268,7 +268,7 @@ fn is_strict_descendant(p: &str, path: &str) -> bool {
 }
 
 impl WatcherImpl for KqueueBackend {
-    // Go: kqueue.go:148 kqueueBackend.start
+    // Go: kqueue.go:151 kqueueBackend.start
     fn start(&self) -> Result<(), GoError> {
         let kq = match unix::kqueue() {
             Ok(kq) => kq,
@@ -388,7 +388,7 @@ impl WatcherImpl for KqueueBackend {
         self.ended_signal.wait();
     }
 
-    // Go: kqueue.go:462 kqueueBackend.subscribe
+    // Go: kqueue.go:457 kqueueBackend.subscribe
     /// subscribe mirrors `kqueueBackend::subscribe`. Called under watcherBase.mu
     /// via watchAdd.
     fn subscribe(&self, w: &Arc<DirWatch>) -> Result<(), GoError> {
@@ -462,7 +462,7 @@ impl WatcherImpl for KqueueBackend {
         Ok(())
     }
 
-    // Go: kqueue.go:748 kqueueBackend.closeWatch
+    // Go: kqueue.go:746 kqueueBackend.closeWatch
     /// closeWatch mirrors `kqueueBackend::closeWatch`.
     fn close_watch(&self, w: &Arc<DirWatch>) -> Result<(), GoError> {
         let mut l = self.mu.lock().unwrap();
@@ -507,7 +507,7 @@ fn watch_error(w: &Arc<DirWatch>, err: GoError) -> GoError {
 }
 
 impl KqueueBackend {
-    // Go: kqueue.go:247 kqueueBackend.closeFDs
+    // Go: kqueue.go:243 kqueueBackend.closeFDs
     pub fn close_fds(&self) {
         let mut pipe_fds = self.pipe_fds.lock().unwrap();
         if pipe_fds[0] >= 0 {
@@ -525,7 +525,7 @@ impl KqueueBackend {
         }
     }
 
-    // Go: kqueue.go:260 kqueueBackend.closeSubscriptions
+    // Go: kqueue.go:258 kqueueBackend.closeSubscriptions
     pub fn close_subscriptions(&self) {
         let mut l = self.mu.lock().unwrap();
         let mut seen_fds: FxHashSet<i32> = FxHashSet::default();
@@ -625,7 +625,7 @@ impl KqueueBackend {
         }
     }
 
-    // Go: kqueue.go:348 kqueueBackend.closeDescendantFDsLocked
+    // Go: kqueue.go:356 kqueueBackend.closeDescendantFDsLocked
     /// closeDescendantFDsLocked closes every fd attached to an entry whose
     /// path lives strictly under root, removing the kevent registration and
     /// the corresponding b.subsByPath / b.fdToEntry bookkeeping, and emits a
@@ -654,7 +654,7 @@ impl KqueueBackend {
         }
     }
 
-    // Go: kqueue.go:368 kqueueBackend.tryRewatchLocked
+    // Go: kqueue.go:375 kqueueBackend.tryRewatchLocked
     /// tryRewatchLocked checks whether a deleted path was immediately recreated
     /// with the same type. If so, it opens a new fd, registers a kqueue watch,
     /// and returns true. The caller should emit update instead of delete.
@@ -687,7 +687,7 @@ impl KqueueBackend {
         true
     }
 
-    // Go: kqueue.go:401 kqueueBackend.closeEntryLocked
+    // Go: kqueue.go:408 kqueueBackend.closeEntryLocked
     pub fn close_entry_locked(l: &mut KqueueLocked, entry: &DirEntry) {
         if let Some(fd) = entry.fd() {
             let _ = unix::close(fd);
@@ -696,7 +696,7 @@ impl KqueueBackend {
         }
     }
 
-    // Go: kqueue.go:409 kqueueBackend.removeSubsForEntriesLocked
+    // Go: kqueue.go:416 kqueueBackend.removeSubsForEntriesLocked
     pub fn remove_subs_for_entries_locked(l: &mut KqueueLocked, path: &str, entries: &Entries) {
         let Some(list) = l.subs_by_path.get_mut(path) else {
             return;
@@ -707,7 +707,7 @@ impl KqueueBackend {
         }
     }
 
-    // Go: kqueue.go:425 kqueueBackend.removeEntryAndDescendantsLocked
+    // Go: kqueue.go:432 kqueueBackend.removeEntryAndDescendantsLocked
     pub fn remove_entry_and_descendants_locked(
         l: &mut KqueueLocked,
         entries: &Entries,
@@ -731,12 +731,12 @@ impl KqueueBackend {
         }
     }
 
-    // Go: kqueue.go:440 kqueueBackend.findSubscriptionsLocked
+    // Go: kqueue.go:448 kqueueBackend.findSubscriptionsLocked
     pub fn find_subscriptions_locked(l: &KqueueLocked, path: &str) -> Vec<Arc<KqueueSubscription>> {
         l.subs_by_path.get(path).cloned().unwrap_or_default()
     }
 
-    // Go: kqueue.go:508 kqueueBackend.cleanupEntriesLocked
+    // Go: kqueue.go:521 kqueueBackend.cleanupEntriesLocked
     /// cleanupEntriesLocked closes fds for all entries that have been opened.
     /// Called on subscribe failure to avoid fd leaks. Must be called under b.mu.
     pub fn cleanup_entries_locked(
@@ -752,7 +752,7 @@ impl KqueueBackend {
         }
     }
 
-    // Go: kqueue.go:519 kqueueBackend.watchPath
+    // Go: kqueue.go:532 kqueueBackend.watchPath
     /// watchPath corresponds to `kqueueBackend::watchDir`.
     pub fn watch_path(&self, w: &Arc<DirWatch>, path: &str, entries: &Entries) -> bool {
         let entry = entries.lock().unwrap().get(path).cloned();
@@ -786,7 +786,7 @@ impl KqueueBackend {
         true
     }
 
-    // Go: kqueue.go:549 kqueueBackend.compareDir
+    // Go: kqueue.go:565 kqueueBackend.compareDir
     /// compareDir mirrors `kqueueBackend::compareDir`. Triggered when a watched
     /// directory has NOTE_WRITE: list the dir, diff against the tree, emit
     /// create/remove events.
@@ -1001,7 +1001,7 @@ pub fn read_entries(path: &str) -> Result<Vec<ReadEntry>, std::io::Error> {
         .collect())
 }
 
-// Go: kqueue.go:776 removeEntryAndDescendants
+// Go: kqueue.go:777 removeEntryAndDescendants
 /// removeEntryAndDescendants removes path and all paths prefixed with
 /// path + separator from the entries map.
 pub fn remove_entry_and_descendants(entries: &mut FxHashMap<String, Arc<DirEntry>>, path: &str) {

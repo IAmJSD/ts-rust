@@ -9,11 +9,11 @@ use crate::fswatch::prelude::*;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-// Go: debounce.go:8 defaultMinWaitTime, defaultMaxWaitTime
+// Go: debounce.go:9 defaultMinWaitTime, defaultMaxWaitTime
 pub const DEFAULT_MIN_WAIT_TIME: Duration = Duration::from_millis(50);
 pub const DEFAULT_MAX_WAIT_TIME: Duration = Duration::from_millis(500);
 
-// Go: debounce.go:13 minWaitTime, maxWaitTime
+// Go: debounce.go:14 minWaitTime, maxWaitTime
 // PORT: Go package vars that only tests change; statics here.
 pub static MIN_WAIT_TIME: Duration = DEFAULT_MIN_WAIT_TIME;
 pub static MAX_WAIT_TIME: Duration = DEFAULT_MAX_WAIT_TIME;

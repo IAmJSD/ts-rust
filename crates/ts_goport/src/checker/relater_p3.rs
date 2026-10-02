@@ -1181,21 +1181,21 @@ pub struct ErrorChain {
 // PORT: The Go `c *Checker` field is not stored. Every `(r *Relater)` method
 // is an `impl Checker` method that takes the handle `r: &Rc<RefCell<Relater>>`
 // right after `self` (same convention as relater_p4/p5). Borrows of `r` are
-// kept short and never held across a checker call. `relation` is never nil
-// while a relater is in use; a pooled relater holds a default `Relation` in
-// place of Go nil. `next` links the free list in `Checker::free_relater`.
+// kept short and never held across a checker call. Go `relation` is `kind`
+// (see `RelationKind`); a pooled relater keeps the last kind in place of Go
+// nil. `next` links the free list in `Checker::free_relater`.
 #[derive(Default)]
 pub struct Relater {
-    pub relation: Rc<RefCell<Relation>>,
+    pub kind: RelationKind,
     pub error_node: Node,
     pub error_chain: Option<Rc<ErrorChain>>,
     pub related_info: Vec<Diagnostic>,
-    pub maybe_keys: Vec<CacheHashKey>,
+    pub maybe_keys: Vec<RelationKey>,
     // PORT: perf. Go keeps the set in sync with `maybeKeys` at all times.
     // Here it is empty while `maybe_keys.len() <= MAYBE_KEYS_SCAN_LIMIT` and
     // holds exactly the stack keys above that. Use `maybe_keys_contain`,
     // `push_maybe_key` and `truncate_maybe_keys`, not the fields directly.
-    pub maybe_keys_set: CacheKeySet,
+    pub maybe_keys_set: RelationKeySet,
     pub source_stack: Vec<TypeId>,
     pub target_stack: Vec<TypeId>,
     // PORT: perf. Not in Go. `stack_recursion_id` of a prefix of
@@ -1225,13 +1225,13 @@ const MAYBE_KEYS_SET_KEEP_CAPACITY: usize = 256;
 
 // Empties the maybe keys set. Drops a large allocation instead of keeping it,
 // so an empty set never holds more than the keep capacity.
-fn clear_maybe_keys_set(set: &mut CacheKeySet) {
+fn clear_maybe_keys_set(set: &mut RelationKeySet) {
     // Clearing an empty set still costs time in its capacity.
     if set.is_empty() {
         return;
     }
     if set.capacity() > MAYBE_KEYS_SET_KEEP_CAPACITY {
-        *set = CacheKeySet::default();
+        *set = RelationKeySet::default();
     } else {
         set.clear();
     }
@@ -1242,7 +1242,7 @@ impl Relater {
     // 3099) with the same result: the stack keys are unique (a key is pushed
     // only when absent), and the set mirrors them above the scan limit.
     #[inline]
-    pub fn maybe_keys_contain(&self, key: &CacheHashKey) -> bool {
+    pub fn maybe_keys_contain(&self, key: &RelationKey) -> bool {
         if self.maybe_keys.len() <= MAYBE_KEYS_SCAN_LIMIT {
             self.maybe_keys.contains(key)
         } else {
@@ -1254,7 +1254,7 @@ impl Relater {
     // (relater.go:3108). The set is written only above the scan limit. The
     // push that crosses the limit fills it with every stack key.
     #[inline]
-    pub fn push_maybe_key(&mut self, key: CacheHashKey) {
+    pub fn push_maybe_key(&mut self, key: RelationKey) {
         self.maybe_keys.push(key);
         let len = self.maybe_keys.len();
         if len == MAYBE_KEYS_SCAN_LIMIT + 1 {
@@ -1298,12 +1298,15 @@ impl Relater {
 
 impl Checker {
     // Go: checker/relater.go:2566 getRelater
+    // PORT: perf. The pool head and `next` are moved out, not cloned. Go
+    // leaves `r.next` set while `r` is in use; nothing reads it then, and
+    // `putRelater` sets it again.
     pub fn get_relater(&mut self) -> Rc<RefCell<Relater>> {
-        let r = match self.free_relater.clone() {
+        let r = match self.free_relater.take() {
             Some(r) => r,
             None => Rc::new(RefCell::new(Relater::default())),
         };
-        self.free_relater = r.borrow().next.clone();
+        self.free_relater = r.borrow_mut().next.take();
         r
     }
 
@@ -1319,9 +1322,9 @@ impl Checker {
             // compile until it is reset here.
             let Relater {
                 // PORT: Go sets `relation` to nil. The pooled relater keeps
-                // the last checker relation. The next `getRelater` user always
-                // sets it first.
-                relation: _,
+                // the last kind. The next `getRelater` user always sets it
+                // first.
+                kind: _,
                 error_node,
                 error_chain,
                 related_info,
@@ -1434,8 +1437,8 @@ impl Checker {
         if original_source == original_target {
             return Ternary::TRUE;
         }
-        let relation = r.borrow().relation.clone();
-        let is_comparable = Rc::ptr_eq(&relation, &self.comparable_relation);
+        let kind = r.borrow().kind;
+        let is_comparable = kind == RelationKind::Comparable;
         // Before normalization: if `source` is type an object type, and `target` is primitive,
         // skip all the checks we don't need and just return `isSimpleTypeRelatedTo` result
         if self.ty(original_source).flags.intersects(TypeFlags::OBJECT)
@@ -1446,12 +1449,12 @@ impl Checker {
         {
             if is_comparable
                 && !self.ty(original_target).flags.intersects(TypeFlags::NEVER)
-                && self.is_simple_type_related_to(original_target, original_source, &relation, None)
+                && self.is_simple_type_related_to_kind(original_target, original_source, kind, None)
                 || if report_errors {
-                    self.is_simple_type_related_to(
+                    self.is_simple_type_related_to_kind(
                         original_source,
                         original_target,
-                        &relation,
+                        kind,
                         Some(&mut |c: &mut Checker,
                                    message: &'static Message,
                                    args: Vec<String>| {
@@ -1459,10 +1462,10 @@ impl Checker {
                         }),
                     )
                 } else {
-                    self.is_simple_type_related_to(
+                    self.is_simple_type_related_to_kind(
                         original_source,
                         original_target,
-                        &relation,
+                        kind,
                         None,
                     )
                 }
@@ -1490,7 +1493,7 @@ impl Checker {
         if source == target {
             return Ternary::TRUE;
         }
-        if Rc::ptr_eq(&relation, &self.identity_relation) {
+        if kind == RelationKind::Identity {
             if self.ty(source).flags != self.ty(target).flags {
                 return Ternary::FALSE;
             }
@@ -1544,12 +1547,12 @@ impl Checker {
         }
         if is_comparable
             && !self.ty(target).flags.intersects(TypeFlags::NEVER)
-            && self.is_simple_type_related_to(target, source, &relation, None)
+            && self.is_simple_type_related_to_kind(target, source, kind, None)
             || if report_errors {
-                self.is_simple_type_related_to(
+                self.is_simple_type_related_to_kind(
                     source,
                     target,
-                    &relation,
+                    kind,
                     Some(
                         &mut |c: &mut Checker, message: &'static Message, args: Vec<String>| {
                             c.report_error(r, message, args)
@@ -1557,7 +1560,7 @@ impl Checker {
                     ),
                 )
             } else {
-                self.is_simple_type_related_to(source, target, &relation, None)
+                self.is_simple_type_related_to_kind(source, target, kind, None)
             }
         {
             return Ternary::TRUE;
@@ -1728,9 +1731,8 @@ impl Checker {
             .ty(source)
             .object_flags
             .intersects(ObjectFlags::JSX_ATTRIBUTES);
-        let relation = r.borrow().relation.clone();
-        if (Rc::ptr_eq(&relation, &self.assignable_relation)
-            || Rc::ptr_eq(&relation, &self.comparable_relation))
+        let kind = r.borrow().kind;
+        if (kind == RelationKind::Assignable || kind == RelationKind::Comparable)
             && (self.is_type_subset_of(self.global_object_type, target)
                 || (!is_comparing_jsx_attributes && self.is_empty_object_type(target)))
         {

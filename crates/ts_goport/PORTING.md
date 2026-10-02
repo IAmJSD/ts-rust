@@ -1215,12 +1215,20 @@ each message and after each wake-up. Go `WaitForBackgroundTasks` runs
 
 ### Not ported (plan level)
 
-- The kqueue, FSEvents and Windows file watchers. The in-process LSP
-  watcher (`lsp/lspwatcher`) needs one of them, so on Linux it is never
-  made (as in Go) and its callback delivery stays `unported!`. The Linux
-  watchers (fanotify, inotify) are ported in `src/fswatch/unix.rs` with
-  safe crates (`nix::sys::fanotify`, `name-to-handle-at`, `rustix`, `std`;
-  D-W1). No `libc`, no `unsafe`.
+- The FSEvents file watcher (macOS). There `fswatch::default()` picks
+  kqueue, which is Go's choice when FSEvents is not available. The other
+  watchers are ported with safe crates (D-W1, no `libc`, no `unsafe`):
+  inotify and fanotify (`src/fswatch/{inotify,fanotify}_linux.rs` on the
+  `unix.rs` shim: `nix::sys::fanotify`, `name-to-handle-at`, `rustix`,
+  `std`), kqueue (`kqueue.rs` on `unix_bsd.rs`) and Windows (`windows.rs`
+  on the `notify` crate). The server makes the in-process LSP watcher
+  (`lsp/lspwatcher`) only when the default watcher has a fast recursive
+  backend, so on Linux it is never made (as in Go).
+- Native path folding in fswatch (ts#64210, `pathcompare.rs`). Go ignores
+  case only for fsevents and kqueue watches on a darwin volume that
+  `pathconf` reports as case-insensitive, and folds with CoreFoundation.
+  The port has no safe `pathconf` and no CoreFoundation, so its path
+  comparer compares bytes on every target, as Go does on Linux.
 - One dispatch thread (see "Threads"): the server answers requests in
   arrival order, where Go runs the async part of a request on a goroutine
   and answers in finish order. Timers and background tasks run at message

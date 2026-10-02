@@ -626,21 +626,24 @@ pub fn is_export_or_export_expression(location: Node) -> bool {
 }
 
 // Go: checker/checker.go:28126 shouldMarkIdentifierAliasReferenced
+// PERF: chkA. The parent and the great-grandparent come with their kinds
+// (`node_parent_and_kind`, one store lookup each), so each node is looked up
+// once. The tests and their order are Go's.
 pub fn should_mark_identifier_alias_referenced(node: Node) -> bool {
-    let parent = node.parent();
+    let (parent, parent_kind) = node_parent_and_kind(node);
     if parent.is_some() {
         // A property access expression LHS? checkPropertyAccessExpression will handle that.
-        if is_property_access_expression(parent) && parent.expression() == node {
+        if parent_kind == SyntaxKind::PropertyAccessExpression && parent.expression() == node {
             return false;
         }
         // Next two check for an identifier inside a type only export.
-        if is_export_specifier(parent) && parent.is_type_only() {
+        if parent_kind == SyntaxKind::ExportSpecifier && parent.is_type_only() {
             return false;
         }
-        if parent.parent().is_some() {
-            let great_grandparent = parent.parent().parent();
-            if great_grandparent.is_some()
-                && is_export_declaration(great_grandparent)
+        let grandparent = parent.parent();
+        if grandparent.is_some() {
+            let (great_grandparent, great_grandparent_kind) = node_parent_and_kind(grandparent);
+            if great_grandparent_kind == SyntaxKind::ExportDeclaration
                 && great_grandparent.is_type_only()
             {
                 return false;

@@ -123,14 +123,14 @@ use std::os::unix::ffi::OsStrExt;
 //   deferred closeFDs closes fanotify fd, pipe fds, and signals endedSignal.
 // ---------------------------------------------------------------------------
 
-// Go: fanotify_linux.go:114 fanotifyInitFlags
+// Go: fanotify_linux.go:115 fanotifyInitFlags
 pub const FANOTIFY_INIT_FLAGS: u32 = unix::FAN_CLASS_NOTIF
     | unix::FAN_CLOEXEC
     | unix::FAN_NONBLOCK
     | unix::FAN_REPORT_FID
     | unix::FAN_REPORT_DFID_NAME;
 
-// Go: fanotify_linux.go:117 fanotifyMarkMaskBase
+// Go: fanotify_linux.go:118 fanotifyMarkMaskBase
 pub const FANOTIFY_MARK_MASK_BASE: u64 = unix::FAN_CREATE
     | unix::FAN_DELETE
     | unix::FAN_MODIFY
@@ -139,23 +139,23 @@ pub const FANOTIFY_MARK_MASK_BASE: u64 = unix::FAN_CREATE
     | unix::FAN_ONDIR
     | unix::FAN_EVENT_ON_CHILD;
 
-// Go: fanotify_linux.go:122 fanotifyMarkMaskRename
+// Go: fanotify_linux.go:123 fanotifyMarkMaskRename
 // Used when FAN_RENAME is available (Linux 5.17+).
 pub const FANOTIFY_MARK_MASK_RENAME: u64 = FANOTIFY_MARK_MASK_BASE | unix::FAN_RENAME;
 
-// Go: fanotify_linux.go:125 fanotifyMarkMaskMovedFromTo
+// Go: fanotify_linux.go:126 fanotifyMarkMaskMovedFromTo
 // Fallback when FAN_RENAME is not available.
 pub const FANOTIFY_MARK_MASK_MOVED_FROM_TO: u64 =
     FANOTIFY_MARK_MASK_BASE | unix::FAN_MOVED_FROM | unix::FAN_MOVED_TO;
 
-// Go: fanotify_linux.go:127 fanotifyMarkAddFlags
+// Go: fanotify_linux.go:128 fanotifyMarkAddFlags
 pub const FANOTIFY_MARK_ADD_FLAGS: u32 =
     unix::FAN_MARK_ADD | unix::FAN_MARK_ONLYDIR | unix::FAN_MARK_DONT_FOLLOW;
 
-// Go: fanotify_linux.go:129 fanotifyBufferSize
+// Go: fanotify_linux.go:130 fanotifyBufferSize
 pub const FANOTIFY_BUFFER_SIZE: usize = 8192;
 
-// Go: fanotify_linux.go:134 fanotifyHandleKey
+// Go: fanotify_linux.go:135 fanotifyHandleKey
 /// fanotifyHandleKey uniquely identifies a filesystem object by its fsid and
 /// file handle. Used as a map key for watch dispatch.
 ///
@@ -169,7 +169,7 @@ pub struct FanotifyHandleKey {
     pub handle: Vec<u8>,
 }
 
-// Go: fanotify_linux.go:140 makeFanotifyHandleKey
+// Go: fanotify_linux.go:141 makeFanotifyHandleKey
 pub fn make_fanotify_handle_key(
     fsid: [i32; 2],
     handle_type: i32,
@@ -182,7 +182,7 @@ pub fn make_fanotify_handle_key(
     }
 }
 
-// Go: fanotify_linux.go:149 fanotifySubscription
+// Go: fanotify_linux.go:150 fanotifySubscription
 /// fanotifySubscription mirrors inotifySubscription for the fanotify backend.
 pub struct FanotifySubscription {
     pub path: String,
@@ -191,7 +191,7 @@ pub struct FanotifySubscription {
     pub key: FanotifyHandleKey,
 }
 
-// Go: fanotify_linux.go:156 fanotifyDfidName
+// Go: fanotify_linux.go:158 fanotifyDfidName
 /// fanotifyDfidName holds parsed directory FID + name from an info record.
 #[derive(Clone, Debug)]
 pub struct FanotifyDfidName {
@@ -200,7 +200,7 @@ pub struct FanotifyDfidName {
     pub name: String,
 }
 
-// Go: fanotify_linux.go:162 fanotifyBackend
+// Go: fanotify_linux.go:164 fanotifyBackend
 /// fanotifyBackend is the fanotify-based watcher backend for Linux.
 pub struct FanotifyBackend {
     pub base: WatcherBase,
@@ -230,7 +230,7 @@ pub struct FanotifyLocked {
     pub subscriptions: FxHashMap<FanotifyHandleKey, Vec<Arc<FanotifySubscription>>>,
 }
 
-// Go: fanotify_linux.go:180 init
+// Go: fanotify_linux.go:182 init
 // PORT: Go's `init()` sets the factory on the package var
 // `fanotifyWatcher`; the port's package var calls this when it is built.
 pub fn init(fanotify_watcher: &mut WatcherStruct) {
@@ -260,7 +260,7 @@ pub fn fanotify_available() -> bool {
     true
 }
 
-// Go: fanotify_linux.go:201 newFanotifyBackend
+// Go: fanotify_linux.go:206 newFanotifyBackend
 /// newFanotifyBackend creates a fanotify backend. If noRename is true, the
 /// backend skips the FAN_RENAME probe and forces the FAN_MOVED_FROM/FAN_MOVED_TO
 /// fallback path; this is only used by the fanotify-no-rename test watcher to
@@ -300,7 +300,7 @@ impl Drop for FanotifyStartDefer<'_> {
 }
 
 impl WatcherImpl for FanotifyBackend {
-    // Go: fanotify_linux.go:216 fanotifyBackend.start
+    // Go: fanotify_linux.go:221 fanotifyBackend.start
     fn start(&self) -> Result<(), GoError> {
         let mut pipe_fds = self.locked.lock().unwrap().pipe_fds;
         if let Err(err) = unix::pipe2(&mut pipe_fds, unix::O_CLOEXEC | unix::O_NONBLOCK) {
@@ -363,7 +363,7 @@ impl WatcherImpl for FanotifyBackend {
         Ok(())
     }
 
-    // Go: fanotify_linux.go:277 fanotifyBackend.shutdown
+    // Go: fanotify_linux.go:282 fanotifyBackend.shutdown
     fn shutdown(&self) {
         let fd = self.pipe_write_fd.load(Ordering::SeqCst);
         if fd < 0 {
@@ -373,7 +373,7 @@ impl WatcherImpl for FanotifyBackend {
         self.ended_signal.wait();
     }
 
-    // Go: fanotify_linux.go:286 fanotifyBackend.subscribe
+    // Go: fanotify_linux.go:291 fanotifyBackend.subscribe
     fn subscribe(&self, w: &Arc<DirWatch>) -> Result<(), GoError> {
         // Probe FAN_RENAME on the first subscribe using the actual watch
         // directory. FAN_RENAME (Linux 5.17+) yields a single paired event
@@ -475,7 +475,7 @@ impl WatcherImpl for FanotifyBackend {
         Ok(())
     }
 
-    // Go: fanotify_linux.go:723 fanotifyBackend.closeWatch
+    // Go: fanotify_linux.go:736 fanotifyBackend.closeWatch
     fn close_watch(&self, w: &Arc<DirWatch>) -> Result<(), GoError> {
         let mut l = self.locked.lock().unwrap();
         let fanotify_fd = l.fanotify_fd;
@@ -523,7 +523,7 @@ impl WatcherImpl for FanotifyBackend {
 }
 
 impl FanotifyBackend {
-    // Go: fanotify_linux.go:260 fanotifyBackend.closeFDs
+    // Go: fanotify_linux.go:265 fanotifyBackend.closeFDs
     pub fn close_fds(&self) {
         let _b = self.base.mu.lock().unwrap();
         let mut l = self.locked.lock().unwrap();
@@ -605,7 +605,7 @@ impl FanotifyBackend {
         Ok(())
     }
 
-    // Go: fanotify_linux.go:367 fanotifyBackend.handleEvents
+    // Go: fanotify_linux.go:380 fanotifyBackend.handleEvents
     /// handleEvents reads and dispatches fanotify events from the fd.
     pub fn handle_events(&self) -> Result<(), GoError> {
         let mut buf = self.read_buf.lock().unwrap();
@@ -682,7 +682,7 @@ impl FanotifyBackend {
         Ok(())
     }
 
-    // Go: fanotify_linux.go:426 fanotifyBackend.handleOverflow
+    // Go: fanotify_linux.go:439 fanotifyBackend.handleOverflow
     pub fn handle_overflow(&self, touched: &mut FxHashMap<usize, Arc<DirWatch>>) {
         let _b = self.base.mu.lock().unwrap();
         let l = self.locked.lock().unwrap();
@@ -700,7 +700,7 @@ impl FanotifyBackend {
         }
     }
 
-    // Go: fanotify_linux.go:442 fanotifyBackend.handleRenameEvent
+    // Go: fanotify_linux.go:455 fanotifyBackend.handleRenameEvent
     pub fn handle_rename_event(
         &self,
         mask: u64,
@@ -774,7 +774,7 @@ impl FanotifyBackend {
             .unwrap_or_default()
     }
 
-    // Go: fanotify_linux.go:484 fanotifyBackend.handleParsedEvent
+    // Go: fanotify_linux.go:497 fanotifyBackend.handleParsedEvent
     pub fn handle_parsed_event(
         &self,
         mask: u64,
@@ -797,7 +797,7 @@ impl FanotifyBackend {
         }
     }
 
-    // Go: fanotify_linux.go:498 fanotifyBackend.handleSubscription
+    // Go: fanotify_linux.go:511 fanotifyBackend.handleSubscription
     pub fn handle_subscription(
         &self,
         mask: u64,
@@ -907,7 +907,7 @@ impl FanotifyBackend {
         touched
     }
 
-    // Go: fanotify_linux.go:683 fanotifyBackend.dropSubsForPathLocked
+    // Go: fanotify_linux.go:696 fanotifyBackend.dropSubsForPathLocked
     /// dropSubsForPathLocked removes every subscription whose s.path equals
     /// path, regardless of which fanotify handle key it lives under. Must be
     /// called with b.mu held.
@@ -919,7 +919,7 @@ impl FanotifyBackend {
         });
     }
 
-    // Go: fanotify_linux.go:706 fanotifyBackend.dropSubsForPathAndDescendantsLocked
+    // Go: fanotify_linux.go:719 fanotifyBackend.dropSubsForPathAndDescendantsLocked
     /// dropSubsForPathAndDescendantsLocked removes every subscription whose
     /// s.path equals path or lives strictly under path. The kernel mark on
     /// the moved-out inode itself remains active (fanotify provides no
@@ -955,7 +955,7 @@ pub fn maybe_wrap_unsupported_filesystem(err: GoError) -> GoError {
     err
 }
 
-// Go: fanotify_linux.go:589 parseFanotifyDfidNames
+// Go: fanotify_linux.go:602 parseFanotifyDfidNames
 /// parseFanotifyDfidNames extracts DFID_NAME info records from the event's
 /// info record area. Returns a primary record (DFID_NAME or OLD_DFID_NAME)
 /// and an optional second record (NEW_DFID_NAME, for FAN_RENAME events).
@@ -1017,7 +1017,7 @@ pub fn parse_fanotify_dfid_names(
     (primary, rename)
 }
 
-// Go: fanotify_linux.go:636 parseFanotifyFidRecord
+// Go: fanotify_linux.go:649 parseFanotifyFidRecord
 /// parseFanotifyFidRecord parses a single fanotify_event_info_fid record.
 pub fn parse_fanotify_fid_record(data: &[u8], has_name: bool) -> Option<FanotifyDfidName> {
     const INFO_HDR_SIZE: usize = 4;

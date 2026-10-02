@@ -14,8 +14,8 @@ use crate::prelude::*;
 // use of the same relater is safe.
 
 /// Go `r.relation == rel` (pointer equality of `*Relation`).
-fn relation_is(r: &Rc<RefCell<Relater>>, rel: &Rc<RefCell<Relation>>) -> bool {
-    Rc::ptr_eq(&r.borrow().relation, rel)
+fn relation_is(r: &Rc<RefCell<Relater>>, kind: RelationKind) -> bool {
+    r.borrow().kind == kind
 }
 
 /// Go `a == b` on `*ErrorChain` values (pointer equality, nil == nil).
@@ -219,7 +219,7 @@ impl Checker {
                 }
             }
             let source_is_primitive = self.ty(source).flags.intersects(TypeFlags::PRIMITIVE);
-            if relation_is(r, &self.comparable_relation) {
+            if relation_is(r, RelationKind::Comparable) {
                 return self.some_type_related_to_type(
                     r,
                     source,
@@ -263,7 +263,7 @@ impl Checker {
         // intersection may further constrain the constraints of the non-primitive types. For example, given a type
         // parameter 'T extends 1 | 2', the intersection 'T & 1' should be reduced to '1' such that it doesn't
         // appear to be comparable to '2'.
-        if relation_is(r, &self.comparable_relation)
+        if relation_is(r, RelationKind::Comparable)
             && self.ty(target).flags.intersects(TypeFlags::PRIMITIVE)
         {
             // PORT: Go `core.SameMap` returns the original slice when no element
@@ -456,7 +456,7 @@ impl Checker {
                 return Ternary::TRUE;
             }
             let source_flags = self.ty(source).flags;
-            if !relation_is(r, &self.comparable_relation)
+            if !relation_is(r, RelationKind::Comparable)
                 && self
                     .ty(target)
                     .object_flags
@@ -466,8 +466,8 @@ impl Checker {
                     TypeFlags::STRING_LITERAL
                         | TypeFlags::BOOLEAN_LITERAL
                         | TypeFlags::BIG_INT_LITERAL,
-                ) || (relation_is(r, &self.subtype_relation)
-                    || relation_is(r, &self.strict_subtype_relation))
+                ) || (relation_is(r, RelationKind::Subtype)
+                    || relation_is(r, RelationKind::StrictSubtype))
                     && source_flags.intersects(TypeFlags::NUMBER_LITERAL))
             {
                 // When relating a literal type to a union of primitive types, we know the relation is false unless
@@ -623,12 +623,17 @@ impl Checker {
         intersection_state: IntersectionState,
         recursion_flags: RecursionFlags,
     ) -> Ternary {
-        if r.borrow().overflow {
+        // PORT: perf. One borrow of `r` for `overflow` and the relation.
+        let (overflow, kind) = {
+            let rb = r.borrow();
+            (rb.overflow, rb.kind)
+        };
+        if overflow {
             // Note that stack depth overflows can cause _any_ relation involving structured types to become false, so it is
             // important to have well-defined behavior even in cases that shouldn't normally occur.
             return Ternary::FALSE;
         }
-        let is_identity = relation_is(r, &self.identity_relation);
+        let is_identity = kind == RelationKind::Identity;
         let (id, constrained) = self.get_relation_key(
             source,
             target,
@@ -636,7 +641,7 @@ impl Checker {
             is_identity,
             false, /*ignoreConstraints*/
         );
-        let entry = r.borrow().relation.borrow().get(id);
+        let entry = self.relation_of(kind).borrow().get(id);
         if entry != RelationComparisonResult::NONE {
             if report_errors
                 && entry.intersects(RelationComparisonResult::FAILED)
@@ -663,15 +668,19 @@ impl Checker {
                 return Ternary::FALSE;
             }
         }
-        if r.borrow().relation_count <= 0 {
-            r.borrow_mut().overflow = true;
-            return Ternary::FALSE;
-        }
-        // If source and target are already being compared, consider them related with assumptions
-        // PORT: perf. A linear scan while the stack is small (see
-        // `Relater::maybe_keys_contain`).
-        if r.borrow().maybe_keys_contain(&id) {
-            return Ternary::MAYBE;
+        {
+            // PORT: perf. One borrow of `r` for both tests.
+            let mut rb = r.borrow_mut();
+            if rb.relation_count <= 0 {
+                rb.overflow = true;
+                return Ternary::FALSE;
+            }
+            // If source and target are already being compared, consider them related with assumptions
+            // PORT: perf. A linear scan while the stack is small (see
+            // `Relater::maybe_keys_contain`).
+            if rb.maybe_keys_contain(&id) {
+                return Ternary::MAYBE;
+            }
         }
         // A constrained key indicates that we have type references that reference constrained
         // type parameters. For such keys we also check against the key we would have gotten if all type parameters
@@ -691,7 +700,7 @@ impl Checker {
         // PORT: one borrow for the stack pushes. The borrow is held across
         // isDeeplyNestedType, which cannot reach `r` (it is not in the
         // relater pool while in use).
-        let (maybe_start, save_expanding_flags) = {
+        let (maybe_start, save_expanding_flags, expanding_flags) = {
             let mut guard = r.borrow_mut();
             // Reborrow so the stack and its ids can be borrowed apart.
             let rb = &mut *guard;
@@ -730,14 +739,14 @@ impl Checker {
                     rb.expanding_flags |= ExpandingFlags::TARGET;
                 }
             }
-            (maybe_start, save_expanding_flags)
+            (maybe_start, save_expanding_flags, rb.expanding_flags)
         };
         let save_reliability_flags = self.reliability_flags;
         self.reliability_flags = RelationComparisonResult::NONE;
         // Go `defer tr.Push(...)()` in the else branch: the event ends when
         // the function returns.
         let mut _trace: Option<crate::tracing::Pop> = None;
-        let result = if r.borrow().expanding_flags == ExpandingFlags::BOTH {
+        let result = if expanding_flags == ExpandingFlags::BOTH {
             if let Some(tr) = self.tracer {
                 let (depth, target_depth) = {
                     let rb = r.borrow();
@@ -799,7 +808,7 @@ impl Checker {
             // A false result goes straight into global cache (when something is false under
             // assumptions it will also be false without assumptions)
             let mut rb = r.borrow_mut();
-            rb.relation.borrow_mut().set(
+            self.relation_of(rb.kind).borrow_mut().set(
                 id,
                 RelationComparisonResult::FAILED | propagating_variance_flags,
             );
@@ -823,7 +832,7 @@ impl Checker {
         let rb = &mut *guard;
         let maybe_start = maybe_start as usize;
         if mark_all_as_succeeded {
-            let mut relation = rb.relation.borrow_mut();
+            let mut relation = self.relation_of(rb.kind).borrow_mut();
             for &key in &rb.maybe_keys[maybe_start..] {
                 relation.set(
                     key,
@@ -879,7 +888,7 @@ impl Checker {
             report_errors,
             intersection_state,
         );
-        if !relation_is(r, &self.identity_relation) {
+        if !relation_is(r, RelationKind::Identity) {
             // The combined constraint of an intersection type is the intersection of the constraints of
             // the constituents. When an intersection type contains instantiable types with union type
             // constraints, there are situations where we need to examine the combined constraint. One is
@@ -1032,7 +1041,7 @@ impl Checker {
         let mut original_error_chain: Option<Rc<ErrorChain>> = None;
         let save_error_state = self.get_error_state(r);
         // PORT: the Go closure `relateVariances` is the free fn `relate_variances`.
-        let is_identity = relation_is(r, &self.identity_relation);
+        let is_identity = relation_is(r, RelationKind::Identity);
         let source_flags = self.ty(source).flags;
         let target_flags = self.ty(target).flags;
         if is_identity {
@@ -1359,7 +1368,7 @@ impl Checker {
                     }
                 }
             }
-            if relation_is(r, &self.comparable_relation)
+            if relation_is(r, RelationKind::Comparable)
                 && source_flags.intersects(TypeFlags::TYPE_PARAMETER)
             {
                 // This is a carve-out in comparability to essentially forbid comparing a type parameter with another type parameter
@@ -1406,8 +1415,7 @@ impl Checker {
             }
             // A type S is related to a type T[K] if S is related to C, where C is the base
             // constraint of T[K] for writing.
-            if relation_is(r, &self.assignable_relation)
-                || relation_is(r, &self.comparable_relation)
+            if relation_is(r, RelationKind::Assignable) || relation_is(r, RelationKind::Comparable)
             {
                 let (object_type, index_type) = {
                     let d = self.ty(target).as_indexed_access_type();
@@ -1628,7 +1636,7 @@ impl Checker {
             }
         } else if target_flags.intersects(TypeFlags::TEMPLATE_LITERAL) {
             if source_flags.intersects(TypeFlags::TEMPLATE_LITERAL) {
-                if relation_is(r, &self.comparable_relation) {
+                if relation_is(r, RelationKind::Comparable) {
                     let unrelated = self.template_literal_types_definitely_unrelated(
                         self.ty(source).as_template_literal_type(),
                         self.ty(target).as_template_literal_type(),
@@ -1661,7 +1669,7 @@ impl Checker {
                     return Ternary::TRUE;
                 }
             }
-        } else if self.is_generic_mapped_type(target) && !relation_is(r, &self.identity_relation) {
+        } else if self.is_generic_mapped_type(target) && !relation_is(r, RelationKind::Identity) {
             // Check if source type `S` is related to target type `{ [P in Q]: T }` or `{ [P in Q as R]: T}`.
             let keys_remapped = self
                 .ty(target)
@@ -2083,8 +2091,8 @@ impl Checker {
             }
         } else {
             // An empty object type is related to any mapped type that includes a '?' modifier.
-            if !relation_is(r, &self.subtype_relation)
-                && !relation_is(r, &self.strict_subtype_relation)
+            if !relation_is(r, RelationKind::Subtype)
+                && !relation_is(r, RelationKind::StrictSubtype)
                 && self.is_partial_mapped_type(target)
                 && self.is_empty_object_type(source)
             {
@@ -2100,7 +2108,7 @@ impl Checker {
                 return Ternary::FALSE;
             }
             let source_is_primitive = source_flags.intersects(TypeFlags::PRIMITIVE);
-            if !relation_is(r, &self.identity_relation) {
+            if !relation_is(r, RelationKind::Identity) {
                 source = self.get_apparent_type(source);
             } else if self.is_generic_mapped_type(source) {
                 return Ternary::FALSE;
@@ -2159,7 +2167,7 @@ impl Checker {
                         c.is_mutable_tuple_type(t)
                     }))
             {
-                if !relation_is(r, &self.identity_relation) {
+                if !relation_is(r, RelationKind::Identity) {
                     let number_type = self.number_type;
                     let any_type = self.any_type;
                     let s = self.get_index_type_of_type_ex(source, number_type, any_type);
@@ -2183,8 +2191,8 @@ impl Checker {
                         report_errors,
                     );
                 }
-            } else if (relation_is(r, &self.subtype_relation)
-                || relation_is(r, &self.strict_subtype_relation))
+            } else if (relation_is(r, RelationKind::Subtype)
+                || relation_is(r, RelationKind::StrictSubtype))
                 && self.is_empty_object_type(target)
                 && target_object_flags.intersects(ObjectFlags::FRESH_LITERAL)
                 && !self.is_empty_object_type(source)

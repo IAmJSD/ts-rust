@@ -107,7 +107,7 @@ pub struct InotifySubscription {
     pub wd: i32,
 }
 
-// Go: inotify_linux.go:98 inotifyBackend
+// Go: inotify_linux.go:99 inotifyBackend
 /// inotifyBackend.
 pub struct InotifyBackend {
     pub base: WatcherBase,
@@ -136,7 +136,7 @@ pub struct InotifyLocked {
     pub subscriptions: FxHashMap<i32, Vec<Arc<InotifySubscription>>>,
 }
 
-// Go: inotify_linux.go:116 init
+// Go: inotify_linux.go:117 init
 // PORT: Go's `init()` sets the factory on the package var
 // `inotifyWatcher`; the port's package var calls this when it is built.
 pub fn init(inotify_watcher: &mut WatcherStruct) {
@@ -144,7 +144,7 @@ pub fn init(inotify_watcher: &mut WatcherStruct) {
     inotify_watcher.factory = Some(factory);
 }
 
-// Go: inotify_linux.go:120 newInotifyBackend
+// Go: inotify_linux.go:121 newInotifyBackend
 pub fn new_inotify_backend() -> Arc<InotifyBackend> {
     Arc::new_cyclic(|self_: &Weak<InotifyBackend>| {
         let b = InotifyBackend {
@@ -178,7 +178,7 @@ impl Drop for InotifyStartDefer<'_> {
 }
 
 impl WatcherImpl for InotifyBackend {
-    // Go: inotify_linux.go:135 inotifyBackend.start
+    // Go: inotify_linux.go:136 inotifyBackend.start
     /// start mirrors `inotifyBackend::start`.
     fn start(&self) -> Result<(), GoError> {
         // Create a pipe so we can wake the poll(2) loop on shutdown.
@@ -239,7 +239,7 @@ impl WatcherImpl for InotifyBackend {
         Ok(())
     }
 
-    // Go: inotify_linux.go:203 inotifyBackend.shutdown
+    // Go: inotify_linux.go:204 inotifyBackend.shutdown
     /// shutdown is the equivalent of the destructor's pipe-write+wait.
     /// Called by removeSharedBackend when the last watch drops. Reads
     /// the pipe write fd via atomic so it's safe to race against the start
@@ -253,7 +253,7 @@ impl WatcherImpl for InotifyBackend {
         self.ended_signal.wait();
     }
 
-    // Go: inotify_linux.go:214 inotifyBackend.subscribe
+    // Go: inotify_linux.go:215 inotifyBackend.subscribe
     /// subscribe mirrors `inotifyBackend::subscribe`. Called via the watcherBase
     /// virtual dispatch under b.mu (so it's serialized against handleEvent).
     fn subscribe(&self, w: &Arc<DirWatch>) -> Result<(), GoError> {
@@ -299,7 +299,7 @@ impl WatcherImpl for InotifyBackend {
         Ok(())
     }
 
-    // Go: inotify_linux.go:395 inotifyBackend.closeWatch
+    // Go: inotify_linux.go:399 inotifyBackend.closeWatch
     /// closeWatch mirrors `inotifyBackend::closeWatch`. Iterates every wd that
     /// referenced w and removes the matching subscriptions. If a kernel
     /// InotifyRmWatch fails we keep processing remaining wds and return the
@@ -347,7 +347,7 @@ impl WatcherImpl for InotifyBackend {
 }
 
 impl InotifyBackend {
-    // Go: inotify_linux.go:182 inotifyBackend.closeFDs
+    // Go: inotify_linux.go:183 inotifyBackend.closeFDs
     /// closeFDs runs in the start goroutine after the poll loop exits. Takes
     /// b.mu so the writes to b.inotify / b.pipeFDs synchronize-against the
     /// reads in closeWatch / subscribe (both of which run under b.mu).
@@ -369,7 +369,7 @@ impl InotifyBackend {
         }
     }
 
-    // Go: inotify_linux.go:244 inotifyBackend.watchDir
+    // Go: inotify_linux.go:246 inotifyBackend.watchDir
     /// watchDir registers an inotify watch on path and records the resulting
     /// subscription. Returns the kernel watch descriptor on success.
     pub fn watch_dir(
@@ -396,7 +396,7 @@ impl InotifyBackend {
         Ok(wd)
     }
 
-    // Go: inotify_linux.go:255 inotifyBackend.handleEvents
+    // Go: inotify_linux.go:257 inotifyBackend.handleEvents
     /// handleEvents mirrors `inotifyBackend::handleEvents`.
     pub fn handle_events(&self) -> Result<(), GoError> {
         let mut buf = self.read_buf.lock().unwrap();
@@ -469,7 +469,7 @@ impl InotifyBackend {
         Ok(())
     }
 
-    // Go: inotify_linux.go:312 inotifyBackend.handleEvent
+    // Go: inotify_linux.go:314 inotifyBackend.handleEvent
     /// handleEvent mirrors `inotifyBackend::handleEvent`.
     pub fn handle_event(
         &self,
@@ -502,7 +502,7 @@ impl InotifyBackend {
         }
     }
 
-    // Go: inotify_linux.go:328 inotifyBackend.handleSubscription
+    // Go: inotify_linux.go:330 inotifyBackend.handleSubscription
     /// handleSubscription mirrors `inotifyBackend::handleSubscription`.
     pub fn handle_subscription(
         &self,

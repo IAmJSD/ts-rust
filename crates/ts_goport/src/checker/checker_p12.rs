@@ -1472,17 +1472,21 @@ impl Checker {
         let declaration_container = self.get_control_flow_container(declaration);
         let mut flow_container = self.get_control_flow_container(node);
         let is_outer_variable = flow_container != declaration_container;
-        let is_spread_destructuring_assignment_target = node.parent().is_some()
-            && node.parent().parent().is_some()
-            && is_spread_assignment(node.parent())
-            && self.is_destructuring_assignment_target(node.parent().parent());
+        // PERF: chkA. The parent and its kind are read once, for the tests
+        // below that read `node.Parent` in Go.
+        let (parent, parent_kind) = node_parent_and_kind(node);
+        let is_spread_destructuring_assignment_target = parent_kind == SyntaxKind::SpreadAssignment
+            && {
+                let grandparent = parent.parent();
+                grandparent.is_some() && self.is_destructuring_assignment_target(grandparent)
+            };
         let is_module_exports = self
             .sym(symbol)
             .flags
             .intersects(SymbolFlags::MODULE_EXPORTS);
         let type_is_automatic = t == self.auto_type || t == self.auto_array_type;
         let is_automatic_type_in_non_null =
-            type_is_automatic && node.parent().kind() == SyntaxKind::NonNullExpression;
+            type_is_automatic && parent_kind == SyntaxKind::NonNullExpression;
         // When the control flow originates in a function expression, arrow function, method, or accessor, and
         // we are referencing a closed-over const variable or parameter or mutable local variable past its last
         // assignment, we extend the origin of the control flow analysis to include the immediately enclosing
@@ -1521,8 +1525,8 @@ impl Checker {
                         .intersects(TypeFlags::ANY_OR_UNKNOWN | TypeFlags::VOID)
                     || is_in_type_query(node)
                     || self.is_in_ambient_or_type_node(node)
-                    || node.parent().kind() == SyntaxKind::ExportSpecifier)
-            || is_non_null_expression(node.parent())
+                    || parent_kind == SyntaxKind::ExportSpecifier)
+            || parent_kind == SyntaxKind::NonNullExpression
             || is_variable_declaration(declaration) && declaration.exclamation_token().is_some()
             || declaration.flags().intersects(NodeFlags::AMBIENT);
         let initial_type;
@@ -1559,8 +1563,20 @@ impl Checker {
         // A variable is considered uninitialized when it is possible to analyze the entire control flow graph
         // from declaration to use, and when the variable's declared type doesn't include undefined but the
         // control flow based type does include undefined.
-        if !self.is_evolving_array_operation_target(node)
-            && (t == self.auto_type || t == self.auto_array_type)
+        // PERF: chkA. Go calls `isEvolvingArrayOperationTarget(node)` first,
+        // but its answer matters only for an automatic type. For any other
+        // type only its element assignment part runs, at the same point,
+        // because that part can make types. The length, push and unshift part
+        // only reads the tree.
+        let is_evolving_array_operation_target = if t == self.auto_type || t == self.auto_array_type
+        {
+            self.is_evolving_array_operation_target(node)
+        } else {
+            let root = self.get_reference_root(node);
+            self.is_evolving_array_element_assignment(root, root.parent());
+            false
+        };
+        if !is_evolving_array_operation_target && (t == self.auto_type || t == self.auto_array_type)
         {
             if flow_type == self.auto_type || flow_type == self.auto_array_type {
                 if self.no_implicit_any {
@@ -1599,5 +1615,24 @@ impl Checker {
             return self.get_base_type_of_literal_type(flow_type);
         }
         flow_type
+    }
+}
+
+/// The parent of `node` and the parent's kind: one store lookup for a node of
+/// a published store (`frozen_store_parent_kind`). The kind of a nil parent
+/// is `SyntaxKind::Unknown`.
+#[inline]
+pub fn node_parent_and_kind(node: Node) -> (Node, SyntaxKind) {
+    match crate::ast::store::frozen_store_parent_kind(node) {
+        Some(parent_and_kind) => parent_and_kind,
+        None => {
+            let parent = node.parent();
+            let kind = if parent.is_some() {
+                parent.kind()
+            } else {
+                SyntaxKind::Unknown
+            };
+            (parent, kind)
+        }
     }
 }

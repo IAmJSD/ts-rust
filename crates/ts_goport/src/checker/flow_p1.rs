@@ -74,6 +74,9 @@ impl ReduceLabel {
 #[derive(Clone, Debug, Default)]
 pub struct FlowState {
     pub reference: Node,
+    /// PERF: chkA. Go `ast.IsAccessExpression(reference)`, read once per
+    /// walk (`get_flow_type_of_reference_ex`) for `get_type_at_flow_assignment`.
+    pub reference_is_access: bool,
     pub declared_type: TypeId,
     pub initial_type: TypeId,
     pub flow_container: Node,
@@ -86,17 +89,22 @@ pub struct FlowState {
 
 impl Checker {
     // Go: checker/flow.go:52 getFlowState
+    // PERF: chkA. The free list moves its links (`take`), so no reference
+    // count changes. Go leaves `f.next` set, but only `put_flow_state` uses
+    // it, and it sets it again.
     pub fn get_flow_state(&mut self) -> Rc<RefCell<FlowState>> {
-        let f = match self.free_flow_state.clone() {
-            Some(f) => f,
+        match self.free_flow_state.take() {
+            Some(f) => {
+                self.free_flow_state = f.borrow_mut().next.take();
+                f
+            }
             None => Rc::new(RefCell::new(FlowState::default())),
-        };
-        self.free_flow_state = f.borrow().next.clone();
-        f
+        }
     }
 
     // Go: checker/flow.go:61 putFlowState
-    pub fn put_flow_state(&mut self, f: &Rc<RefCell<FlowState>>) {
+    // PORT: takes the state by value: the caller is done with it.
+    pub fn put_flow_state(&mut self, f: Rc<RefCell<FlowState>>) {
         {
             let mut fb = f.borrow_mut();
             let mut reduce_labels = std::mem::take(&mut fb.reduce_labels);
@@ -107,7 +115,7 @@ impl Checker {
                 ..FlowState::default()
             };
         }
-        self.free_flow_state = Some(f.clone());
+        self.free_flow_state = Some(f);
     }
 }
 
@@ -153,6 +161,7 @@ impl Checker {
         {
             let mut fb = f.borrow_mut();
             fb.reference = reference;
+            fb.reference_is_access = is_access_expression(reference);
             fb.declared_type = declared_type;
             fb.initial_type = if initial_type.is_some() {
                 initial_type
@@ -166,7 +175,7 @@ impl Checker {
         let evolved_type = self.get_type_at_flow_node(&f, flow_node).t;
         let shared_flow_start = f.borrow().shared_flow_start as usize;
         self.shared_flows.truncate(shared_flow_start);
-        self.put_flow_state(&f);
+        self.put_flow_state(f);
         // When the reference is 'x' in an 'x.length', 'x.push(value)', 'x.unshift(value)' or x[n] = value' operation,
         // we give type 'any[]' to 'x' instead of using the type determined by control flow analysis such that operations
         // on empty arrays are possible without implicit any errors and new element types can be inferred without
@@ -181,9 +190,9 @@ impl Checker {
         } else {
             self.finalize_evolving_array_type(evolved_type)
         };
+        // PERF: chkA. The parent of `reference` and its kind are read once.
         if result_type == self.unreachable_never_type
-            || reference.parent().is_some()
-                && is_non_null_expression(reference.parent())
+            || node_parent_and_kind(reference).1 == SyntaxKind::NonNullExpression
                 && !self.ty(result_type).flags.intersects(TypeFlags::NEVER)
                 && {
                     let with_facts =
@@ -369,13 +378,18 @@ impl Checker {
         flow_data: &FlowNode,
     ) -> FlowType {
         let node = flow_data.node;
-        let (reference, declared_type) = {
+        let (reference, declared_type, reference_is_access) = {
             let fb = f.borrow();
-            (fb.reference, fb.declared_type)
+            (fb.reference, fb.declared_type, fb.reference_is_access)
         };
+        // PERF: chkA. The kind of `node` is read once, for the match and the
+        // `for ... in` test below.
+        let node_kind = node.kind();
         // Assignments only narrow the computed type if the declared type is a union type. Thus, we
         // only need to evaluate the assigned type if the declared type is a union type.
-        if self.is_matching_reference(reference, node) {
+        if !self.matching_reference_memo_says_no(reference, node, node_kind)
+            && self.is_matching_reference_kind(reference, node, node_kind)
+        {
             if !self.is_reachable_flow_node(flow) {
                 return FlowType {
                     t: self.unreachable_never_type,
@@ -428,7 +442,9 @@ impl Checker {
         // may be an assignment to a left hand part of the reference. For example, for a
         // reference 'x.y.z', we may be at an assignment to 'x.y' or 'x'. In that case,
         // return the declared type.
-        if self.contains_matching_reference(reference, node) {
+        // PERF: chkA. `contains_matching_reference` is false at once for a
+        // reference that is not an access expression (read once per walk).
+        if reference_is_access && self.contains_matching_reference(reference, node) {
             if !self.is_reachable_flow_node(flow) {
                 return FlowType {
                     t: self.unreachable_never_type,
@@ -449,7 +465,7 @@ impl Checker {
             };
         }
         // for (const _ in ref) acts as a nonnull on ref
-        if is_variable_declaration(node)
+        if node_kind == SyntaxKind::VariableDeclaration
             && is_for_in_statement(node.parent().parent())
             && (self.is_matching_reference(reference, node.parent().parent().expression())
                 || self.optional_chain_contains_reference(
@@ -670,22 +686,27 @@ impl Checker {
         assume_true: bool,
     ) -> TypeId {
         // for `a?.b`, we emulate a synthetic `a !== null && a !== undefined` condition for `a`
-        if is_expression_of_optional_chain_root(expr)
-            || is_binary_expression(expr.parent())
-                && (expr.parent().operator_token().kind() == SyntaxKind::QuestionQuestionToken
-                    || expr.parent().operator_token().kind()
-                        == SyntaxKind::QuestionQuestionEqualsToken)
-                && expr.parent().left() == expr
-        {
+        // PERF: chkA. The parent, its kind and its operator are read once
+        // (`node_parent_and_kind`), and the kind of `expr` once.
+        if is_expression_of_optional_chain_root(expr) || {
+            let (parent, parent_kind) = node_parent_and_kind(expr);
+            parent_kind == SyntaxKind::BinaryExpression
+                && matches!(
+                    parent.operator_token().kind(),
+                    SyntaxKind::QuestionQuestionToken | SyntaxKind::QuestionQuestionEqualsToken
+                )
+                && parent.left() == expr
+        } {
             return self.narrow_type_by_optionality(f, t, expr, assume_true);
         }
-        match expr.kind() {
+        let expr_kind = expr.kind();
+        match expr_kind {
             SyntaxKind::Identifier
             | SyntaxKind::ThisKeyword
             | SyntaxKind::SuperKeyword
             | SyntaxKind::PropertyAccessExpression
             | SyntaxKind::ElementAccessExpression => {
-                if expr.kind() == SyntaxKind::Identifier {
+                if expr_kind == SyntaxKind::Identifier {
                     // When narrowing a reference to a const variable, non-assigned parameter, or readonly property, we inline
                     // up to five levels of aliased conditional expressions that are themselves declared as const variables.
                     let reference = f.borrow().reference;

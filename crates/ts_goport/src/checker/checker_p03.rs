@@ -9,7 +9,9 @@ pub fn is_immediately_used_in_initializer_of_block_scoped_variable(
     usage: Node,
     decl_container: Node,
 ) -> bool {
-    match declaration.parent().parent().kind() {
+    // PERF: chkA. The grandparent is read once (Go reads it twice).
+    let grandparent = declaration.parent().parent();
+    match grandparent.kind() {
         SyntaxKind::VariableStatement | SyntaxKind::ForStatement | SyntaxKind::ForOfStatement => {
             // variable statement/for/for-of statement case,
             // use site should not be inside variable declaration (initializer of declaration or binding element)
@@ -20,7 +22,6 @@ pub fn is_immediately_used_in_initializer_of_block_scoped_variable(
         _ => {}
     }
     // ForIn/ForOf case - use site should not be used in expression part
-    let grandparent = declaration.parent().parent();
     is_for_in_or_of_statement(grandparent)
         && is_same_scope_descendent_of(usage, grandparent.expression(), decl_container)
 }
@@ -30,25 +31,25 @@ pub fn is_immediately_used_in_initializer_of_block_scoped_variable(
 // If at any point current node is equal to 'parent' node - return true.
 // If current node is an IIFE, continue walking up.
 // Return false if 'stopAt' node is reached or isFunctionLike(current) === true.
+// PERF: chkA. One walk up the store tables (`find_ancestor_with_kind`,
+// which gives each kind), in place of a `parent()` and a `kind()` lookup per
+// step. The tests and their order are Go's.
 pub fn is_same_scope_descendent_of(initial: Node, parent: Node, stop_at: Node) -> bool {
     if parent.is_nil() {
         return false;
     }
-    let mut n = initial;
-    while n.is_some() {
+    let mut found = false;
+    find_ancestor_with_kind(initial, |n, kind| {
         if n == parent {
+            found = true;
             return true;
         }
-        if n == stop_at
-            || is_function_like(n)
+        n == stop_at
+            || is_function_like_kind(kind)
                 && (get_immediately_invoked_function_expression(n).is_nil()
                     || get_function_flags(n).intersects(FunctionFlags::ASYNC_GENERATOR))
-        {
-            return false;
-        }
-        n = n.parent();
-    }
-    false
+    });
+    found
 }
 
 // Go: checker/checker.go:2090 isPropertyImmediatelyReferencedWithinDeclaration

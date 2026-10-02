@@ -121,10 +121,6 @@ impl std::hash::Hasher for CacheKeyHasher {
 pub type CacheKeyMap<V> =
     std::collections::HashMap<CacheHashKey, V, std::hash::BuildHasherDefault<CacheKeyHasher>>;
 
-/// A set of `CacheHashKey` that hashes with `CacheKeyHasher`.
-pub type CacheKeySet =
-    std::collections::HashSet<CacheHashKey, std::hash::BuildHasherDefault<CacheKeyHasher>>;
-
 // PORT: perf. `CacheHashKey` is already an xxh3 hash, so `FlatMap` uses its
 // low half as is (the same bits `CacheKeyHasher` uses).
 impl FlatKey for CacheHashKey {
@@ -134,44 +130,286 @@ impl FlatKey for CacheHashKey {
     }
 }
 
-/// The map type of `Relation::results`. For an A/B run against hashbrown,
-/// change it to `CacheKeyMap<RelationComparisonResult>`.
-pub type RelationResultsMap = FlatMap<CacheHashKey, RelationComparisonResult>;
+// PORT: perf. Not in Go. Go keys every relation result by the xxh3 hash of
+// the key bytes. A plain key has only 12 bytes of content (Go writes `'s'`,
+// the source and target ids and the intersection state), so the port keeps
+// those values as the key: it needs no xxh3 and compares exactly. A generic
+// key (`'g'`, with type references) stays Go's xxh3 hash. Go's xxh3 keys
+// collide with a chance of about 2^-128; plain keys here never do.
+/// Go `getRelationKey` result: the key of a `Relation` result.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RelationKey {
+    /// A key without generic type references, as its key bytes.
+    Plain(PlainRelationKey),
+    /// Go's xxh3 hash of a key with generic type references.
+    Generic(CacheHashKey),
+}
+
+/// The content of a plain relation key (Go `getRelationKey` writes `'s'`,
+/// then these three values).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PlainRelationKey {
+    pub source: u32,
+    pub target: u32,
+    pub intersection_state: u32,
+}
+
+/// Bits of the source and of the target id in a packed plain key.
+const PACKED_ID_BITS: u32 = 28;
+
+impl PlainRelationKey {
+    /// The key in 58 bits for `PlainResultTable`: the source and target ids
+    /// in 28 bits each and the intersection state in 2. `None` when a value
+    /// does not fit, or when the packed key is 0 (an empty slot).
+    #[inline]
+    fn packed(&self) -> Option<u64> {
+        if (self.source | self.target) >> PACKED_ID_BITS != 0 || self.intersection_state >> 2 != 0 {
+            return None;
+        }
+        let p = u64::from(self.source)
+            | u64::from(self.target) << PACKED_ID_BITS
+            | u64::from(self.intersection_state) << (2 * PACKED_ID_BITS);
+        (p != 0).then_some(p)
+    }
+}
+
+impl FlatKey for PlainRelationKey {
+    // A 64x64 to 128-bit multiply folded to 64 bits puts every key bit into
+    // the low bits that pick the slot.
+    #[inline]
+    fn flat_hash(&self) -> u64 {
+        let ids = u64::from(self.source) | u64::from(self.target) << 32;
+        fold_mul(ids, u64::from(self.intersection_state))
+    }
+}
+
+/// A 64x64 to 128-bit multiply of `x` and a constant changed by `y`, folded
+/// to 64 bits, so every bit of `x` reaches the low bits.
+#[inline]
+fn fold_mul(x: u64, y: u64) -> u64 {
+    let p = u128::from(x ^ 0x243f_6a88_85a3_08d3) * u128::from(0x9e37_79b9_7f4a_7c15 ^ y);
+    (p >> 64) as u64 ^ p as u64
+}
+
+// Only for `RelationKeySet`: `CacheKeyHasher` takes one `u64` as the hash.
+impl std::hash::Hash for RelationKey {
+    #[inline]
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        state.write_u64(match self {
+            RelationKey::Plain(key) => key.flat_hash(),
+            RelationKey::Generic(key) => key.lo,
+        });
+    }
+}
+
+/// A set of `RelationKey` (the relater's maybe keys).
+pub type RelationKeySet =
+    std::collections::HashSet<RelationKey, std::hash::BuildHasherDefault<CacheKeyHasher>>;
+
+/// Bits of the result in a `PlainResultTable` entry.
+const RESULT_BITS: u32 = 6;
+const _: () = assert!(
+    (RelationComparisonResult::SUCCEEDED.bits()
+        | RelationComparisonResult::FAILED.bits()
+        | RelationComparisonResult::REPORTS_MASK.bits()
+        | RelationComparisonResult::OVERFLOW.bits())
+        >> RESULT_BITS
+        == 0
+);
+
+// PORT: perf. Not in Go. The plain results of one relation, each in one
+// `u64`: the packed key (`PlainRelationKey::packed`) in the high 58 bits and
+// the result in the low 6 bits, so a cache line holds 8 results (a table of
+// 12-byte keys and 4-byte results holds 4). Open addressing with linear
+// probing, a power-of-two slot count and a load of at most 1/2; 0 is an
+// empty slot. There is no iteration, so the layout cannot change any output.
+#[derive(Clone, Debug, Default)]
+pub struct PlainResultTable {
+    /// Empty (no allocation) until the first insert; else a power of two.
+    slots: Box<[u64]>,
+    used: usize,
+}
+
+impl PlainResultTable {
+    #[inline]
+    fn home(packed: u64, mask: usize) -> usize {
+        fold_mul(packed, 0) as usize & mask
+    }
+
+    #[inline]
+    fn get(&self, packed: u64) -> RelationComparisonResult {
+        if self.slots.is_empty() {
+            return RelationComparisonResult::NONE;
+        }
+        let mask = self.slots.len() - 1;
+        let mut i = Self::home(packed, mask);
+        loop {
+            let entry = self.slots[i];
+            if entry >> RESULT_BITS == packed {
+                return RelationComparisonResult((entry & ((1 << RESULT_BITS) - 1)) as u32);
+            }
+            if entry == 0 {
+                return RelationComparisonResult::NONE;
+            }
+            i = (i + 1) & mask;
+        }
+    }
+
+    #[inline]
+    fn insert(&mut self, packed: u64, result: RelationComparisonResult) {
+        debug_assert!(result.bits() >> RESULT_BITS == 0);
+        let entry = packed << RESULT_BITS | u64::from(result.bits());
+        if !self.slots.is_empty() {
+            let mask = self.slots.len() - 1;
+            let mut i = Self::home(packed, mask);
+            loop {
+                let old = self.slots[i];
+                if old >> RESULT_BITS == packed {
+                    self.slots[i] = entry;
+                    return;
+                }
+                if old == 0 {
+                    if self.used < self.slots.len() / 2 {
+                        self.slots[i] = entry;
+                        self.used += 1;
+                        return;
+                    }
+                    break;
+                }
+                i = (i + 1) & mask;
+            }
+        }
+        // The key is absent and the table is empty or full to its load.
+        self.grow();
+        self.insert_absent(entry);
+        self.used += 1;
+    }
+
+    /// Doubles the slot count and puts every entry back.
+    #[cold]
+    fn grow(&mut self) {
+        let len = (self.slots.len() * 2).max(16);
+        let old = std::mem::replace(&mut self.slots, vec![0; len].into_boxed_slice());
+        for &entry in &*old {
+            if entry != 0 {
+                self.insert_absent(entry);
+            }
+        }
+    }
+
+    /// Writes an entry whose key is not in `slots` into its first empty slot.
+    #[inline]
+    fn insert_absent(&mut self, entry: u64) {
+        let mask = self.slots.len() - 1;
+        let mut i = Self::home(entry >> RESULT_BITS, mask);
+        while self.slots[i] != 0 {
+            i = (i + 1) & mask;
+        }
+        self.slots[i] = entry;
+    }
+}
 
 // Go: checker/relater.go:99 Relation
+// PORT: Go has one map of xxh3 keys. Here plain keys are in `plain` (or in
+// `plain_wide` when they do not pack) and generic keys in `generic` (see
+// `RelationKey`). There is no iteration, so this cannot change any output.
 #[derive(Clone, Debug, Default)]
 pub struct Relation {
-    pub results: RelationResultsMap,
+    pub plain: PlainResultTable,
+    /// Plain keys with an id of 2^28 or more.
+    pub plain_wide: FlatMap<PlainRelationKey, RelationComparisonResult>,
+    pub generic: FlatMap<CacheHashKey, RelationComparisonResult>,
 }
 
 impl Relation {
     // Go: checker/relater.go:103 Relation.get
-    pub fn get(&self, key: CacheHashKey) -> RelationComparisonResult {
-        self.results.get(&key).copied().unwrap_or_default()
+    #[inline]
+    pub fn get(&self, key: RelationKey) -> RelationComparisonResult {
+        match key {
+            RelationKey::Plain(key) => match key.packed() {
+                Some(packed) => self.plain.get(packed),
+                None => self.plain_wide.get(&key).copied().unwrap_or_default(),
+            },
+            RelationKey::Generic(key) => self.generic.get(&key).copied().unwrap_or_default(),
+        }
     }
 
     // Go: checker/relater.go:107 Relation.set
-    pub fn set(&mut self, key: CacheHashKey, result: RelationComparisonResult) {
-        self.results.insert(key, result);
+    #[inline]
+    pub fn set(&mut self, key: RelationKey, result: RelationComparisonResult) {
+        match key {
+            RelationKey::Plain(key) => match key.packed() {
+                Some(packed) => self.plain.insert(packed, result),
+                None => {
+                    self.plain_wide.insert(key, result);
+                }
+            },
+            RelationKey::Generic(key) => {
+                self.generic.insert(key, result);
+            }
+        }
     }
 
     // Go: checker/relater.go:114 Relation.size
     pub fn size(&self) -> i32 {
-        self.results.len() as i32
+        (self.plain.used + self.plain_wide.len() + self.generic.len()) as i32
+    }
+}
+
+// PORT: perf. Not in Go. Go tests a relation by pointer (`relation ==
+// c.identityRelation`). Hot code here tests a `RelationKind`, so it does not
+// clone the `Rc` of the relation to keep it while `self` is borrowed.
+/// One of the checker's five relations (see `Checker::relation_of`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RelationKind {
+    #[default]
+    Identity,
+    Subtype,
+    StrictSubtype,
+    Assignable,
+    Comparable,
+}
+
+impl Checker {
+    /// The relation of `kind`.
+    #[inline]
+    pub fn relation_of(&self, kind: RelationKind) -> &Rc<RefCell<Relation>> {
+        match kind {
+            RelationKind::Identity => &self.identity_relation,
+            RelationKind::Subtype => &self.subtype_relation,
+            RelationKind::StrictSubtype => &self.strict_subtype_relation,
+            RelationKind::Assignable => &self.assignable_relation,
+            RelationKind::Comparable => &self.comparable_relation,
+        }
+    }
+
+    /// The kind of `relation`, which is one of the checker's five relations.
+    #[inline]
+    pub fn relation_kind(&self, relation: &Rc<RefCell<Relation>>) -> RelationKind {
+        if Rc::ptr_eq(relation, &self.assignable_relation) {
+            RelationKind::Assignable
+        } else if Rc::ptr_eq(relation, &self.subtype_relation) {
+            RelationKind::Subtype
+        } else if Rc::ptr_eq(relation, &self.strict_subtype_relation) {
+            RelationKind::StrictSubtype
+        } else if Rc::ptr_eq(relation, &self.comparable_relation) {
+            RelationKind::Comparable
+        } else {
+            debug_assert!(Rc::ptr_eq(relation, &self.identity_relation));
+            RelationKind::Identity
+        }
     }
 }
 
 impl Checker {
     // Go: checker/relater.go:118 isTypeIdenticalTo
     pub fn is_type_identical_to(&mut self, source: TypeId, target: TypeId) -> bool {
-        let relation = self.identity_relation.clone();
-        self.is_type_related_to(source, target, &relation)
+        self.is_type_related_to_kind(source, target, RelationKind::Identity)
     }
 
     // Go: checker/relater.go:122 compareTypesIdentical
     pub fn compare_types_identical(&mut self, source: TypeId, target: TypeId) -> Ternary {
-        let relation = self.identity_relation.clone();
-        if self.is_type_related_to(source, target, &relation) {
+        if self.is_type_related_to_kind(source, target, RelationKind::Identity) {
             return Ternary::TRUE;
         }
         Ternary::FALSE
@@ -179,8 +417,7 @@ impl Checker {
 
     // Go: checker/relater.go:129 compareTypesAssignableSimple
     pub fn compare_types_assignable_simple(&mut self, source: TypeId, target: TypeId) -> Ternary {
-        let relation = self.assignable_relation.clone();
-        if self.is_type_related_to(source, target, &relation) {
+        if self.is_type_related_to_kind(source, target, RelationKind::Assignable) {
             return Ternary::TRUE;
         }
         Ternary::FALSE
@@ -193,8 +430,7 @@ impl Checker {
         target: TypeId,
         report_errors: bool,
     ) -> Ternary {
-        let relation = self.assignable_relation.clone();
-        if self.is_type_related_to(source, target, &relation) {
+        if self.is_type_related_to_kind(source, target, RelationKind::Assignable) {
             return Ternary::TRUE;
         }
         Ternary::FALSE
@@ -202,8 +438,7 @@ impl Checker {
 
     // Go: checker/relater.go:143 compareTypesSubtypeOf
     pub fn compare_types_subtype_of(&mut self, source: TypeId, target: TypeId) -> Ternary {
-        let relation = self.subtype_relation.clone();
-        if self.is_type_related_to(source, target, &relation) {
+        if self.is_type_related_to_kind(source, target, RelationKind::Subtype) {
             return Ternary::TRUE;
         }
         Ternary::FALSE
@@ -211,26 +446,22 @@ impl Checker {
 
     // Go: checker/relater.go:150 isTypeAssignableTo
     pub fn is_type_assignable_to(&mut self, source: TypeId, target: TypeId) -> bool {
-        let relation = self.assignable_relation.clone();
-        self.is_type_related_to(source, target, &relation)
+        self.is_type_related_to_kind(source, target, RelationKind::Assignable)
     }
 
     // Go: checker/relater.go:154 isTypeSubtypeOf
     pub fn is_type_subtype_of(&mut self, source: TypeId, target: TypeId) -> bool {
-        let relation = self.subtype_relation.clone();
-        self.is_type_related_to(source, target, &relation)
+        self.is_type_related_to_kind(source, target, RelationKind::Subtype)
     }
 
     // Go: checker/relater.go:158 isTypeStrictSubtypeOf
     pub fn is_type_strict_subtype_of(&mut self, source: TypeId, target: TypeId) -> bool {
-        let relation = self.strict_subtype_relation.clone();
-        self.is_type_related_to(source, target, &relation)
+        self.is_type_related_to_kind(source, target, RelationKind::StrictSubtype)
     }
 
     // Go: checker/relater.go:162 isTypeComparableTo
     pub fn is_type_comparable_to(&mut self, source: TypeId, target: TypeId) -> bool {
-        let relation = self.comparable_relation.clone();
-        self.is_type_related_to(source, target, &relation)
+        self.is_type_related_to_kind(source, target, RelationKind::Comparable)
     }
 
     // Go: checker/relater.go:166 areTypesComparable
@@ -239,11 +470,23 @@ impl Checker {
     }
 
     // Go: checker/relater.go:170 isTypeRelatedTo
+    #[inline]
     pub fn is_type_related_to(
         &mut self,
         source: TypeId,
         target: TypeId,
         relation: &Rc<RefCell<Relation>>,
+    ) -> bool {
+        let kind = self.relation_kind(relation);
+        self.is_type_related_to_kind(source, target, kind)
+    }
+
+    // PORT: perf. Go isTypeRelatedTo with the relation as a `RelationKind`.
+    pub fn is_type_related_to_kind(
+        &mut self,
+        source: TypeId,
+        target: TypeId,
+        kind: RelationKind,
     ) -> bool {
         let mut source = source;
         let mut target = target;
@@ -256,12 +499,12 @@ impl Checker {
         if source == target {
             return true;
         }
-        let is_identity = Rc::ptr_eq(relation, &self.identity_relation);
+        let is_identity = kind == RelationKind::Identity;
         if !is_identity {
-            if Rc::ptr_eq(relation, &self.comparable_relation)
+            if kind == RelationKind::Comparable
                 && !self.ty(target).flags.intersects(TypeFlags::NEVER)
-                && self.is_simple_type_related_to(target, source, relation, None)
-                || self.is_simple_type_related_to(source, target, relation, None)
+                && self.is_simple_type_related_to_kind(target, source, kind, None)
+                || self.is_simple_type_related_to_kind(source, target, kind, None)
             {
                 return true;
             }
@@ -284,7 +527,7 @@ impl Checker {
         {
             let (id, _) =
                 self.get_relation_key(source, target, IntersectionState::NONE, is_identity, false);
-            let related = relation.borrow().get(id);
+            let related = self.relation_of(kind).borrow().get(id);
             if related != RelationComparisonResult::NONE {
                 return related.intersects(RelationComparisonResult::SUCCEEDED);
             }
@@ -298,10 +541,11 @@ impl Checker {
                 .flags
                 .intersects(TypeFlags::STRUCTURED_OR_INSTANTIABLE)
         {
+            let relation = self.relation_of(kind).clone();
             return self.check_type_related_to(
                 source,
                 target,
-                relation,
+                &relation,
                 Node::NIL, /*errorNode*/
             );
         }
@@ -309,11 +553,25 @@ impl Checker {
     }
 
     // Go: checker/relater.go:205 isSimpleTypeRelatedTo
+    #[inline]
     pub fn is_simple_type_related_to(
         &mut self,
         source: TypeId,
         target: TypeId,
         relation: &Rc<RefCell<Relation>>,
+        error_reporter: Option<&mut dyn FnMut(&mut Checker, &'static Message, Vec<String>)>,
+    ) -> bool {
+        let kind = self.relation_kind(relation);
+        self.is_simple_type_related_to_kind(source, target, kind, error_reporter)
+    }
+
+    // PORT: perf. Go isSimpleTypeRelatedTo with the relation as a
+    // `RelationKind`.
+    pub fn is_simple_type_related_to_kind(
+        &mut self,
+        source: TypeId,
+        target: TypeId,
+        kind: RelationKind,
         mut error_reporter: Option<&mut dyn FnMut(&mut Checker, &'static Message, Vec<String>)>,
     ) -> bool {
         let s = self.ty(source).flags;
@@ -325,73 +583,65 @@ impl Checker {
             return true;
         }
         if t.intersects(TypeFlags::UNKNOWN)
-            && !(Rc::ptr_eq(relation, &self.strict_subtype_relation)
-                && s.intersects(TypeFlags::ANY))
+            && !(kind == RelationKind::StrictSubtype && s.intersects(TypeFlags::ANY))
         {
             return true;
         }
         if t.intersects(TypeFlags::NEVER) {
             return false;
         }
-        if s.intersects(TypeFlags::STRING_LIKE) && t.intersects(TypeFlags::STRING) {
-            return true;
-        }
-        if s.intersects(TypeFlags::STRING_LITERAL)
-            && s.intersects(TypeFlags::ENUM_LITERAL)
-            && t.intersects(TypeFlags::STRING_LITERAL)
-            && !t.intersects(TypeFlags::ENUM_LITERAL)
-            && self.ty(source).as_literal_type().value == self.ty(target).as_literal_type().value
-        {
-            return true;
-        }
-        if s.intersects(TypeFlags::NUMBER_LIKE) && t.intersects(TypeFlags::NUMBER) {
-            return true;
-        }
-        if s.intersects(TypeFlags::NUMBER_LITERAL)
-            && s.intersects(TypeFlags::ENUM_LITERAL)
-            && t.intersects(TypeFlags::NUMBER_LITERAL)
-            && !t.intersects(TypeFlags::ENUM_LITERAL)
-            && self.ty(source).as_literal_type().value == self.ty(target).as_literal_type().value
-        {
-            return true;
-        }
-        if s.intersects(TypeFlags::BIG_INT_LIKE) && t.intersects(TypeFlags::BIG_INT) {
-            return true;
-        }
-        if s.intersects(TypeFlags::BOOLEAN_LIKE) && t.intersects(TypeFlags::BOOLEAN) {
-            return true;
-        }
-        if s.intersects(TypeFlags::ES_SYMBOL_LIKE) && t.intersects(TypeFlags::ES_SYMBOL) {
-            return true;
-        }
-        let source_symbol = self.ty(source).symbol;
-        let target_symbol = self.ty(target).symbol;
-        if s.intersects(TypeFlags::ENUM)
-            && t.intersects(TypeFlags::ENUM)
-            && self.sym(source_symbol).name == self.sym(target_symbol).name
-            && self.is_enum_type_related_to(
-                source_symbol,
-                target_symbol,
-                reborrow_error_reporter(&mut error_reporter),
-            )
-        {
-            return true;
-        }
-        if s.intersects(TypeFlags::ENUM_LITERAL) && t.intersects(TypeFlags::ENUM_LITERAL) {
-            if s.intersects(TypeFlags::UNION)
-                && t.intersects(TypeFlags::UNION)
-                && self.is_enum_type_related_to(
-                    source_symbol,
-                    target_symbol,
-                    reborrow_error_reporter(&mut error_reporter),
-                )
-            {
+        // PORT: perf. Every rule from here to the null rule needs one of
+        // these source flags, so one test skips them all for other sources.
+        const PRIMITIVE_RULE_SOURCE: TypeFlags = TypeFlags(
+            TypeFlags::STRING_LIKE.bits()
+                | TypeFlags::NUMBER_LIKE.bits()
+                | TypeFlags::BIG_INT_LIKE.bits()
+                | TypeFlags::BOOLEAN_LIKE.bits()
+                | TypeFlags::ES_SYMBOL_LIKE.bits()
+                | TypeFlags::ENUM.bits()
+                | TypeFlags::ENUM_LITERAL.bits()
+                | TypeFlags::UNDEFINED.bits()
+                | TypeFlags::NULL.bits(),
+        );
+        if s.intersects(PRIMITIVE_RULE_SOURCE) {
+            if s.intersects(TypeFlags::STRING_LIKE) && t.intersects(TypeFlags::STRING) {
                 return true;
             }
-            if s.intersects(TypeFlags::LITERAL)
-                && t.intersects(TypeFlags::LITERAL)
+            if s.intersects(TypeFlags::STRING_LITERAL)
+                && s.intersects(TypeFlags::ENUM_LITERAL)
+                && t.intersects(TypeFlags::STRING_LITERAL)
+                && !t.intersects(TypeFlags::ENUM_LITERAL)
                 && self.ty(source).as_literal_type().value
                     == self.ty(target).as_literal_type().value
+            {
+                return true;
+            }
+            if s.intersects(TypeFlags::NUMBER_LIKE) && t.intersects(TypeFlags::NUMBER) {
+                return true;
+            }
+            if s.intersects(TypeFlags::NUMBER_LITERAL)
+                && s.intersects(TypeFlags::ENUM_LITERAL)
+                && t.intersects(TypeFlags::NUMBER_LITERAL)
+                && !t.intersects(TypeFlags::ENUM_LITERAL)
+                && self.ty(source).as_literal_type().value
+                    == self.ty(target).as_literal_type().value
+            {
+                return true;
+            }
+            if s.intersects(TypeFlags::BIG_INT_LIKE) && t.intersects(TypeFlags::BIG_INT) {
+                return true;
+            }
+            if s.intersects(TypeFlags::BOOLEAN_LIKE) && t.intersects(TypeFlags::BOOLEAN) {
+                return true;
+            }
+            if s.intersects(TypeFlags::ES_SYMBOL_LIKE) && t.intersects(TypeFlags::ES_SYMBOL) {
+                return true;
+            }
+            let source_symbol = self.ty(source).symbol;
+            let target_symbol = self.ty(target).symbol;
+            if s.intersects(TypeFlags::ENUM)
+                && t.intersects(TypeFlags::ENUM)
+                && self.sym(source_symbol).name == self.sym(target_symbol).name
                 && self.is_enum_type_related_to(
                     source_symbol,
                     target_symbol,
@@ -400,24 +650,48 @@ impl Checker {
             {
                 return true;
             }
-        }
-        // In non-strictNullChecks mode, `undefined` and `null` are assignable to anything except `never`.
-        // Since unions and intersections may reduce to `never`, we exclude them here.
-        if s.intersects(TypeFlags::UNDEFINED)
-            && (!self.strict_null_checks && !t.intersects(TypeFlags::UNION_OR_INTERSECTION)
-                || t.intersects(TypeFlags::UNDEFINED | TypeFlags::VOID))
-        {
-            return true;
-        }
-        if s.intersects(TypeFlags::NULL)
-            && (!self.strict_null_checks && !t.intersects(TypeFlags::UNION_OR_INTERSECTION)
-                || t.intersects(TypeFlags::NULL))
-        {
-            return true;
+            if s.intersects(TypeFlags::ENUM_LITERAL) && t.intersects(TypeFlags::ENUM_LITERAL) {
+                if s.intersects(TypeFlags::UNION)
+                    && t.intersects(TypeFlags::UNION)
+                    && self.is_enum_type_related_to(
+                        source_symbol,
+                        target_symbol,
+                        reborrow_error_reporter(&mut error_reporter),
+                    )
+                {
+                    return true;
+                }
+                if s.intersects(TypeFlags::LITERAL)
+                    && t.intersects(TypeFlags::LITERAL)
+                    && self.ty(source).as_literal_type().value
+                        == self.ty(target).as_literal_type().value
+                    && self.is_enum_type_related_to(
+                        source_symbol,
+                        target_symbol,
+                        reborrow_error_reporter(&mut error_reporter),
+                    )
+                {
+                    return true;
+                }
+            }
+            // In non-strictNullChecks mode, `undefined` and `null` are assignable to anything except `never`.
+            // Since unions and intersections may reduce to `never`, we exclude them here.
+            if s.intersects(TypeFlags::UNDEFINED)
+                && (!self.strict_null_checks && !t.intersects(TypeFlags::UNION_OR_INTERSECTION)
+                    || t.intersects(TypeFlags::UNDEFINED | TypeFlags::VOID))
+            {
+                return true;
+            }
+            if s.intersects(TypeFlags::NULL)
+                && (!self.strict_null_checks && !t.intersects(TypeFlags::UNION_OR_INTERSECTION)
+                    || t.intersects(TypeFlags::NULL))
+            {
+                return true;
+            }
         }
         if s.intersects(TypeFlags::OBJECT)
             && t.intersects(TypeFlags::NON_PRIMITIVE)
-            && !(Rc::ptr_eq(relation, &self.strict_subtype_relation)
+            && !(kind == RelationKind::StrictSubtype
                 && self.is_empty_anonymous_object_type(source)
                 && !self
                     .ty(source)
@@ -426,9 +700,7 @@ impl Checker {
         {
             return true;
         }
-        if Rc::ptr_eq(relation, &self.assignable_relation)
-            || Rc::ptr_eq(relation, &self.comparable_relation)
-        {
+        if kind == RelationKind::Assignable || kind == RelationKind::Comparable {
             if s.intersects(TypeFlags::ANY) {
                 return true;
             }
@@ -679,9 +951,10 @@ impl Checker {
         let mut error_node = error_node;
         let r = self.get_relater();
         {
+            let kind = self.relation_kind(relation);
             let relation_size = relation.borrow().size();
             let mut rb = r.borrow_mut();
-            rb.relation = relation.clone();
+            rb.kind = kind;
             rb.error_node = error_node;
             rb.relation_count = (16_000_000 - relation_size) / 8;
         }
@@ -1988,4 +2261,57 @@ impl Checker {
 // Go: checker/relater.go:750 isHyphenatedJsxName
 pub fn is_hyphenated_jsx_name(name: &str) -> bool {
     name.contains('-')
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `Relation` against a `HashMap`, with plain keys that pack, plain keys
+    /// that do not, and generic keys, so all three tables grow and overwrite.
+    #[test]
+    fn relation_matches_hash_map() {
+        let mut relation = Relation::default();
+        let mut want = std::collections::HashMap::new();
+        let mut rng: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut next = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        let results = [
+            RelationComparisonResult::SUCCEEDED,
+            RelationComparisonResult::FAILED,
+            RelationComparisonResult::FAILED | RelationComparisonResult::COMPLEXITY_OVERFLOW,
+            RelationComparisonResult::SUCCEEDED | RelationComparisonResult::REPORTS_MASK,
+        ];
+        for n in 0..20_000u64 {
+            let v = next();
+            let key = match v % 8 {
+                0 => RelationKey::Generic(CacheHashKey {
+                    hi: v >> 8 & 0xff,
+                    lo: v >> 16 & 0x3ff,
+                }),
+                1 => RelationKey::Plain(PlainRelationKey {
+                    source: (1 << PACKED_ID_BITS) + (v >> 8 & 0x3f) as u32,
+                    target: (v >> 16 & 0x3f) as u32,
+                    intersection_state: 0,
+                }),
+                _ => RelationKey::Plain(PlainRelationKey {
+                    source: (v >> 8 & 0x3f) as u32,
+                    target: (v >> 16 & 0x3f) as u32 | if v % 16 == 2 { 0xfff_ffc0 } else { 0 },
+                    intersection_state: (v >> 24 & 3) as u32,
+                }),
+            };
+            if n % 3 == 0 {
+                let result = results[(v >> 32) as usize % results.len()];
+                relation.set(key, result);
+                want.insert(key, result);
+                assert_eq!(relation.size() as usize, want.len());
+            }
+            let got = relation.get(key);
+            assert_eq!(got, want.get(&key).copied().unwrap_or_default());
+        }
+    }
 }

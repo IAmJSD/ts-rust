@@ -2,6 +2,7 @@
 
 use crate::diagnostics::Message;
 use crate::prelude::*;
+use smallvec::SmallVec;
 
 // PORT: Go `core.FirstOrNil` / `core.ElementOrNil` over a `NodeSlice`.
 fn node_slice_element_or_nil(nodes: NodeSlice, index: usize) -> Node {
@@ -33,18 +34,22 @@ impl Checker {
         args: &[Node],
         check_mode: CheckMode,
         context: InferenceContextId,
-    ) -> Vec<TypeId> {
+    ) -> SmallVec<[TypeId; 4]> {
         if is_jsx_opening_like_element(node) {
-            return self.infer_jsx_type_arguments(node, signature, check_mode, context);
+            return SmallVec::from_vec(
+                self.infer_jsx_type_arguments(node, signature, check_mode, context),
+            );
         }
         // If a contextual type is available, infer from that type to the return type of the call expression. For
         // example, given a 'function wrap<T, U>(cb: (x: T) => U): (x: T) => U' and a call expression
         // 'let f: (x: string) => number = wrap(s => s.length)', we infer from the declared type of 'f' to the
         // return type of 'wrap'.
         if !is_decorator(node) && !is_binary_expression(node) {
-            let signature_type_parameters = self.sig(signature).type_parameters.clone();
+            // PERF: the type parameters are read from the signature in place,
+            // not copied.
             let mut skip_binding_patterns = true;
-            for &p in &signature_type_parameters {
+            for i in 0..self.sig(signature).type_parameters.len() {
+                let p = self.sig(signature).type_parameters[i];
                 if self.get_default_from_type_parameter(p).is_nil() {
                     skip_binding_patterns = false;
                     break;
@@ -125,12 +130,8 @@ impl Checker {
                     // This protects against circular inferences, i.e. avoiding situations where inferences reference
                     // type parameters for which the inferences are being made.
                     let context_flags = self.inference_context(context).flags;
-                    let return_context = self.new_inference_context(
-                        &signature_type_parameters,
-                        signature,
-                        context_flags,
-                        None,
-                    );
+                    let return_context =
+                        self.new_inference_context_of_signature(signature, context_flags);
                     let outer_return_mapper = if outer_context.is_some() {
                         self.create_outer_return_mapper(outer_context)
                     } else {
@@ -236,7 +237,7 @@ impl Checker {
                 false,
             );
         }
-        self.get_inferred_types(context)
+        self.get_inferred_type_list(context)
     }
 
     // Go: checker/checker.go:9468 getCandidateForOverloadFailure
@@ -669,7 +670,7 @@ impl Checker {
                 if implementation.is_some() {
                     let candidate = self.get_signature_from_declaration(implementation);
                     let mut local_state = s.clone();
-                    local_state.candidates = vec![candidate];
+                    local_state.candidates = smallvec::smallvec![candidate];
                     local_state.is_single_non_generic_candidate =
                         self.sig(candidate).type_parameters.is_empty();
                     let assignable_relation = self.assignable_relation.clone();

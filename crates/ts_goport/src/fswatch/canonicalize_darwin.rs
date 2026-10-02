@@ -85,7 +85,7 @@ pub fn fold_native_path(_: &str) -> String {
     panic!("fswatch: native path folding is not ported (CoreFoundation)");
 }
 
-// Go: fsevents_darwin_ffi.go:217 isASCII
+// Go: fsevents_darwin_ffi.go:262 isASCII
 /// isASCII reports whether every byte in s is below 0x80. Pure-ASCII paths
 /// are identical in every Unicode normalization form, so we can skip the
 /// CoreFoundation round-trip entirely, which is the overwhelming common case.
@@ -93,7 +93,7 @@ pub fn is_ascii(s: &str) -> bool {
     s.bytes().all(|b| b < 0x80)
 }
 
-// Go: fsevents_darwin_ffi.go:274 normalizeNFC
+// Go: fsevents_darwin_ffi.go:319 normalizeNFC
 /// normalizeNFC returns s in Unicode NFC (canonical composed) form. ASCII
 /// inputs are returned unchanged. Non-ASCII inputs go through CoreFoundation;
 /// if any step fails (e.g. invalid UTF-8 from a corrupt path), the original
@@ -126,11 +126,11 @@ mod tests {
     use super::*;
 
     // "é"
-    // Go: fsevents_darwin_nfd_test.go:21
+    // Go: fsevents_darwin_nfd_test.go:26 nfcE, nfdE
     const NFC_E: &str = "\u{00e9}"; // U+00E9
     const NFD_E: &str = "e\u{0301}"; // U+0065 U+0301
 
-    // Go: fsevents_darwin_nfd_test.go:30 TestNormalizeNFC
+    // Go: fsevents_darwin_nfd_test.go:33 TestNormalizeNFC
     // TestNormalizeNFC exercises the CoreFoundation-backed normalizer directly
     // (without going through FSEvents) so a regression in the FFI plumbing is
     // caught even if the end-to-end FSEvents tests are skipped.
@@ -191,7 +191,7 @@ mod tests {
         }
     }
 
-    // Go: fsevents_darwin_nfd_test.go:79 TestNormalizeNFCASCIIFastPath
+    // Go: fsevents_darwin_nfd_test.go:82 TestNormalizeNFCASCIIFastPath
     // TestNormalizeNFCASCIIFastPath verifies the ASCII fast path returns the
     // input unchanged with no Unicode round-trip.
     #[test]
@@ -201,7 +201,7 @@ mod tests {
         assert_eq!(out, input, "ascii input mutated");
     }
 
-    // Go: fsevents_darwin_nfd_test.go:89 TestIsASCII
+    // Go: fsevents_darwin_nfd_test.go:92 TestIsASCII
     // PORT: Go's "\x80" is one byte that is not UTF-8; the Rust case is U+0080
     // (bytes C2 80, also not ASCII). Go's last case, the bytes C2 A9, is "a©".
     #[test]

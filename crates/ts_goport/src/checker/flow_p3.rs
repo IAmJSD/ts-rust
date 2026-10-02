@@ -6,15 +6,16 @@ use crate::prelude::*;
 
 impl Checker {
     // Go: checker/flow.go:1855 getReferenceRoot
+    // PERF: chkA. The parent, its kind and its operator are read once
+    // (`node_parent_and_kind`).
     pub fn get_reference_root(&mut self, node: Node) -> Node {
-        let parent = node.parent();
-        if is_parenthesized_expression(parent)
-            || is_binary_expression(parent)
-                && parent.operator_token().kind() == SyntaxKind::EqualsToken
-                && parent.left() == node
-            || is_binary_expression(parent)
-                && parent.operator_token().kind() == SyntaxKind::CommaToken
-                && parent.right() == node
+        let (parent, parent_kind) = node_parent_and_kind(node);
+        if parent_kind == SyntaxKind::ParenthesizedExpression
+            || parent_kind == SyntaxKind::BinaryExpression && {
+                let operator = parent.operator_token().kind();
+                operator == SyntaxKind::EqualsToken && parent.left() == node
+                    || operator == SyntaxKind::CommaToken && parent.right() == node
+            }
         {
             return self.get_reference_root(parent);
         }
@@ -1003,7 +1004,7 @@ impl Checker {
     pub fn is_reachable_flow_node(&mut self, flow: FlowNodeId) -> bool {
         let f = self.get_flow_state();
         let result = self.is_reachable_flow_node_worker(&f, flow, false /*noCacheCheck*/);
-        self.put_flow_state(&f);
+        self.put_flow_state(f);
         self.last_flow_node = flow;
         self.last_flow_node_reachable = result;
         result
@@ -1136,7 +1137,7 @@ impl Checker {
     pub fn is_post_super_flow_node(&mut self, flow: FlowNodeId, no_cache_check: bool) -> bool {
         let f = self.get_flow_state();
         let result = self.is_post_super_flow_node_worker(&f, flow, no_cache_check);
-        self.put_flow_state(&f);
+        self.put_flow_state(f);
         result
     }
 
