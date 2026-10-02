@@ -1905,8 +1905,12 @@ struct LightRebuild {
 /// PORT: not in Go (perf). The program files of the light rebuilds that
 /// can compile beside the largest one (`ForecastState::parallel_files`)
 /// below which builders gain too little for their cost. Each builder costs
-/// a thread, a system and a build host, 3 to 7 MiB of peak RSS, and 40% to
-/// 80% more sys CPU in small builds.
+/// a thread, a system and a build host, and its loads share the parse
+/// workers (files_parser.rs `share_parse_workers`).
+// PERF (tscbpar1 round f, mini-743d, stable bins against R155, 20 rounds,
+// builders that share the parse workers): the 25 cells from 250 files on
+// gained 7.7% to 47.7% for -6.7% to +7.0% peak RSS (ind3x62, 250 files:
+// -22.9% and +6.1%).
 // PERF (tscbpar1 round e; files from the build infos, gains against R153
 // on the minis from tscbpar1 round d): a small package with the default
 // libs has 68 files, most of them lib files. 2 or 3 of them (indep2t,
