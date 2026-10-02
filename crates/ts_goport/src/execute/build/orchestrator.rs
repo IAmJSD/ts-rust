@@ -2161,11 +2161,12 @@ impl Drop for ReadySignal {
 
 impl BuildInfoPrefetch {
     /// Starts reading and parsing the files of `reads`, in order, on the
-    /// threads of `pool` (at most one per file), and puts the mtimes they
+    /// threads of `pool` (at most one per job), and puts the mtimes they
     /// read into `m_times`. With `forecast`, the threads also forecast the
     /// rebuild of each task: after the parses, a second job per file reads
-    /// the mtimes of its task's files (`unchanged_inputs`), and each parse
-    /// tells the rest (`forecast_rebuild`).
+    /// the mtimes of its task's files (`unchanged_inputs`; part jobs help
+    /// with many root files, `RootTimes`), and each parse tells the rest
+    /// (`forecast_rebuild`).
     // PORT: the threads only read, so their count changes no output; it
     // is not Go's `numRoutines`.
     fn start(
@@ -2179,11 +2180,17 @@ impl BuildInfoPrefetch {
             .into_iter()
             .enumerate()
             .map(|(index, read)| {
+                // Only a forecast reads the root mtimes here.
+                let roots = RootTimes::new(if forecast.is_some() {
+                    read.input_files.len()
+                } else {
+                    0
+                });
                 Arc::new(PrefetchRead {
                     read,
                     index,
                     slot: Arc::default(),
-                    roots: RootTimes::default(),
+                    roots,
                 })
             })
             .collect();
@@ -2196,11 +2203,18 @@ impl BuildInfoPrefetch {
             // The reads with the fewest root files first: a changed input of
             // a small task ends the forecast before a large task reads its
             // root mtimes.
+            // A read with more than one part of root files: its part jobs
+            // read the later parts beside its mtimes job (`RootTimes`).
             let mut by_size = reads.clone();
             by_size.sort_by_key(|read| read.read.input_files.len());
-            jobs.extend(by_size.into_iter().map(PrefetchJob::Mtimes));
+            for read in by_size {
+                let parts = read.roots.parts();
+                jobs.push(PrefetchJob::Mtimes(read.clone()));
+                jobs.extend((1..parts).map(|part| PrefetchJob::RootPart(read.clone(), part)));
+            }
         }
-        let threads = pool.threads().min(reads.len());
+        let part_jobs = jobs.len() - reads.len() * (1 + usize::from(forecast.is_some()));
+        let threads = pool.threads().min(reads.len() + part_jobs);
         let queue = Mutex::new(jobs.into_iter());
         let thread_forecast = forecast.clone();
         pool.run(threads, move || {
@@ -2226,6 +2240,22 @@ impl BuildInfoPrefetch {
                             }))
                             .unwrap_or(false);
                         forecast.add_mtimes(unchanged);
+                    }
+                    Some(PrefetchJob::RootPart(read, part)) => {
+                        let Some(forecast) = &thread_forecast else {
+                            continue;
+                        };
+                        // As the mtimes job (`unchanged_inputs`): no read
+                        // once the answer is known or for a build info that
+                        // makes no light rebuild. A part that panics is
+                        // left to the mtimes job, which reads it again.
+                        if !forecast.ended() && forecast.class(read.index) != Some(false) {
+                            let stop = || forecast.ended();
+                            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                read.roots
+                                    .get_part(&*fs, &read.read.input_files, part, Some(&stop))
+                            }));
+                        }
                     }
                 }
             }
@@ -2277,15 +2307,15 @@ impl BuildInfoPrefetch {
     }
 }
 
-/// One build info file of a `BuildInfoPrefetch`, and what its two jobs
+/// One build info file of a `BuildInfoPrefetch`, and what its jobs
 /// share.
 struct PrefetchRead {
     read: BuildInfoRead,
     /// The index of the read in the forecast (`RebuildForecast::add_class`).
     index: usize,
     slot: Arc<BuildInfoSlot>,
-    /// With a forecast: the mtimes of the root files, read once by the
-    /// first of the two jobs that needs them.
+    /// With a forecast: the mtimes of the root files, each part read once
+    /// by the first job that needs it.
     roots: RootTimes,
 }
 
@@ -2299,6 +2329,9 @@ enum PrefetchJob {
     /// For a forecast: read the mtimes of the build info, config and root
     /// files (`unchanged_inputs`).
     Mtimes(Arc<PrefetchRead>),
+    /// For a forecast: read the root mtimes of one later part of a read
+    /// (`RootTimes::get_part`), beside its mtimes job.
+    RootPart(Arc<PrefetchRead>, usize),
 }
 
 /// The parse job of `read` (`PrefetchJob::Parse`).
@@ -2373,10 +2406,19 @@ fn parse_build_info_job(
     }
 }
 
-/// The mtimes of the root files of a read, in order, read once by the
-/// first of its two jobs that needs them (`get`).
-#[derive(Default)]
+/// The mtimes of the root files of a read, in order, in parts of
+/// `ROOT_PART` files. Each part is read once, by the first job that needs
+/// it (`get`, `get_part`): the parse or the mtimes job of the read, or, for
+/// a read with more than one part, one of its part jobs
+/// (`PrefetchJob::RootPart`), which read the later parts on other threads
+/// beside its mtimes job.
 struct RootTimes {
+    parts: Box<[RootPart]>,
+}
+
+/// One part of a `RootTimes`.
+#[derive(Default)]
+struct RootPart {
     state: Mutex<RootRead>,
     read: Condvar,
 }
@@ -2390,9 +2432,9 @@ enum RootRead {
     Read(Arc<[Option<SystemTime>]>),
 }
 
-/// Sets `RootTimes` to `Unread` when a read stops without a result, also
+/// Sets a `RootPart` to `Unread` when a read stops without a result, also
 /// when it panics, and wakes the jobs that wait.
-struct UnreadOnStop<'a>(&'a RootTimes, Option<Arc<[Option<SystemTime>]>>);
+struct UnreadOnStop<'a>(&'a RootPart, Option<Arc<[Option<SystemTime>]>>);
 
 impl Drop for UnreadOnStop<'_> {
     fn drop(&mut self) {
@@ -2408,23 +2450,64 @@ impl Drop for UnreadOnStop<'_> {
 /// How many root files a read with `stop` reads between two checks.
 const ROOT_STOP_CHECK: usize = 64;
 
+/// PORT: not in Go (perf). The root files in one part of a `RootTimes`.
+// PERF (tscbpar1 round f): the forecast of small8-big1 (8 light tasks of 15
+// files, then one of 1,500) knows that it has enough light files once the
+// first build infos are parsed, but it waits for the 1,500 root mtimes of
+// the last task, on one thread (an edit shows there), and so does the
+// first load. In parts of 256 files the idle build info threads read
+// them together.
+const ROOT_PART: usize = 256;
+
 impl RootTimes {
-    /// The mtimes of `files`, the root files: read now by the first job
-    /// that asks; a job that asks while another reads them waits for it.
-    /// With `stop`, the read stops when `stop` is true between files and
-    /// gives None; then the next job that asks reads them.
+    /// The parts for `files` root files (none for none).
+    fn new(files: usize) -> Self {
+        RootTimes {
+            parts: (0..files.div_ceil(ROOT_PART))
+                .map(|_| RootPart::default())
+                .collect(),
+        }
+    }
+
+    /// The number of parts.
+    fn parts(&self) -> usize {
+        self.parts.len()
+    }
+
+    /// The mtimes of `files`, the root files that `new` counted, part by
+    /// part (`get_part`). None when the read of a part stops.
     fn get(
         &self,
         fs: &dyn Fs,
         files: &[String],
         stop: Option<&dyn Fn() -> bool>,
+    ) -> Option<Vec<Option<SystemTime>>> {
+        debug_assert_eq!(self.parts.len(), files.len().div_ceil(ROOT_PART));
+        let mut times = Vec::with_capacity(files.len());
+        for part in 0..self.parts.len() {
+            times.extend_from_slice(&self.get_part(fs, files, part, stop)?);
+        }
+        Some(times)
+    }
+
+    /// The mtimes of the files of part `part` of `files`: read now by the
+    /// first job that asks; a job that asks while another reads them waits
+    /// for it. With `stop`, the read stops when `stop` is true between
+    /// files and gives None; then the next job that asks reads them.
+    fn get_part(
+        &self,
+        fs: &dyn Fs,
+        files: &[String],
+        part: usize,
+        stop: Option<&dyn Fn() -> bool>,
     ) -> Option<Arc<[Option<SystemTime>]>> {
-        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let slot = &self.parts[part];
+        let mut state = slot.state.lock().unwrap_or_else(PoisonError::into_inner);
         loop {
             match &*state {
                 RootRead::Read(times) => return Some(times.clone()),
                 RootRead::Reading => {
-                    state = self
+                    state = slot
                         .read
                         .wait(state)
                         .unwrap_or_else(PoisonError::into_inner);
@@ -2434,7 +2517,8 @@ impl RootTimes {
         }
         *state = RootRead::Reading;
         drop(state);
-        let mut done = UnreadOnStop(self, None);
+        let mut done = UnreadOnStop(slot, None);
+        let files = &files[part * ROOT_PART..files.len().min((part + 1) * ROOT_PART)];
         let mut times = Vec::with_capacity(files.len());
         for (index, file) in files.iter().enumerate() {
             if index % ROOT_STOP_CHECK == 0 && stop.is_some_and(|stop| stop()) {
@@ -2651,6 +2735,37 @@ mod tests {
 
     /// The program files of a light rebuild of a 300-file package.
     const WIDE: usize = 363;
+
+    /// `RootTimes`: the parts give the mtimes of every root file in order,
+    /// whichever job reads a part first, and a part whose read stops is
+    /// read again by the next job.
+    #[test]
+    fn root_times_read_in_parts_give_every_mtime_in_order() {
+        let dir = std::env::temp_dir().join(format!("goport-tscb-roots-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut files: Vec<String> = (0..2 * ROOT_PART + 3)
+            .map(|i| {
+                let path = dir.join(format!("m{i}.ts"));
+                std::fs::write(&path, "").unwrap();
+                path.to_str().unwrap().to_string()
+            })
+            .collect();
+        files[ROOT_PART + 1] = dir.join("missing.ts").to_str().unwrap().to_string();
+        let fs = crate::frontend::vfs::osvfs_fs();
+        let expected: Vec<Option<SystemTime>> = files
+            .iter()
+            .map(|file| fs.stat(file).and_then(|stat| stat.mod_time()))
+            .collect();
+        let roots = RootTimes::new(files.len());
+        assert_eq!(roots.parts(), 3);
+        assert!(roots.get(&*fs, &files, Some(&|| true)).is_none());
+        let part = roots.get_part(&*fs, &files, 2, None).unwrap();
+        assert_eq!(part[..], expected[2 * ROOT_PART..]);
+        assert_eq!(roots.get(&*fs, &files, None).unwrap(), expected);
+        assert_eq!(RootTimes::new(0).get(&*fs, &[], None).unwrap(), vec![]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// `RebuildForecast::light`: builders start only with no heavy rebuild
     /// and two light ones that can compile at the same time.
