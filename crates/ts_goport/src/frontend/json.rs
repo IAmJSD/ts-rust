@@ -1955,6 +1955,176 @@ fn json_append_indent(b: &mut String, mut n: usize, prefix: &str, indent: &str) 
 // state machine update. Top-level output has no trailing newline, as in Go
 // `json.Marshal`.
 fn json_append_multiline(compact: &str, prefix: &str, indent: &str) -> Result<String, JsonError> {
+    json_append_multiline_pieces(compact, prefix, indent, None)
+}
+
+/// The size classes of the Go allocator (internal/runtime/gc/sizeclasses.go
+/// `SizeClassToSize`, go1.27.1).
+const GO_SIZE_CLASSES: [usize; 67] = [
+    8, 16, 24, 32, 48, 64, 80, 96, 112, 128, 144, 160, 176, 192, 208, 224, 240, 256, 288, 320, 352,
+    384, 416, 448, 480, 512, 576, 640, 704, 768, 896, 1024, 1152, 1280, 1408, 1536, 1792, 2048,
+    2304, 2688, 3072, 3200, 3456, 4096, 4864, 5376, 6144, 6528, 6784, 6912, 8192, 9472, 9728,
+    10240, 10880, 12288, 13568, 14336, 16384, 18432, 19072, 20480, 21760, 24576, 27264, 28672,
+    32768,
+];
+
+// Go: runtime/slice.go growslice (`nextslicecap`) and runtime/msize.go
+// roundupsize, for a `[]byte` (noscan)
+/// The capacity of a Go `[]byte` with capacity `old_cap` after an `append`
+/// that needs `new_len` bytes.
+fn go_byte_slice_grow(old_cap: usize, new_len: usize) -> usize {
+    let mut new_cap = old_cap;
+    if new_len > 2 * old_cap {
+        new_cap = new_len;
+    } else if old_cap < 256 {
+        new_cap = 2 * old_cap;
+    } else {
+        while new_cap < new_len {
+            new_cap += (new_cap + 3 * 256) >> 2;
+        }
+    }
+    match GO_SIZE_CLASSES.iter().find(|&&size| size >= new_cap) {
+        Some(&size) => size,
+        // A large object takes whole pages of 8 KiB.
+        None => new_cap.next_multiple_of(8192),
+    }
+}
+
+/// Where Go's streaming `jsontext.Encoder` (v2 `MarshalWrite` to an
+/// `io.Writer` that is not a `bytes.Buffer`) writes its buffer out, for
+/// `json_marshal_indent_write`. Its buffer starts empty and grows by Go
+/// `append`. After each token it flushes when the value is complete or the
+/// buffer is more than 3/4 full (`NeedFlush`), except where it may have to
+/// take back an empty member (`avoidFlush`). After a write it doubles a
+/// buffer of up to 2 KiB that is less than half the output so far.
+// Go: jsontext/encode.go NeedFlush, Flush and avoidFlush, the appends of
+// WriteToken, AppendIndent and jsonwire.AppendQuote (go1.27.1).
+#[derive(Default)]
+struct JsonStreamPieces {
+    /// `cap(e.Buf)`.
+    cap: usize,
+    /// The output offset where `e.Buf` starts.
+    start: usize,
+    /// `len(e.Buf)` while a token is appended.
+    len: usize,
+    /// The output offset where each write ends.
+    ends: Vec<usize>,
+}
+
+impl JsonStreamPieces {
+    /// Go `append` of `n` bytes to `e.Buf`.
+    fn append(&mut self, n: usize) {
+        self.reserve(n);
+        self.len += n;
+    }
+
+    /// Go `slices.Grow(e.Buf, n)`.
+    fn reserve(&mut self, n: usize) {
+        if n > 0 && self.len + n > self.cap {
+            self.cap = go_byte_slice_grow(self.cap, self.len + n);
+        }
+    }
+
+    /// The appends of Go `WriteToken` before a token of kind `k`: the
+    /// delimiter and the whitespace. `out_len` is the output length so far
+    /// and `m` the state before the token.
+    fn before_token(
+        &mut self,
+        out_len: usize,
+        m: &JsonMultilineState,
+        k: u8,
+        prefix: &str,
+        indent: &str,
+    ) {
+        self.len = out_len - self.start;
+        let delim = m.need_delim(k);
+        if delim != 0 {
+            self.append(1);
+        }
+        if delim == b':' {
+            self.append(1);
+        } else {
+            let n = m.need_indent(k);
+            if n > 0 {
+                self.append(1);
+                self.append(prefix.len());
+                for _ in 1..n {
+                    self.append(indent.len());
+                }
+            }
+        }
+    }
+
+    /// The appends of Go `WriteToken` for the token `token` of kind `k`.
+    fn token(&mut self, k: u8, token: &[u8]) {
+        if k != b'"' {
+            self.append(token.len());
+            return;
+        }
+        // Go `jsonwire.AppendQuote`: room for the quotes and the unescaped
+        // bytes, then the quote, each run and each escape, and the quote.
+        // The port output escapes what Go escapes; each escape stands for
+        // one byte (`\uXXXX` only below U+0020).
+        let body = &token[1..token.len() - 1];
+        let mut escapes = Vec::new();
+        let mut i = 0;
+        while i < body.len() {
+            if body[i] == b'\\' {
+                let len = if body.get(i + 1) == Some(&b'u') { 6 } else { 2 };
+                escapes.push((i, len));
+                i += len;
+            } else {
+                i += 1;
+            }
+        }
+        let escaped: usize = escapes.iter().map(|&(_, len)| len - 1).sum();
+        self.reserve(token.len() - escaped);
+        self.append(1);
+        let mut run_start = 0;
+        for (at, len) in escapes {
+            self.append(at - run_start);
+            self.append(len);
+            run_start = at + len;
+        }
+        self.append(body.len() - run_start);
+        self.append(1);
+    }
+
+    /// Go `if e.NeedFlush() { e.Flush() }` after a token, with `b` the output
+    /// so far.
+    fn after_token(&mut self, b: &str, m: &JsonMultilineState) {
+        let len = b.len() - self.start;
+        if m.depth() != 1 && len <= 3 * self.cap / 4 {
+            return;
+        }
+        let last = m.last;
+        let avoid = last.length == 0
+            || last.need_object_value()
+            || (last.is_object
+                && last.length % 2 == 0
+                && len >= 2
+                && matches!(
+                    &b.as_bytes()[b.len() - 2..],
+                    b"ll" | b"\"\"" | b"{}" | b"[]"
+                ));
+        if avoid {
+            return;
+        }
+        self.ends.push(b.len());
+        self.start = b.len();
+        if self.cap <= 2048 && self.cap < b.len() / 2 {
+            self.cap *= 2;
+        }
+    }
+}
+
+/// `json_append_multiline`, which also records Go's writes in `pieces`.
+fn json_append_multiline_pieces(
+    compact: &str,
+    prefix: &str,
+    indent: &str,
+    mut pieces: Option<&mut JsonStreamPieces>,
+) -> Result<String, JsonError> {
     let src = compact.as_bytes();
     let mut b = String::with_capacity(compact.len() * 2);
     let mut m = JsonMultilineState {
@@ -1972,6 +2142,9 @@ fn json_append_multiline(compact: &str, prefix: &str, indent: &str) -> Result<St
             continue;
         }
         let k = normalize_kind(c);
+        if let Some(pieces) = pieces.as_deref_mut() {
+            pieces.before_token(b.len(), &m, k, prefix, indent);
+        }
         m.may_append_delim(&mut b, k);
         json_append_whitespace(&m, &mut b, k, prefix, indent);
         let start = i;
@@ -2019,7 +2192,13 @@ fn json_append_multiline(compact: &str, prefix: &str, indent: &str) -> Result<St
                 )));
             }
         }
+        if let Some(pieces) = pieces.as_deref_mut() {
+            pieces.token(k, &src[start..i]);
+        }
         b.push_str(&compact[start..i]);
+        if let Some(pieces) = pieces.as_deref_mut() {
+            pieces.after_token(&b, &m);
+        }
     }
     Ok(b)
 }
@@ -2027,7 +2206,9 @@ fn json_append_multiline(compact: &str, prefix: &str, indent: &str) -> Result<St
 // Go: json/json.go:49 MarshalIndentWrite
 // Used by execute/tsc.go:375 showConfig (prefix "", indent four spaces).
 // PORT: the indented output comes from `json_marshal_indent` (see the
-// PORT notes there and on `json_marshal_write`). There is no trailing newline.
+// PORT notes there and on `json_marshal_write`). There is no trailing
+// newline. It goes out in the writes of Go's streaming encoder
+// (`JsonStreamPieces`), after the whole value is marshaled.
 pub fn json_marshal_indent_write<T: MarshalerTo + ?Sized>(
     out: &mut dyn std::io::Write,
     input: &T,
@@ -2038,9 +2219,20 @@ pub fn json_marshal_indent_write<T: MarshalerTo + ?Sized>(
         // WithIndentPrefix and WithIndent imply multiline output, so skip them.
         return json_marshal_write(out, input, &[]);
     }
-    let b = json_marshal_indent(input, prefix, indent)?;
-    out.write_all(b.as_bytes())
-        .map_err(|err| JsonError::new(err.to_string()))
+    json_check_indent(prefix, " in indent prefix");
+    json_check_indent(indent, " in indent");
+    let compact = json_marshal(input, &[])?;
+    let mut pieces = JsonStreamPieces::default();
+    let b = json_append_multiline_pieces(&compact, prefix, indent, Some(&mut pieces))?;
+    let mut start = 0;
+    for end in pieces.ends.into_iter().chain([b.len()]) {
+        if end > start {
+            out.write_all(&b.as_bytes()[start..end])
+                .map_err(|err| JsonError::new(err.to_string()))?;
+            start = end;
+        }
+    }
+    Ok(())
 }
 
 // Go: json/json.go:57 Unmarshal
@@ -2297,6 +2489,18 @@ mod marshal_indent_tests {
             "{\n \t\"a\": [\n \t\t\"x\",\n \t\t\"y:{\"\n \t],\n \t\"b\": [],\n \t\"c\": [\n \t\t[\n \t\t\ttrue\n \t\t],\n \t\t[]\n \t]\n }"
         );
         assert_eq!(json_marshal_indent("s", "", "  ").unwrap(), "\"s\"");
+    }
+
+    // PORT: not in Go. The writes of Go's streaming encoder for a
+    // `--showConfig` with 31 files (one name needs an escape), recorded with
+    // strace from the pin N oracle: 83 149 178 299 294 46 bytes.
+    #[test]
+    fn json_stream_pieces_match_go_show_config_writes() {
+        let compact = r#"{"compilerOptions":{"lib":["es2022","dom"],"module":"nodenext","outDir":"./out","paths":{"@a/*":["./src/*"]},"strict":true,"target":"es2022","moduleResolution":"nodenext","moduleDetection":"force"},"files":["./m1.ts","./m10.ts","./m11.ts","./m12.ts","./m13.ts","./m14.ts","./m15.ts","./m16.ts","./m17.ts","./m18.ts","./m19.ts","./m2.ts","./m20.ts","./m21.ts","./m22.ts","./m23.ts","./m24.ts","./m25.ts","./m26.ts","./m27.ts","./m28.ts","./m29.ts","./m3.ts","./m30.ts","./m4.ts","./m5.ts","./m6.ts","./m7.ts","./m8.ts","./m9.ts","./q\"x.ts"],"exclude":["out"]}"#;
+        let mut pieces = JsonStreamPieces::default();
+        let out = json_append_multiline_pieces(compact, "", "    ", Some(&mut pieces)).unwrap();
+        assert_eq!(out.len(), 1049);
+        assert_eq!(pieces.ends, [83, 232, 410, 709, 1003, 1049]);
     }
 }
 

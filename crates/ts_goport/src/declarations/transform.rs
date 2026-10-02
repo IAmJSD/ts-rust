@@ -18,7 +18,7 @@ use super::diagnostics::{
 };
 use super::tracker::{SymbolTrackerImpl, SymbolTrackerSharedState, new_symbol_tracker};
 use super::util::{
-    can_produce_diagnostics, is_declaration_and_not_visible, is_enclosing_declaration,
+    can_produce_diagnostics_kind, is_declaration_and_not_visible, is_enclosing_declaration_kind,
     needs_scope_marker,
 };
 use crate::ast::visitor::syntax_list_children;
@@ -362,7 +362,7 @@ impl DeclarationTransformer {
             | SyntaxKind::MissingDeclaration
             | SyntaxKind::ExpressionStatement => Node::NIL,
             // parts of things, things we just visit children of
-            _ => self.visit_declaration_subtree(node),
+            kind => self.visit_declaration_subtree(node, kind),
         }
     }
 
@@ -692,17 +692,26 @@ impl DeclarationTransformer {
         &mut self,
         input: Node,
     ) -> (bool, CleanupDiagnosticContext) {
-        let can_produce_diagnostic = can_produce_diagnostics(input);
+        self.setup_diagnostic_context_of_kind(input, input.kind())
+    }
+
+    /// `setup_diagnostic_context` of a node of kind `kind`.
+    // PERF: emitast2. The caller has read the kind (`visit_declaration_subtree`).
+    fn setup_diagnostic_context_of_kind(
+        &mut self,
+        input: Node,
+        kind: SyntaxKind,
+    ) -> (bool, CleanupDiagnosticContext) {
+        let can_produce_diagnostic = can_produce_diagnostics_kind(kind);
         let old_within_object_literal_type = self.suppress_new_diagnostic_contexts;
         // PERF: pure kind tests; read each kind once. The parent kind is still
         // read only for a type literal or mapped type, as in Go.
-        let should_enter_suppress_new_diagnostics_context_context = matches!(
-            input.kind(),
-            SyntaxKind::TypeLiteral | SyntaxKind::MappedType
-        ) && !matches!(
-            input.parent().kind(),
-            SyntaxKind::TypeAliasDeclaration | SyntaxKind::JsTypeAliasDeclaration
-        );
+        let should_enter_suppress_new_diagnostics_context_context =
+            matches!(kind, SyntaxKind::TypeLiteral | SyntaxKind::MappedType)
+                && !matches!(
+                    input.parent().kind(),
+                    SyntaxKind::TypeAliasDeclaration | SyntaxKind::JsTypeAliasDeclaration
+                );
 
         let old_diag = self
             .state
@@ -730,11 +739,20 @@ impl DeclarationTransformer {
     }
 
     // Go: transformers/declarations/transform.go:571 DeclarationTransformer.visitDeclarationSubtree
-    fn visit_declaration_subtree(&mut self, input: Node) -> Node {
+    // PERF: emitast2. `kind` is the kind of `input`, which `visit` has read.
+    // The kind tests below use it: a kind read of a factory node goes to the
+    // synthetic arena each time.
+    fn visit_declaration_subtree(&mut self, input: Node, kind: SyntaxKind) -> Node {
         if self.should_strip_internal(input) {
             return Node::NIL;
         }
-        if is_declaration(input) {
+        // Go `ast.IsDeclaration(input)`.
+        let is_declaration = if kind == SyntaxKind::TypeParameter {
+            input.parent().is_some()
+        } else {
+            is_declaration_node(input)
+        };
+        if is_declaration {
             if is_declaration_and_not_visible(&self.emit_context, &*self.resolver, input) {
                 return Node::NIL;
             }
@@ -780,15 +798,15 @@ impl DeclarationTransformer {
         }
 
         // Elide implementation signatures from overload sets
-        if is_function_like(input) && self.resolver.is_implementation_of_overload(input) {
+        if is_function_like_kind(kind) && self.resolver.is_implementation_of_overload(input) {
             return Node::NIL;
         }
 
-        if input.kind() == SyntaxKind::SemicolonClassElement {
+        if kind == SyntaxKind::SemicolonClassElement {
             return Node::NIL;
         }
 
-        if is_heritage_clause(input) {
+        if kind == SyntaxKind::HeritageClause {
             let types = input.types().nodes();
             if types.len() == 0 || (types.len() == 1 && node_is_missing(types.get(0))) {
                 return Node::NIL;
@@ -796,14 +814,14 @@ impl DeclarationTransformer {
         }
 
         let previous_enclosing_declaration = self.enclosing_declaration;
-        if is_enclosing_declaration(input) {
+        if is_enclosing_declaration_kind(kind) {
             self.enclosing_declaration = input;
         }
 
         let (can_produce_diagnostic, cleanup_diagnostic_context) =
-            self.setup_diagnostic_context(input);
+            self.setup_diagnostic_context_of_kind(input, kind);
 
-        let result = match input.kind() {
+        let result = match kind {
             SyntaxKind::MappedType => self.transform_mapped_type_node(input),
             SyntaxKind::HeritageClause => self.transform_heritage_clause(input),
             SyntaxKind::MethodSignature => self.transform_method_signature_declaration(input),

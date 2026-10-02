@@ -31,8 +31,13 @@ pub(crate) fn can_have_literal_initializer(host: &dyn DeclarationEmitHost, node:
 // PERF: Go chains 23 `ast.Is*` tests. Each one is a pure kind compare, so one
 // kind read and one match give the same result. The arms keep the Go order.
 pub(crate) fn can_produce_diagnostics(node: Node) -> bool {
+    can_produce_diagnostics_kind(node.kind())
+}
+
+/// `can_produce_diagnostics` of a node of kind `kind`.
+pub(crate) fn can_produce_diagnostics_kind(kind: SyntaxKind) -> bool {
     matches!(
-        node.kind(),
+        kind,
         SyntaxKind::VariableDeclaration
             | SyntaxKind::PropertyDeclaration
             | SyntaxKind::PropertySignature
@@ -121,16 +126,25 @@ pub(crate) fn get_binding_name_visible(resolver: &dyn EmitResolver, elem: Node) 
 
 // Go: transformers/declarations/util.go:109 isEnclosingDeclaration
 pub(crate) fn is_enclosing_declaration(node: Node) -> bool {
-    is_source_file(node)
-        || is_type_alias_declaration(node)
-        || is_js_type_alias_declaration(node)
-        || is_module_declaration(node)
-        || is_class_declaration(node)
-        || is_interface_declaration(node)
-        || is_function_like(node)
-        || is_index_signature_declaration(node)
-        || is_mapped_type_node(node)
-        || is_variable_declaration(node)
+    is_enclosing_declaration_kind(node.kind())
+}
+
+/// `is_enclosing_declaration` of a node of kind `kind`.
+// PERF: emitast2. Each test of Go `isEnclosingDeclaration` is a kind test, so
+// the kind is read once.
+pub(crate) fn is_enclosing_declaration_kind(kind: SyntaxKind) -> bool {
+    matches!(
+        kind,
+        SyntaxKind::SourceFile
+            | SyntaxKind::TypeAliasDeclaration
+            | SyntaxKind::JsTypeAliasDeclaration
+            | SyntaxKind::ModuleDeclaration
+            | SyntaxKind::ClassDeclaration
+            | SyntaxKind::InterfaceDeclaration
+            | SyntaxKind::IndexSignature
+            | SyntaxKind::MappedType
+            | SyntaxKind::VariableDeclaration
+    ) || is_function_like_kind(kind)
 }
 
 // Go: transformers/declarations/util.go:121 isAlwaysType

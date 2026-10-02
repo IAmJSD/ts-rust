@@ -1067,7 +1067,9 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     // PORT: not in Go. Go `os.Chtimes` (utimensat on the path) sets the
-    // mtime of a file that its owner cannot read; so does `chtimes`.
+    // mtime of a file that its owner cannot read; so does `chtimes`. The
+    // test skips when the file still opens (root, CAP_DAC_OVERRIDE): then a
+    // `chtimes` that opens the file would pass too.
     #[test]
     fn chtimes_without_read_permission() {
         let dir = std::env::temp_dir().join(format!("ts_goport_chtimes_{}", std::process::id()));
@@ -1076,6 +1078,11 @@ mod tests {
         let file = dir.join("out.js");
         std::fs::write(&file, "x").unwrap();
         std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::File::open(&file).is_ok() {
+            let _ = std::fs::remove_dir_all(&dir);
+            eprintln!("skipped: a file without read permission opens here");
+            return;
+        }
         let m_time = SystemTime::UNIX_EPOCH + std::time::Duration::new(1_700_000_000, 5);
         let result = osvfs_fs().chtimes(file.to_str().unwrap(), None, Some(m_time));
         let modified = std::fs::symlink_metadata(&file)

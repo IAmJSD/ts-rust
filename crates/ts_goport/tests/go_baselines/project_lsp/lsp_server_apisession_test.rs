@@ -1,11 +1,12 @@
 //! Port-only tests of the API session of the LSP server
-//! (`custom/initializeAPISession`, Go `server.go:1725
+//! (`custom/initializeAPISession`, Go `server.go:2280
 //! handleInitializeAPISession`).
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::mpsc::TryRecvError;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ts_goport::jsonrpc;
@@ -18,7 +19,9 @@ use super::util::uri;
 const A_TS: &str = "export const a = 1;\n";
 
 /// An initialized server with `/home/projects/a.ts` open.
-fn start_server() -> LspClient {
+fn start_server(
+    on_server_notification: Option<lsptestutil::ServerNotificationHandler>,
+) -> LspClient {
     let on_server_request: lsptestutil::ServerRequestHandler = Arc::new(|req| {
         if req.method == lsproto::Method::CLIENT_REGISTER_CAPABILITY
             || req.method == lsproto::Method::CLIENT_UNREGISTER_CAPABILITY
@@ -40,7 +43,7 @@ fn start_server() -> LspClient {
             ]),
         ),
         Some(on_server_request),
-        None,
+        on_server_notification,
     );
     let (init_msg, _) = client.send_request(
         &lsproto::INITIALIZE_INFO,
@@ -188,7 +191,7 @@ child_test! {
     // server must answer LSP requests before and while an API client is
     // connected, answer API requests, and stop on shutdown and exit.
     fn api_session_keeps_lsp_served() {
-        let client = start_server();
+        let client = start_server(None);
         let pipe = init_api_session(&client);
 
         // No API client yet.
@@ -213,8 +216,24 @@ child_test! {
     // its dispatch goroutine (server.go:968). The port serves the ones that
     // do not need the session (didChange here) in order, keeps the others
     // (hover), and serves shutdown and exit wherever they are in the queue.
+    // The server logs each message it handled (`window/logMessage`, Go
+    // server.go:1182 "handled method"), so the log shows that didChange
+    // was served before shutdown and the hover was not.
     fn api_callback_wait_serves_shutdown_and_exit_behind_other_messages() {
-        let client = start_server();
+        let handled = Arc::new(Mutex::new(Vec::<String>::new()));
+        let log = Arc::clone(&handled);
+        let client = start_server(Some(Arc::new(move |msg| {
+            if msg.method != lsproto::Method::WINDOW_LOG_MESSAGE {
+                return;
+            }
+            if let Ok(params) = lsproto::unmarshal_params::<lsproto::LogMessageParams>(msg) {
+                if params.message.starts_with("handled method") {
+                    log.lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push(params.message);
+                }
+            }
+        })));
         let pipe = init_api_session(&client);
         let mut api = ApiClient::connect(&pipe);
         api.send(r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#);
@@ -249,9 +268,33 @@ child_test! {
                 }],
             },
         );
-        let _kept_hover =
-            client.send_request_async(&lsproto::TEXT_DOCUMENT_HOVER_INFO, hover_params());
+        let hover_id = jsonrpc::new_id_int(client.next_id());
+        let kept_hover = client.send_request_message(
+            lsproto::TEXT_DOCUMENT_HOVER_INFO.new_request_message(Some(hover_id.clone()), hover_params()),
+            hover_id,
+        );
         shutdown_and_exit(&client);
+
+        let handled = handled
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let position = |method: &str| {
+            handled
+                .iter()
+                .position(|line| line.starts_with(&format!("handled method '{method}'")))
+        };
+        let did_change = position("textDocument/didChange");
+        let shutdown = position("shutdown");
+        assert!(
+            did_change.is_some() && did_change < shutdown,
+            "didChange was not served before shutdown: {handled:?}"
+        );
+        assert_eq!(position("textDocument/hover"), None, "{handled:?}");
+        assert!(
+            matches!(kept_hover.try_recv(), Err(TryRecvError::Empty)),
+            "the hover was answered"
+        );
         drop(api);
         let _ = std::fs::remove_file(&pipe);
     }

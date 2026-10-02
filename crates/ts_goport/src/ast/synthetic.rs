@@ -118,6 +118,11 @@ struct SyntheticNode {
     /// the node to it, so a list handle taken before the write still reads
     /// the old list, like a Go `*NodeList` pointer.
     data: u32,
+    /// The kind of the astdata node `data`, so a kind read needs no data
+    /// lookup (emitast1 F3).
+    kind: SyntaxKind,
+    /// Go `CompositeBase.facts` (`Node::subtree_facts`; emitast1 F1).
+    facts: SlotFacts,
     parent: Node,
     flags: NodeFlags,
     loc: TextRange,
@@ -129,6 +134,20 @@ struct SyntheticNode {
     /// The Go `ast.SourceFile` fields of a factory SourceFile. `None` for
     /// other kinds.
     source_file: Option<Box<SyntheticSourceFileData>>,
+}
+
+/// The cached `Node::subtree_facts` of a factory node: `COMPUTED` is set
+/// once they are cached. A copy (`Clone`) has none cached: each thread
+/// computes the facts of its nodes, as with the per-thread map of parsed
+/// nodes (`ast::SUBTREE_FACTS`), so a node that a seed or a print pack
+/// copies gets the facts of its data on the new thread.
+#[derive(Default)]
+struct SlotFacts(SubtreeFacts);
+
+impl Clone for SlotFacts {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
 }
 
 /// The Go `ast.SourceFile` fields (other than `Statements` and
@@ -246,6 +265,15 @@ struct OwnerChunks {
     lists: Vec<u32>,
 }
 
+impl OwnerChunks {
+    const EMPTY: Self = Self {
+        slots: Vec::new(),
+        datas: Vec::new(),
+        data_fill: 0,
+        lists: Vec::new(),
+    };
+}
+
 /// The synthetic nodes of one thread. Each table is a list of chunks, and
 /// each chunk has one owner. Entry `i` of a table with `N` entries per
 /// chunk is entry `i % N` of chunk `i / N`. A freed chunk is `None`. Chunk
@@ -296,25 +324,42 @@ struct SyntheticArena {
 }
 
 impl SyntheticArena {
-    fn new() -> Self {
-        let mut arena = Self {
+    /// An arena with no entry. The nil slot (slot 0) comes with the first
+    /// slot (`push_slot`), but counts as made from the start
+    /// (`slots_made`).
+    // PERF: emitast1 F3. A `const` value, so `ARENA` is a `const` thread
+    // local: each access is an inline thread pointer load, not a call to
+    // the lazy initializer.
+    const fn new() -> Self {
+        Self {
             slots: Vec::new(),
             slot_owner: Vec::new(),
-            aliases: FxHashMap::default(),
+            aliases: FxHashMap::with_hasher(rustc_hash::FxBuildHasher),
             datas: Vec::new(),
             lists: Vec::new(),
             slices: Vec::new(),
-            base: OwnerChunks::default(),
-            owners: FxHashMap::default(),
-            alias_files: FxHashMap::default(),
+            base: OwnerChunks::EMPTY,
+            owners: FxHashMap::with_hasher(rustc_hash::FxBuildHasher),
+            alias_files: FxHashMap::with_hasher(rustc_hash::FxBuildHasher),
             dead_seen: 0,
             last: None,
-            slots_made: 0,
+            slots_made: 1,
             shared: None,
-        };
-        let nil = arena.push_slot(OwnerKey::Base, Slot::Nil);
+        }
+    }
+
+    /// Adds the nil slot to an arena with no slot.
+    fn ensure_nil_slot(&mut self) {
+        if self.slots.is_empty() {
+            self.add_nil_slot();
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn add_nil_slot(&mut self) {
+        let nil = self.push_slot_in(OwnerKey::Base, Slot::Nil);
         debug_assert_eq!(nil, NIL_SLOT);
-        arena
     }
 
     /// The owner of a new node, factory list or list copy: the owner of the
@@ -344,34 +389,6 @@ impl SyntheticArena {
         };
         self.last = Some((program, owner));
         owner
-    }
-
-    /// The chunks of `owner`, which must be open (a file owner opens with
-    /// `alias_owner`).
-    fn chunks(&self, owner: OwnerKey) -> &OwnerChunks {
-        match owner {
-            OwnerKey::Base => &self.base,
-            OwnerKey::Program(id) => self.owners.get(&id).expect("synthetic owner is not open"),
-            OwnerKey::File(file) => self
-                .alias_files
-                .get(&file)
-                .expect("synthetic owner is not open"),
-        }
-    }
-
-    /// `chunks` to write.
-    fn chunks_mut(&mut self, owner: OwnerKey) -> &mut OwnerChunks {
-        match owner {
-            OwnerKey::Base => &mut self.base,
-            OwnerKey::Program(id) => self
-                .owners
-                .get_mut(&id)
-                .expect("synthetic owner is not open"),
-            OwnerKey::File(file) => self
-                .alias_files
-                .get_mut(&file)
-                .expect("synthetic owner is not open"),
-        }
     }
 
     /// The owner of a new alias slot for parsed node `n`, or of a file
@@ -420,8 +437,14 @@ impl SyntheticArena {
                 }
             }
         }
-        let dead: FxHashSet<usize> = dead.into_iter().collect();
-        self.aliases.retain(|n, _| !dead.contains(&n.file_index()));
+        // PERF: emitast2. An editor edit kills one version: compare its id,
+        // with no set lookup per alias.
+        if let [file] = dead[..] {
+            self.aliases.retain(|n, _| n.file_index() != file);
+        } else {
+            let dead: FxHashSet<usize> = dead.into_iter().collect();
+            self.aliases.retain(|n, _| !dead.contains(&n.file_index()));
+        }
     }
 
     /// Slot `index`. Panics when its owner was freed.
@@ -437,30 +460,53 @@ impl SyntheticArena {
 
     /// Adds a slot of `owner` and returns its index.
     fn push_slot(&mut self, owner: OwnerKey, slot: Slot) -> u32 {
-        let open = self
-            .chunks(owner)
-            .slots
-            .last()
-            .copied()
-            .filter(|&c| self.slots[c as usize].as_ref().expect(FREED).len() < SLOT_CHUNK);
-        let c = match open {
-            Some(c) => c,
-            None => {
-                let c = self.new_chunk_number(SLOT_TABLE, self.slots.len(), SLOT_CHUNK);
-                set_chunk(&mut self.slots, c, Vec::with_capacity(SLOT_CHUNK));
-                if self.slot_owner.len() <= c as usize {
-                    self.slot_owner.resize(c as usize + 1, OwnerKey::Base);
-                }
-                self.slot_owner[c as usize] = owner;
-                self.chunks_mut(owner).slots.push(c);
-                c
-            }
-        };
-        let chunk = self.slots[c as usize].as_mut().expect(FREED);
-        chunk.push(slot);
-        let index = c as usize * SLOT_CHUNK + chunk.len() - 1;
+        self.ensure_nil_slot();
         self.slots_made += 1;
-        index as u32
+        self.push_slot_in(owner, slot)
+    }
+
+    /// `push_slot` in an arena that has the nil slot (or for the nil slot).
+    fn push_slot_in(&mut self, owner: OwnerKey, slot: Slot) -> u32 {
+        let Self {
+            slots,
+            slot_owner,
+            base,
+            owners,
+            alias_files,
+            shared,
+            ..
+        } = self;
+        let chunks = owner_chunks(base, owners, alias_files, owner);
+        push_slot_into(slots, slot_owner, shared, chunks, owner, slot)
+    }
+
+    /// Adds the data entry and the node slot of a new node of `owner`
+    /// (`alloc_synthetic_node`) and returns the slot index. `slot` makes the
+    /// slot from the data index.
+    // PERF: emitast2. One lookup of the chunks of `owner` for both entries
+    // (a hash lookup for a program owner); `push_data` and `push_slot` made
+    // three.
+    fn push_node(
+        &mut self,
+        owner: OwnerKey,
+        node: crate::astdata::Node,
+        slot: impl FnOnce(u32) -> Slot,
+    ) -> u32 {
+        self.ensure_nil_slot();
+        self.slots_made += 1;
+        let Self {
+            slots,
+            slot_owner,
+            datas,
+            base,
+            owners,
+            alias_files,
+            shared,
+            ..
+        } = self;
+        let chunks = owner_chunks(base, owners, alias_files, owner);
+        let data = push_data_into(datas, shared, chunks, node);
+        push_slot_into(slots, slot_owner, shared, chunks, owner, slot(data))
     }
 
     /// The astdata node of data entry `index`. Panics when its owner was
@@ -475,30 +521,16 @@ impl SyntheticArena {
 
     /// Adds a data entry of `owner` and returns its index.
     fn push_data(&mut self, owner: OwnerKey, node: crate::astdata::Node) -> u32 {
-        let chunks = self.chunks(owner);
-        let fill = chunks.data_fill;
-        let open = chunks
-            .datas
-            .last()
-            .copied()
-            .filter(|_| (fill as usize) < DATA_CHUNK);
-        let (c, cell) = match open {
-            Some(c) => (c, fill),
-            None => {
-                let c = self.new_chunk_number(DATA_TABLE, self.datas.len(), DATA_CHUNK);
-                set_chunk(&mut self.datas, c, empty_data_chunk());
-                self.chunks_mut(owner).datas.push(c);
-                (c, 0)
-            }
-        };
-        self.chunks_mut(owner).data_fill = cell + 1;
-        assert!(
-            self.datas[c as usize].as_ref().expect(FREED)[cell as usize]
-                .set(node)
-                .is_ok(),
-            "synthetic node data entry is filled twice"
-        );
-        (c as usize * DATA_CHUNK + cell as usize) as u32
+        let Self {
+            datas,
+            base,
+            owners,
+            alias_files,
+            shared,
+            ..
+        } = self;
+        let chunks = owner_chunks(base, owners, alias_files, owner);
+        push_data_into(datas, shared, chunks, node)
     }
 
     /// The factory list of entry `index`. Panics when its owner was freed.
@@ -510,37 +542,53 @@ impl SyntheticArena {
 
     /// Adds a factory list of `owner` and returns its index.
     fn push_list(&mut self, owner: OwnerKey, list: OwnList) -> u32 {
-        let open = self
-            .chunks(owner)
+        let Self {
+            lists,
+            base,
+            owners,
+            alias_files,
+            shared,
+            ..
+        } = self;
+        let chunks = owner_chunks(base, owners, alias_files, owner);
+        let open = chunks
             .lists
             .last()
             .copied()
-            .filter(|&c| self.lists[c as usize].as_ref().expect(FREED).len() < LIST_CHUNK);
+            .filter(|&c| lists[c as usize].as_ref().expect(FREED).len() < LIST_CHUNK);
         let c = match open {
             Some(c) => c,
             None => {
-                let c = self.new_chunk_number(LIST_TABLE, self.lists.len(), LIST_CHUNK);
-                set_chunk(&mut self.lists, c, Vec::with_capacity(LIST_CHUNK));
-                self.chunks_mut(owner).lists.push(c);
+                let c = new_chunk_number(shared, LIST_TABLE, lists.len(), LIST_CHUNK);
+                set_chunk(lists, c, Vec::with_capacity(LIST_CHUNK));
+                chunks.lists.push(c);
                 c
             }
         };
-        let chunk = self.lists[c as usize].as_mut().expect(FREED);
+        let chunk = lists[c as usize].as_mut().expect(FREED);
         chunk.push(list);
         (c as usize * LIST_CHUNK + chunk.len() - 1) as u32
     }
 
     /// The node slot of synthetic handle `n`.
+    // PERF: emitast1. Out of line, as before: inlined at every synthetic
+    // field read, it made `tsgo -p` effect check (16 threads) 0.9% to
+    // 1.5% slower on mini-743d with the same instruction count (runs t3,
+    // t5, t6); out of line it is +0.15% there, with the same emit gain.
+    #[inline(never)]
     fn node(&self, n: Node) -> &SyntheticNode {
         match self.slot(slot_index(n)) {
             Slot::Node(s) => s,
-            Slot::Absent => panic!("{ABSENT}"),
-            _ => panic!("synthetic handle does not name a node slot"),
+            other => not_a_node_slot(other),
         }
     }
 
     /// The Go node that synthetic-space id `index` stands for.
     fn resolve(&self, index: usize) -> Node {
+        // The nil id, also in an arena with no slot yet.
+        if index == NIL_SLOT as usize {
+            return Node::NIL;
+        }
         match self.slot(index) {
             Slot::Nil => Node::NIL,
             Slot::Alias(target) => *target,
@@ -559,22 +607,121 @@ impl SyntheticArena {
             SyntheticList::Slice { .. } => panic!("a node slice is not a NodeList"),
         }
     }
+}
 
-    /// The number of a new chunk of `table`, which has `len` chunks with
-    /// `per_chunk` entries each: `len`, or the next number of the shared
-    /// counter (`SharedChunks`). Entry ids are `u32` and are not used again,
-    /// so a thread that makes about 4 billion entries of one kind runs out
-    /// of them.
-    fn new_chunk_number(&self, table: usize, len: usize, per_chunk: usize) -> u32 {
-        let c = match &self.shared {
-            None => len,
-            Some(shared) => shared.next[table].fetch_add(1, Ordering::Relaxed) as usize,
-        };
-        assert!(
-            (c + 1) * per_chunk < u32::MAX as usize,
-            "synthetic entry ids exhausted"
-        );
-        c as u32
+/// The number of a new chunk of `table`, which has `len` chunks with
+/// `per_chunk` entries each: `len`, or the next number of the shared
+/// counter (`SyntheticArena::shared`). Entry ids are `u32` and are not used
+/// again, so a thread that makes about 4 billion entries of one kind runs
+/// out of them.
+fn new_chunk_number(
+    shared: &Option<Arc<SharedChunks>>,
+    table: usize,
+    len: usize,
+    per_chunk: usize,
+) -> u32 {
+    let c = match shared {
+        None => len,
+        Some(shared) => shared.next[table].fetch_add(1, Ordering::Relaxed) as usize,
+    };
+    assert!(
+        (c + 1) * per_chunk < u32::MAX as usize,
+        "synthetic entry ids exhausted"
+    );
+    c as u32
+}
+
+/// The chunks of `owner`, which must be open (a file owner opens with
+/// `SyntheticArena::alias_owner`), from the owner fields of an arena, so the
+/// caller can still borrow its tables.
+fn owner_chunks<'a>(
+    base: &'a mut OwnerChunks,
+    owners: &'a mut FxHashMap<u32, OwnerChunks>,
+    alias_files: &'a mut FxHashMap<u32, OwnerChunks>,
+    owner: OwnerKey,
+) -> &'a mut OwnerChunks {
+    match owner {
+        OwnerKey::Base => base,
+        OwnerKey::Program(id) => owners.get_mut(&id).expect("synthetic owner is not open"),
+        OwnerKey::File(file) => alias_files
+            .get_mut(&file)
+            .expect("synthetic owner is not open"),
+    }
+}
+
+/// `SyntheticArena::push_slot_in` on the arena tables: `chunks` are the
+/// chunks of `owner`.
+fn push_slot_into(
+    slots: &mut Vec<Option<Vec<Slot>>>,
+    slot_owner: &mut Vec<OwnerKey>,
+    shared: &Option<Arc<SharedChunks>>,
+    chunks: &mut OwnerChunks,
+    owner: OwnerKey,
+    slot: Slot,
+) -> u32 {
+    let open = chunks
+        .slots
+        .last()
+        .copied()
+        .filter(|&c| slots[c as usize].as_ref().expect(FREED).len() < SLOT_CHUNK);
+    let c = match open {
+        Some(c) => c,
+        None => {
+            let c = new_chunk_number(shared, SLOT_TABLE, slots.len(), SLOT_CHUNK);
+            set_chunk(slots, c, Vec::with_capacity(SLOT_CHUNK));
+            if slot_owner.len() <= c as usize {
+                slot_owner.resize(c as usize + 1, OwnerKey::Base);
+            }
+            slot_owner[c as usize] = owner;
+            chunks.slots.push(c);
+            c
+        }
+    };
+    let chunk = slots[c as usize].as_mut().expect(FREED);
+    chunk.push(slot);
+    (c as usize * SLOT_CHUNK + chunk.len() - 1) as u32
+}
+
+/// `SyntheticArena::push_data` on the arena tables: `chunks` are the chunks
+/// of the owner.
+fn push_data_into(
+    datas: &mut Vec<Option<DataChunk>>,
+    shared: &Option<Arc<SharedChunks>>,
+    chunks: &mut OwnerChunks,
+    node: crate::astdata::Node,
+) -> u32 {
+    let fill = chunks.data_fill;
+    let open = chunks
+        .datas
+        .last()
+        .copied()
+        .filter(|_| (fill as usize) < DATA_CHUNK);
+    let (c, cell) = match open {
+        Some(c) => (c, fill),
+        None => {
+            let c = new_chunk_number(shared, DATA_TABLE, datas.len(), DATA_CHUNK);
+            set_chunk(datas, c, empty_data_chunk());
+            chunks.datas.push(c);
+            (c, 0)
+        }
+    };
+    chunks.data_fill = cell + 1;
+    assert!(
+        datas[c as usize].as_ref().expect(FREED)[cell as usize]
+            .set(node)
+            .is_ok(),
+        "synthetic node data entry is filled twice"
+    );
+    (c as usize * DATA_CHUNK + cell as usize) as u32
+}
+
+/// The panic of `SyntheticArena::node` on a slot that is not a node slot.
+#[cold]
+#[inline(never)]
+fn not_a_node_slot(slot: &Slot) -> ! {
+    match slot {
+        Slot::Absent => panic!("{ABSENT}"),
+        _ => panic!("synthetic handle does not name a node slot"),
     }
 }
 
@@ -606,7 +753,7 @@ static EMPTY_BIND: NodeBindData = NodeBindData {
 };
 
 thread_local! {
-    static ARENA: RefCell<SyntheticArena> = RefCell::new(SyntheticArena::new());
+    static ARENA: RefCell<SyntheticArena> = const { RefCell::new(SyntheticArena::new()) };
     /// The owner of the innermost open scope on this thread
     /// (`enter_base_synthetic_owner`, `enter_file_synthetic_owner`).
     static SCOPE_OWNER: Cell<Option<OwnerKey>> = const { Cell::new(None) };
@@ -811,6 +958,8 @@ pub fn install_synthetic_seed(seed: SyntheticSeed) {
 pub fn share_synthetic_chunks() -> Arc<SharedChunks> {
     ARENA.with(|a| {
         let mut a = a.borrow_mut();
+        // The nil chunk is this thread's: the twin's own chunks come after.
+        a.ensure_nil_slot();
         let lens = [a.slots.len(), a.datas.len(), a.lists.len()];
         Arc::clone(a.shared.get_or_insert_with(|| {
             Arc::new(SharedChunks {
@@ -1435,15 +1584,33 @@ pub fn synthetic_loc(n: Node) -> TextRange {
     with_node(n, |s| s.loc)
 }
 
-/// Hook for `Node::kind` on a synthetic node. It reads the kind while it
-/// borrows the arena, so it does not clone the data chunk
+/// Hook for `Node::kind` on a synthetic node. It reads the kind in the
+/// slot, so it does not look up the data entry or clone its chunk
 /// (`synthetic_ast_node`).
 #[must_use]
 pub fn synthetic_kind(n: Node) -> SyntaxKind {
     ARENA.with(|a| {
         let a = a.borrow();
-        a.data(a.node(n).data).kind
+        let s = a.node(n);
+        debug_assert_eq!(s.kind, a.data(s.data).kind, "synthetic slot kind");
+        s.kind
     })
+}
+
+/// The cached `Node::subtree_facts` of synthetic node `n`, if any.
+#[must_use]
+pub fn synthetic_subtree_facts(n: Node) -> Option<SubtreeFacts> {
+    with_node(n, |s| {
+        s.facts
+            .0
+            .intersects(SubtreeFacts::COMPUTED)
+            .then(|| s.facts.0.without(SubtreeFacts::COMPUTED))
+    })
+}
+
+/// Caches `facts` as the `Node::subtree_facts` of synthetic node `n`.
+pub fn set_synthetic_subtree_facts(n: Node, facts: SubtreeFacts) {
+    with_node_mut(n, |s| s.facts = SlotFacts(facts | SubtreeFacts::COMPUTED));
 }
 
 /// Hook for `Node::bind` on a synthetic node. The data belongs to the
@@ -1629,6 +1796,16 @@ pub fn set_node_flags(n: Node, flags: NodeFlags) {
     with_node_mut(n, |s| s.flags = flags);
 }
 
+/// Go `node.Flags |= flags`.
+// PERF: emitast2. One arena access for a synthetic node (the factory
+// `onCreate` hook), not a flag read and a flag write.
+pub fn add_node_flags(n: Node, flags: NodeFlags) {
+    if is_store_node(n) {
+        return set_store_node_flags(n, n.flags() | flags);
+    }
+    with_node_mut(n, |s| s.flags |= flags);
+}
+
 /// Gives synthetic node `n` a new astdata node that `f` makes from the
 /// current one. The old one stays in the arena for the list handles taken
 /// before (see `SyntheticNode::data`). The new one belongs to the owner of
@@ -1646,12 +1823,14 @@ fn replace_synthetic_ast_node(
         let mut a = a.borrow_mut();
         let index = slot_index(n);
         let node = f(a.data(a.node(n).data));
+        let kind = node.kind;
         let owner = a.slot_owner[index / SLOT_CHUNK];
         let data = a.push_data(owner, node);
         let Slot::Node(s) = a.slot_mut(index) else {
             panic!("synthetic handle does not name a node slot");
         };
         s.data = data;
+        s.kind = kind;
     });
 }
 
@@ -1792,19 +1971,19 @@ pub fn alloc_synthetic_node(kind: SyntaxKind, data: NodeData) -> Node {
     ARENA.with(|a| {
         let mut a = a.borrow_mut();
         let owner = a.current_owner();
-        let data = a.push_data(owner, node);
-        handle(a.push_slot(
-            owner,
+        handle(a.push_node(owner, node, |data| {
             Slot::Node(SyntheticNode {
                 data,
+                kind,
+                facts: SlotFacts::default(),
                 parent: Node::NIL,
                 flags: NodeFlags::NONE,
                 loc: TextRange::undefined(),
                 bind: None,
                 synthetic_type: TypeId::NIL,
                 source_file: None,
-            }),
-        ))
+            })
+        }))
     })
 }
 

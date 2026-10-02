@@ -545,6 +545,22 @@ process (bin/tsgo.rs `go_runtime_start`).
   SIGINT and SIGTERM go to `notify_context`. PORT: Go then prints the
   goroutines. SIGABRT and SIGTRAP keep their default actions. Other
   systems keep the default actions.
+- PORT: SIGILL, SIGBUS, SIGFPE and SIGSEGV keep their default actions,
+  also when another process sends them (`kill`). Go throws a sent one
+  (`sigFromUser`) as it throws SIGQUIT: it prints the name (`SIGSEGV:
+  segmentation violation`), the PC line and the goroutines and exits 2. In
+  the port the process ends by the signal (128 + N, a core dump where the
+  limit allows it).
+- PORT: the signal mask. On each thread Go unblocks the signals that it
+  must get (sigtab `_SigUnblock`, `_SigKill` or `_SigThrow`: SIGHUP,
+  SIGINT, SIGTERM, SIGQUIT, SIGILL, SIGSEGV and others), and a process that
+  it starts gets the mask that Go inherited. The port does not change the
+  mask: an inherited blocked SIGINT or SIGTERM stays blocked in tsgo, and a
+  process that the port starts with std `Command` (the content mapper, npm,
+  the launcher's worker) gets an empty mask.
+- PORT: `GOTRACEBACK` does nothing. With `GOTRACEBACK=crash`, Go ends a
+  thrown signal or a fatal panic with SIGABRT (`crash`, a core dump) after
+  the goroutines; the port exits 2 as with the default setting.
 - The launcher (`launch`) drops the same signals and sends SIGINT, SIGTERM
   and the thrown signals on to its worker. The worker gets no environment
   variable and no file descriptor from the launcher, so its children get
@@ -562,9 +578,11 @@ process (bin/tsgo.rs `go_runtime_start`).
   of the affinity mask, lowered to the CPU limit of the process's cgroup
   (rounded up, at least 2), as in Go 1.25 and later. It sizes the parse,
   bind and emit pools (`program::available_cores`), the auto-import
-  checker pool and the search threads. PORT: the checker threads
-  (`--checkers`) all run at once; Go runs them on GOMAXPROCS threads. Go
-  reads the value again while it runs; the port reads it once.
+  checker pool and the search threads, and the LSP telemetry event
+  reports it as `goMaxProcs` (Go runtime/metrics
+  `/sched/gomaxprocs:threads`). PORT: the checker threads (`--checkers`)
+  all run at once; Go runs them on GOMAXPROCS threads. Go reads the value
+  again while it runs; the port reads it once.
 - `GOGC` and `GOMEMLIMIT` (the VS Code `goMemLimit` setting) do nothing:
   the port has no garbage collector.
 

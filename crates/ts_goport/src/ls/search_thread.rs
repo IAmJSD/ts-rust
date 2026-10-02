@@ -344,11 +344,10 @@ fn spawn_search_thread(program: &compiler::NewProgram) -> mpsc::Sender<Job> {
         crate::program::WorkerSeed::take()
     };
     let (jobs, receiver) = mpsc::channel::<Job>();
-    std::thread::Builder::new()
+    crate::core::GoThread::new()
         .name("ls-search".to_string())
         .stack_size(crate::gostd::stack::max_stack_size())
-        .spawn(move || search_thread_main(seed, data, receiver))
-        .unwrap_or_else(|err| crate::core::go_fatal_newosproc(&err));
+        .spawn(move || search_thread_main(seed, data, receiver));
     jobs
 }
 

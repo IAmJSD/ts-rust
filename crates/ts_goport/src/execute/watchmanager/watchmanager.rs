@@ -9,9 +9,9 @@
 //! fields that `onWatchEvents` and `handleWatchTerminated` touch
 //! (`mu`, `watchedDirs`, the `doCycleCh` sender, `changedMu` and its data).
 //! Those two methods live on `WatchManagerShared`. Their `DebugLog` and
-//! `warnWriter` output goes to the process stdout: Go passes
-//! `sys.Writer()`, which is `os.Stdout` for the real system, and the `Rc`
-//! writer cannot cross threads.
+//! `warnWriter` output goes to the process stdout (`stdio::CliStdout`): Go
+//! passes `sys.Writer()`, which is `os.Stdout` for the real system, and the
+//! `Rc` writer cannot cross threads.
 
 use crate::execute::watchmanager::prelude::*;
 
@@ -660,12 +660,14 @@ impl DirWatchSet {
 }
 
 // PORT: Go `fmt.Fprintf(w, ...)` on the callback thread, where `w` is the
-// real system's `os.Stdout` (see the file comment). Errors are ignored as
-// in Go. `text` is in the port form, so this writes its Go bytes.
+// real system's `os.Stdout` (see the file comment): one write of
+// `stdio::CliStdout`. Errors are ignored as in Go. `text` is in the port
+// form, so this writes its Go bytes.
 fn write_stdout(text: &str) {
-    let mut stdout = std::io::stdout();
-    let _ = stdout.write_all(&crate::scanner_util::go_string_bytes(text));
-    let _ = stdout.flush();
+    let _ = crate::execute::tsc::write_go_output(
+        &mut crate::execute::tsc::stdio::CliStdout,
+        text.as_bytes(),
+    );
 }
 
 #[cfg(test)]

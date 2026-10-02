@@ -339,6 +339,10 @@ pub type NpmInstallFunc = Box<dyn Fn(&str, &[String]) -> (Vec<u8>, Option<GoErro
 #[derive(Default)]
 pub struct NpmExecutorMock {
     pub npm_install_func: RefCell<Option<NpmInstallFunc>>,
+    /// PORT: no Go counterpart. When set, ATA runs npm through it on a
+    /// helper thread (`ata::NpmExecutor::npm_install_func`), as with the
+    /// LSP server's executor, and `npm_install` is not called.
+    pub npm_install_on_thread: RefCell<Option<ata::NpmInstallFunc>>,
     npm_install: RefCell<Vec<NpmInstallCall>>,
 }
 
@@ -358,6 +362,10 @@ impl ata::NpmExecutor for NpmExecutorMock {
             Some(f) => f(cwd, args),
             None => (Vec::new(), None),
         }
+    }
+
+    fn npm_install_func(&self) -> Option<ata::NpmInstallFunc> {
+        self.npm_install_on_thread.borrow().clone()
     }
 }
 
@@ -569,7 +577,7 @@ pub fn types_registry_config() -> Vec<(&'static str, &'static str)> {
 }
 
 // Go: projecttestutil.go:203 createTypesRegistryFileContent
-fn create_types_registry_file_content(ti_options: &TypingsInstallerOptions) -> String {
+pub fn create_types_registry_file_content(ti_options: &TypingsInstallerOptions) -> String {
     let mut builder = String::new();
     builder.push_str("{\n  \"entries\": {");
     for (index, entry) in ti_options.types_registry.iter().enumerate() {

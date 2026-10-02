@@ -1458,3 +1458,59 @@ child_test! {
         assert_eq!(node_modules_bucket.export_count, PACKAGE_COUNT);
     }
 }
+
+child_test! {
+    // followups4 (R153 reviewer): the registry extracts a package first with
+    // the narrow walk of lspreg1 (`AliasResolver::new_narrow_checker`), which
+    // does not read the imports of a .ts source. This entrypoint exports a
+    // binding that it imports, so the checker asks for other.ts, which the
+    // narrow walk did not read. That is a miss: the narrow results are
+    // dropped, and the full walk extracts the package again. The export `y`
+    // then has its target in other.ts, as Go gives (Go reads the files that
+    // the checker asks for).
+    fn narrow_walk_miss_extracts_the_package_with_the_full_walk() {
+        let root = "/home/src/narrow-miss";
+        let pkg = format!("{root}/node_modules/src-pkg");
+        let index_text = r#"import { y } from "src-pkg";"#;
+        let mut files = FileMap::new();
+        let mut add = |path: String, text: &str| {
+            files.insert(path, text.into());
+        };
+        add(
+            format!("{root}/tsconfig.json"),
+            r#"{"compilerOptions":{"module":"esnext","moduleResolution":"bundler"}}"#,
+        );
+        add(
+            format!("{root}/package.json"),
+            r#"{"name":"narrow-miss","dependencies":{"src-pkg":"*"}}"#,
+        );
+        add(format!("{root}/index.ts"), index_text);
+        add(
+            format!("{pkg}/package.json"),
+            r#"{"name":"src-pkg","version":"1.0.0","types":"index.ts"}"#,
+        );
+        add(format!("{pkg}/index.ts"), "import { y } from \"./other\";\nexport { y };\n");
+        add(format!("{pkg}/other.ts"), "export const y = 1;\n");
+        let (session, _) = projecttestutil::setup(files);
+        let index_uri = uri(&format!("file://{root}/index.ts"));
+        open_uri(&session, &index_uri, index_text, lsproto::LanguageKind::TYPE_SCRIPT);
+
+        with_auto_imports(&session, &index_uri);
+
+        let registry = session
+            .snapshot()
+            .auto_import_registry()
+            .expect("auto import registry not initialized");
+        assert_eq!(registry.node_modules.len(), 1);
+        let bucket = registry.node_modules.values().next().unwrap();
+        let index = bucket.index.as_ref().expect("an indexed bucket").borrow();
+        let exports = index.find("y", true);
+        let from_index: Vec<_> = exports
+            .iter()
+            .filter(|export| export.module_file_name == format!("{pkg}/index.ts"))
+            .collect();
+        assert_eq!(from_index.len(), 1, "{exports:?}");
+        assert_eq!(from_index[0].target.module_id.0, format!("{pkg}/other.ts"));
+        assert_eq!(from_index[0].target.export_name, "y");
+    }
+}

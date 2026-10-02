@@ -785,6 +785,8 @@ fn get_content_mapper_project(
 fn show_config(sys: &dyn System, config: &ParsedCommandLine, config_file_name: &str) {
     let ts_config = convert_to_ts_config(config, config_file_name);
     let writer = sys.writer();
+    // PORT: one report (`stdio::keep_writes`).
+    let _report = crate::execute::tsc::stdio::keep_writes();
     let _ = json_marshal_indent_write(&mut *writer.borrow_mut(), &ts_config, "", "    ");
 }
 

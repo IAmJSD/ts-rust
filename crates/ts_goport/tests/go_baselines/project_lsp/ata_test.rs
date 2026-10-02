@@ -2,6 +2,8 @@
 
 use std::collections::BTreeMap;
 use std::rc::Rc;
+use std::sync::{Arc, Mutex, PoisonError};
+use std::thread::ThreadId;
 
 use ts_goport::frontend::json_ext::LspAny;
 use ts_goport::ls::lsutil;
@@ -131,6 +133,47 @@ child_test! {
         assert_eq!(calls[1].args[2], "@types/jquery@latest");
 
         // Verify the types file was installed
+        let p = program(&session, APP_URI);
+        assert!(has_file(&p, &typings_file("jquery")), "jquery types should be installed");
+    }
+}
+
+child_test! {
+    // followups4 (R153 reviewer): `inferred_projects` with an executor that
+    // gives `npm_install_func`, as the LSP server's does. ATA runs each npm
+    // call on a helper thread, and the post of its result wakes the request
+    // on the session thread (`TypingsInstaller::npm_install`).
+    fn inferred_projects_with_npm_on_a_helper_thread() {
+        let files = files(&[(APP, ""), ("/user/username/projects/project/package.json", PACKAGE_JSON_JQUERY)]);
+        let ti_options = ti(&[], &[("jquery", "declare const $: { x: number }")]);
+        let registry = projecttestutil::create_types_registry_file_content(&ti_options);
+        let (session, utils) = projecttestutil::setup_with_typings_installer(files, ti_options);
+        let map = projecttestutil::current_map_fs_for_test();
+        let thread_calls: Arc<Mutex<Vec<(ThreadId, Vec<String>)>>> = Arc::default();
+        let log = Arc::clone(&thread_calls);
+        *utils.npm_executor().npm_install_on_thread.borrow_mut() =
+            Some(Arc::new(move |cwd: &str, args: &[String]| {
+                log.lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push((std::thread::current().id(), args.to_vec()));
+                let (path, text) = if args[2] == "types-registry@latest" {
+                    (format!("{cwd}/node_modules/types-registry/index.json"), registry.as_str())
+                } else {
+                    (typings_file("jquery"), "declare const $: { x: number }")
+                };
+                map.fs().write_file(&path, text).expect("write the npm output");
+                (Vec::new(), None)
+            }));
+
+        open_kind(&session, APP_URI, "", lsproto::LanguageKind::JAVA_SCRIPT);
+        session.wait_for_background_tasks();
+
+        assert!(calls(&utils).is_empty(), "npm ran on the session thread");
+        let thread_calls = thread_calls.lock().unwrap_or_else(PoisonError::into_inner).clone();
+        let args: Vec<&str> = thread_calls.iter().map(|(_, args)| args[2].as_str()).collect();
+        assert_eq!(args, ["types-registry@latest", "@types/jquery@latest"]);
+        let session_thread = std::thread::current().id();
+        assert!(thread_calls.iter().all(|(thread, _)| *thread != session_thread));
         let p = program(&session, APP_URI);
         assert!(has_file(&p, &typings_file("jquery")), "jquery types should be installed");
     }

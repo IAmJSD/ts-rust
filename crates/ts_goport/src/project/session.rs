@@ -1044,15 +1044,22 @@ enum MetricsValue {
 // Go: runtime/metrics/sample.go:45 Read (go1.26.8), which runs
 // runtime/metrics.go:1028 readMetricsLocked.
 // PORT: Go computes each metric from Go runtime statistics (heap, GC,
-// scheduler, goroutines). The port has no Go runtime, so it has none of
-// these metrics. Go gives `KindBad` for a name it does not have, so every
-// sample is `KindBad` and every Go runtime field of the telemetry event is
-// 0 (`memoryUsedBytes`, `goMemLimit`, `goGCPercent`, the heap and GC
-// fields, `goMaxProcs`, `goroutineCount`, `gcCpuSeconds`, `userCpuSeconds`).
+// scheduler, goroutines). The port has no Go runtime, so it has only
+// `/sched/gomaxprocs:threads` (`gostd::runtime::gomaxprocs`, as Go
+// runtime/metrics.go `gomaxprocs`). Go gives `KindBad` for a name it does
+// not have, so every other sample is `KindBad` and the other Go runtime
+// fields of the telemetry event are 0 (`memoryUsedBytes`, `goMemLimit`,
+// `goGCPercent`, the heap and GC fields, `goroutineCount`, `gcCpuSeconds`,
+// `userCpuSeconds`).
 fn metrics_read(samples: &mut [MetricsSample]) {
     // Sample.
     for sample in samples.iter_mut() {
-        sample.value = MetricsValue::Bad;
+        sample.value = match sample.name {
+            "/sched/gomaxprocs:threads" => {
+                MetricsValue::Uint64(crate::gostd::runtime::gomaxprocs() as u64)
+            }
+            _ => MetricsValue::Bad,
+        };
     }
 }
 

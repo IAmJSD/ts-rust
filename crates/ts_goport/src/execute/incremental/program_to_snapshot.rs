@@ -416,10 +416,9 @@ fn start_text_hashes(files: &[Node], hash_with_text: bool) -> std::sync::mpsc::R
     if single_threaded() {
         hash_texts();
     } else {
-        std::thread::Builder::new()
+        crate::core::GoThread::new()
             .name("goport-text-hash".to_string())
-            .spawn(hash_texts)
-            .unwrap_or_else(|err| crate::core::go_fatal_newosproc(&err));
+            .spawn(hash_texts);
     }
     receiver
 }

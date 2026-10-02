@@ -3,7 +3,6 @@
 //! cache and the `plainJSErrors` set.
 
 use crate::frontend::prelude::*;
-use std::fmt::Write as _;
 use std::sync::{Arc, OnceLock};
 
 // Go: program.go:73 packageNamesInfo
@@ -117,11 +116,11 @@ impl NewProgram {
     }
 
     // Go: program.go:1841 (*Program).ExplainFiles
-    // PORT: Go writes to an `io.Writer`; this appends to a `String`.
+    // Each line is one write, as Go's `fmt.Fprintln`; its errors are ignored.
     // Go `fmt.Fprintln(w, "  ", x)` puts one more space between the operands.
     // PORT: the Go `explainFile` closure increments `filesExplained`; here
     // the callers do it, so the loop condition can read the counter.
-    pub fn explain_files(&self, w: &mut String, locale: &crate::locale::Locale) {
+    pub fn explain_files(&self, w: &mut dyn std::io::Write, locale: &crate::locale::Locale) {
         let to_relative_file_name = |file_name: &str| {
             get_relative_path_from_directory(
                 &self.get_current_directory(),
@@ -129,8 +128,9 @@ impl NewProgram {
                 &self.compare_paths_options,
             )
         };
-        let explain_file = |w: &mut String, file: &dyn HasFileName| {
-            let _ = writeln!(w, "{}", to_relative_file_name(&file.file_name()));
+        let explain_file = |w: &mut dyn std::io::Write, file: &dyn HasFileName| {
+            let _ =
+                w.write_all(format!("{}\n", to_relative_file_name(&file.file_name())).as_bytes());
             if let Some(reasons) = self
                 .processed_files
                 .include_processor
@@ -138,11 +138,9 @@ impl NewProgram {
                 .get(&file.path())
             {
                 for reason in reasons {
-                    let _ = writeln!(
-                        w,
-                        "   {}",
-                        reason.to_diagnostic(self, true).localize(locale)
-                    );
+                    let line =
+                        format!("   {}\n", reason.to_diagnostic(self, true).localize(locale));
+                    let _ = w.write_all(line.as_bytes());
                 }
             }
             for diag in self
@@ -150,7 +148,7 @@ impl NewProgram {
                 .include_processor
                 .explain_redirect_and_implied_format(self, &file.path(), to_relative_file_name)
             {
-                let _ = writeln!(w, "   {}", diag.localize(locale));
+                let _ = w.write_all(format!("   {}\n", diag.localize(locale)).as_bytes());
             }
         };
         let mut files_explained: i32 = 0;
@@ -167,7 +165,7 @@ impl NewProgram {
         let files = self.get_source_files();
         let mut source_file_index = 0;
         let mut explain_source_files =
-            |w: &mut String, files_explained: &mut i32, end_index: i32| {
+            |w: &mut dyn std::io::Write, files_explained: &mut i32, end_index: i32| {
                 while *files_explained < end_index {
                     explain_file(w, &*files[source_file_index]);
                     *files_explained += 1;

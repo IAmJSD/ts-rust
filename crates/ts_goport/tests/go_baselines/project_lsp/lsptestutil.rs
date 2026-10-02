@@ -393,13 +393,26 @@ impl LspClient {
         req: lsproto::RequestMessage,
         req_id: ID,
     ) -> Option<lsproto::ResponseMessage> {
+        self.send_request_message(req, req_id)
+            .recv_timeout(Duration::from_secs(120))
+            .ok()
+    }
+
+    /// `send_request_worker` without the wait (no Go counterpart): returns
+    /// the channel of the response, so a test can check later whether the
+    /// server answered.
+    pub fn send_request_message(
+        &self,
+        req: lsproto::RequestMessage,
+        req_id: ID,
+    ) -> Receiver<lsproto::ResponseMessage> {
         let (tx, rx) = sync_channel::<lsproto::ResponseMessage>(1);
         self.pending_requests
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(req_id, tx);
         self.write_msg(req.message());
-        rx.recv_timeout(Duration::from_secs(120)).ok()
+        rx
     }
 
     // Go: lspclient.go:312 SendNotification
@@ -410,11 +423,14 @@ impl LspClient {
     }
 
     /// Waits up to `timeout` for the server's `run` to return by itself,
-    /// as after an LSP `exit`. True when it returned.
+    /// as after an LSP `exit`, and for the router to pass on all that the
+    /// server wrote. True when both ended.
     pub fn wait_server_end(&self, timeout: Duration) -> bool {
         let deadline = std::time::Instant::now() + timeout;
         loop {
-            if self.server.as_ref().is_none_or(JoinHandle::is_finished) {
+            if self.server.as_ref().is_none_or(JoinHandle::is_finished)
+                && self.router.as_ref().is_none_or(JoinHandle::is_finished)
+            {
                 return true;
             }
             if std::time::Instant::now() >= deadline {

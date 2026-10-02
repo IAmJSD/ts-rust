@@ -1,7 +1,6 @@
 //! Go: execute/tsc/statistics.go, the `--diagnostics` and
 //! `--extendedDiagnostics` table.
 
-use std::fmt::Write as _;
 use std::time::Duration;
 
 use crate::prelude::*;
@@ -36,7 +35,8 @@ impl Table {
     }
 
     // Go: execute/tsc/statistics.go:31 print
-    fn print(&self, w: &mut String) {
+    // One write for each row, as Go's `fmt.Fprintf`.
+    fn print(&self, w: &Writer) {
         let mut name_width = 0;
         let mut value_width = 0;
         for r in &self.rows {
@@ -45,12 +45,14 @@ impl Table {
         }
 
         for r in &self.rows {
-            let _ = writeln!(
+            write_str(
                 w,
-                "{:<name_width$} {:>value_width$}",
-                format!("{}:", r.name),
-                r.value,
-                name_width = name_width + 1,
+                &format!(
+                    "{:<name_width$} {:>value_width$}\n",
+                    format!("{}:", r.name),
+                    r.value,
+                    name_width = name_width + 1,
+                ),
             );
         }
     }
@@ -132,9 +134,8 @@ pub fn statistics_from_program(compile_times: &CompileTimes, mem_stats: &MemStat
 
 impl Statistics {
     // Go: execute/tsc/statistics.go:86 Report, the table part.
-    // PORT: this writes the table to a string. `report_to` is Go `Report`
-    // with the writer and the `CommandLineTesting` hooks.
-    pub fn report(&self, w: &mut String) {
+    // PORT: `report_to` is Go `Report` with the `CommandLineTesting` hooks.
+    fn report(&self, w: &Writer) {
         let mut table = Table::default();
         let mut prefix = "";
 
@@ -244,9 +245,10 @@ impl Statistics {
         if let Some(testing) = &testing {
             testing.on_statistics_start(w);
         }
-        let mut text = String::new();
-        self.report(&mut text);
-        write_str(w, &text);
+        // PORT: one report (`stdio::keep_writes`).
+        let report = super::stdio::keep_writes();
+        self.report(w);
+        drop(report);
         if let Some(testing) = &testing {
             testing.on_statistics_end(w);
         }
@@ -298,10 +300,10 @@ mod tests {
         table.add("Files", 750);
         table.add("Memory used", "165135K");
         table.add_duration("Changes compute time", Duration::from_micros(33_400));
-        let mut out = String::new();
-        table.print(&mut out);
+        let out = Rc::new(RefCell::new(Vec::<u8>::new()));
+        table.print(&(out.clone() as Writer));
         assert_eq!(
-            out,
+            String::from_utf8(out.take()).unwrap(),
             "Files:                    750\n\
              Memory used:          165135K\n\
              Changes compute time:  0.033s\n"

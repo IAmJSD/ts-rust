@@ -181,8 +181,9 @@ pub fn go_work_group_task<R>(f: impl FnOnce() -> R) -> R {
 /// The Go runtime when the OS refuses a new thread (runtime/os_linux.go
 /// `newosproc`): it prints the error and the thread count, then
 /// `throw("newosproc")` ends the process with exit 2. The port site takes
-/// the place of the goroutine dump. Use it where the port starts a thread
-/// for work that Go runs on goroutines, so the run fails as Go's does.
+/// the place of the goroutine dump. `GoThread` calls it after Go's retry;
+/// use `GoThread` to start a thread for work that Go runs on goroutines,
+/// so the run fails as Go's does.
 #[cold]
 #[inline(never)]
 #[track_caller]
@@ -205,6 +206,119 @@ pub fn go_fatal_newosproc(err: &std::io::Error) -> ! {
     use std::io::Write;
     let _ = std::io::stderr().write_all(text.as_bytes());
     std::process::exit(EXIT_GO_PANIC)
+}
+
+/// `std::thread::Builder` for a thread that runs work Go runs on
+/// goroutines. A start that the OS refuses goes as a Go runtime thread
+/// start goes (`newosproc`): it tries again while the error is EAGAIN, then
+/// ends the process with Go's text (`go_fatal_newosproc`). Do not start one
+/// while this thread holds a lock that one of its thread-local destructors
+/// takes: the exit runs those destructors (glibc `exit`), and the process
+/// hangs.
+#[derive(Default)]
+pub struct GoThread {
+    name: Option<String>,
+    stack_size: Option<usize>,
+}
+
+impl GoThread {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// `std::thread::Builder::name`.
+    #[must_use]
+    pub fn name(mut self, name: String) -> Self {
+        self.name = Some(name);
+        self
+    }
+
+    /// `std::thread::Builder::stack_size`.
+    #[must_use]
+    pub fn stack_size(mut self, size: usize) -> Self {
+        self.stack_size = Some(size);
+        self
+    }
+
+    /// `std::thread::Builder::spawn`, with Go's retry and fatal error.
+    #[track_caller]
+    pub fn spawn<F, T>(self, f: F) -> std::thread::JoinHandle<T>
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        let slot = std::sync::Arc::new(std::sync::Mutex::new(Some(f)));
+        newosproc(|| self.builder().spawn(take_once(&slot)))
+    }
+
+    /// `std::thread::Builder::spawn_scoped`, with Go's retry and fatal
+    /// error.
+    #[track_caller]
+    pub fn spawn_scoped<'scope, 'env, F, T>(
+        self,
+        scope: &'scope std::thread::Scope<'scope, 'env>,
+        f: F,
+    ) -> std::thread::ScopedJoinHandle<'scope, T>
+    where
+        F: FnOnce() -> T + Send + 'scope,
+        T: Send + 'scope,
+    {
+        let slot = std::sync::Arc::new(std::sync::Mutex::new(Some(f)));
+        newosproc(|| self.builder().spawn_scoped(scope, take_once(&slot)))
+    }
+
+    fn builder(&self) -> std::thread::Builder {
+        let mut builder = std::thread::Builder::new();
+        if let Some(name) = &self.name {
+            builder = builder.name(name.clone());
+        }
+        if let Some(size) = self.stack_size {
+            builder = builder.stack_size(size);
+        }
+        builder
+    }
+}
+
+/// The function of one try to start a thread. `Builder::spawn` drops the
+/// function of a thread that it could not start, so each try takes `f`
+/// from a shared slot, and only the started thread takes it.
+fn take_once<F: FnOnce() -> T, T>(
+    slot: &std::sync::Arc<std::sync::Mutex<Option<F>>>,
+) -> impl FnOnce() -> T + use<F, T> {
+    let slot = std::sync::Arc::clone(slot);
+    move || {
+        let f = slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        f.expect("only the started thread takes its function")()
+    }
+}
+
+// Go: runtime/os_linux.go:170 newosproc (go1.27.1)
+// `retryOnEAGAIN` (runtime/retry.go:14) calls `clone` up to 20 times while
+// it fails with EAGAIN, and sleeps 1, 2, ... 20 ms after each failure.
+// Then, or at once for another error, the start throws.
+// PORT: Go on Windows tries again on ERROR_ACCESS_DENIED instead
+// (runtime/os_windows.go:794 createThread); the port does not.
+#[track_caller]
+fn newosproc<H>(mut clone: impl FnMut() -> std::io::Result<H>) -> H {
+    let mut tries = 0;
+    loop {
+        let err = match clone() {
+            Ok(handle) => return handle,
+            Err(err) => err,
+        };
+        if err.kind() != std::io::ErrorKind::WouldBlock {
+            go_fatal_newosproc(&err)
+        }
+        tries += 1;
+        std::thread::sleep(std::time::Duration::from_millis(tries));
+        if tries == 20 {
+            go_fatal_newosproc(&err)
+        }
+    }
 }
 
 /// `go_panic` with the Go runtime text for a nil pointer dereference, at a

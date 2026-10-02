@@ -740,7 +740,7 @@ impl BuildTask {
         } else {
             command.build_options.builders.unwrap_or(4)
         };
-        panic.repanicked = num_routines != 1;
+        panic.repanicked |= num_routines != 1;
         self.go_panic = Some(TaskGoPanic::Panicked(payload));
         false
     }

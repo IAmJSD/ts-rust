@@ -201,8 +201,10 @@ pub(super) fn try_load_with(
     // version (`try_load_version`) does not trace, as Go tsc starts tracing
     // only here.
     if let Some(warning) = crate::tracing::start_tracing_if_needed(&opts.config, false) {
-        let _ =
-            crate::execute::tsc::write_go_output(&mut std::io::stdout().lock(), warning.as_bytes());
+        let _ = crate::execute::tsc::write_go_output(
+            &mut crate::execute::tsc::stdio::CliStdout,
+            warning.as_bytes(),
+        );
     }
     // Go: tsc.go:305 times `NewProgram`. PORT: the port's `NewProgram` is
     // `install_new_program`, which also builds the Go files, as the build
@@ -1045,7 +1047,7 @@ fn trace_from_sys() -> TraceFn {
         // PORT: `text` is in the port form (see
         // `scanner_util::GO_STRING_MARKER`); stdout gets its Go bytes.
         let _ = crate::execute::tsc::write_go_output(
-            &mut std::io::stdout().lock(),
+            &mut crate::execute::tsc::stdio::CliStdout,
             format!("{text}\n").as_bytes(),
         );
     })
@@ -1693,4 +1695,130 @@ fn assert_same_include_diagnostics(
         text(expected),
         "include processor diagnostics"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A copy of `np` with the file at `slot` parsed again, as Go
+    /// `ReuseProgram` replaces a changed file in place: the same files at
+    /// the same paths and the same resolutions.
+    fn replaced_in_place(np: &NewProgram, slot: usize) -> NewProgram {
+        let mut processed_files = np.processed_files.clone();
+        let old = &processed_files.files[slot];
+        let file = Rc::new(crate::frontend::parser::parse_source_file(
+            old.parse_options(),
+            crate::ast::file_version::FileText::new(format!("{}\n", old.text()), false),
+            old.script_kind,
+        ));
+        processed_files.files[slot] = file.clone();
+        processed_files
+            .files_by_path
+            .insert(file.path().clone(), file);
+        NewProgram {
+            opts: np.opts.clone(),
+            compare_paths_options: np.compare_paths_options.clone(),
+            processed_files,
+            uses_uri_style_node_core_modules: np.uses_uri_style_node_core_modules,
+            common_source_directory: std::cell::OnceCell::new(),
+            program_diagnostics: Vec::new(),
+            has_emit_blocking_diagnostics: FxHashSet::default(),
+            source_files_to_emit: std::cell::OnceCell::new(),
+            unresolved_imports: Default::default(),
+            known_symlinks: Default::default(),
+            package_names: Default::default(),
+            has_ts_file: std::cell::OnceCell::new(),
+        }
+    }
+
+    // followups4 (R153 reviewer): editfast1 gives a full build when a
+    // replaced file is in a package redirect group (`replaced_files`). Go's
+    // ReuseProgram checks only the changed file, not the content-mapper
+    // supplemental files, so a reused program can still replace a file of
+    // a redirect group. Here the same pkg@1.0.0 is in two node_modules
+    // dirs, so one copy redirects to the other.
+    #[test]
+    fn replaced_file_in_redirect_group_takes_the_full_build() {
+        let dir = std::env::temp_dir().join(format!("goport-redirect-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let pkg = r#"{"name":"pkg","version":"1.0.0","types":"index.d.ts"}"#;
+        let files = [
+            ("tsconfig.json", r#"{"compilerOptions":{"types":[]}}"#),
+            (
+                "index.ts",
+                "import { a } from \"a\";\nimport { b } from \"b\";\nexport const x = a + b;\n",
+            ),
+            (
+                "node_modules/a/package.json",
+                r#"{"name":"a","types":"index.d.ts"}"#,
+            ),
+            (
+                "node_modules/a/index.d.ts",
+                "import { p } from \"pkg\";\nexport declare const a: typeof p;\n",
+            ),
+            ("node_modules/a/node_modules/pkg/package.json", pkg),
+            (
+                "node_modules/a/node_modules/pkg/index.d.ts",
+                "export declare const p: number;\n",
+            ),
+            (
+                "node_modules/b/package.json",
+                r#"{"name":"b","types":"index.d.ts"}"#,
+            ),
+            (
+                "node_modules/b/index.d.ts",
+                "import { p } from \"pkg\";\nexport declare const b: typeof p;\n",
+            ),
+            ("node_modules/b/node_modules/pkg/package.json", pkg),
+            (
+                "node_modules/b/node_modules/pkg/index.d.ts",
+                "export declare const p: number;\n",
+            ),
+        ];
+        for (path, text) in files {
+            let path = dir.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        }
+        let config = format!("{}/tsconfig.json", dir.to_string_lossy().replace('\\', "/"));
+        let _scope = crate::core::enter_program(None);
+        let opts = load_config(&config, |_| {}, &mut CompileTimes::default()).unwrap();
+        let np = new_program(opts);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let files = np.source_files();
+        let old = VersionTables::new((0..files.len()).collect(), std::iter::empty());
+        let slot_of = |name: &str| {
+            files
+                .iter()
+                .position(|file| file.file_name().ends_with(name))
+                .unwrap_or_else(|| panic!("no {name}"))
+        };
+        let in_group = |path: &GoPath| {
+            np.redirect_files_by_path
+                .as_ref()
+                .is_some_and(|redirects| redirects.contains_key(path))
+                || np
+                    .redirect_targets_map
+                    .as_ref()
+                    .is_some_and(|targets| targets.contains_key(path))
+        };
+        let pkg = slot_of("/node_modules/a/node_modules/pkg/index.d.ts");
+        assert!(
+            in_group(files[pkg].path()),
+            "pkg is not in a redirect group"
+        );
+        let index = slot_of("/index.ts");
+        assert!(!in_group(files[index].path()));
+
+        // A replaced file outside the group keeps the old tables.
+        let edited = replaced_in_place(&np, index);
+        let replaced = replaced_files(&edited, &np, &old).expect("a reused program");
+        assert_eq!(replaced.iter().map(|r| r.slot).collect::<Vec<_>>(), [index]);
+
+        // A replaced file of the group takes the full build.
+        let edited = replaced_in_place(&np, pkg);
+        assert!(replaced_files(&edited, &np, &old).is_none());
+    }
 }

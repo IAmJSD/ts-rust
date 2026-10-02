@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Editor sessions for the PGO and BOLT training of build-release.sh.
+"""Editor sessions for the BOLT training of build-release.sh (perf samples them; PGO has no
+editor sessions).
 
 Runs `<tsgo> --lsp --stdio` through the long session of scripts/goport/ls_edit_bench.py (typing,
 errfix, imports and mix edits, each followed by a VS Code-like request burst) on each named
@@ -11,8 +12,8 @@ usage: lsp-train.py <tsgo> <inputs-dir> <project>:<edits>...
   project     query-core, hono or effect (ls_edit_bench.PROJECTS)
 
 Prints one line per session (with ls_edit_bench's plan digest) and "lsp-train: ok" when every
-server answered every round and exited 0. Else exits 1: a server that is killed writes no PGO
-profile.
+server answered every round and exited 0. Else exits 1, and build-release.sh stops the BOLT
+training.
 """
 
 import os

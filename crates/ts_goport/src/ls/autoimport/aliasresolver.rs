@@ -35,8 +35,9 @@ pub struct PathAndFileName {
 
 // Go: ls/autoimport/aliasresolver.go:21 aliasResolver
 // PORT: Go `collections.SyncMap` values are `RefCell<FxHashMap>` (one
-// thread). A Go nil `symlinks` map is an empty map. The last two fields are
-// the port's (see `new_checker`).
+// thread). A Go nil `symlinks` map is an empty map. The fields after
+// `resolved_modules` are the port's (see `new_checker` and
+// `new_narrow_checker`).
 pub struct AliasResolver {
     pub to_path: Rc<dyn Fn(&str) -> tspath::Path>,
     pub host: Rc<dyn RegistryCloneHost>,

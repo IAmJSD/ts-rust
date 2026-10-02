@@ -2221,12 +2221,81 @@ thread_local! {
     /// It forgets the nodes of dead file versions (`PerFileMap`, lsshells
     /// M3c); their small slices stay leaked.
     static DECORATORS: RefCell<PerFileMap<NodeSlice>> = const { RefCell::new(PerFileMap::new()) };
-    /// Go `CompositeBase.facts`: cached `SubtreeFacts` per node. It forgets
-    /// the nodes of dead file versions (`PerFileMap`, lsshells M3a).
-    static SUBTREE_FACTS: RefCell<PerFileMap<SubtreeFacts>> = const { RefCell::new(PerFileMap::new()) };
+    /// Go `CompositeBase.facts` of parsed nodes: per file (keyed by
+    /// `facts_file_key`), the cached `SubtreeFacts` of each node by its
+    /// index, with `COMPUTED` set once cached. It forgets the files of dead
+    /// file versions (`PerFileMap`, lsshells M3a). A factory node keeps its
+    /// facts in its arena slot (`synthetic_subtree_facts`).
+    // PERF: emitast1 F1. A column per file, not a map entry per node: no
+    // hash per read and no growth rehash of a map with one entry per node.
+    static SUBTREE_FACTS: RefCell<PerFileMap<Vec<SubtreeFacts>>> = const { RefCell::new(PerFileMap::new()) };
+    /// `SUBTREE_FACTS` for a node whose index is too large for a column
+    /// (`FACTS_COLUMN_LIMIT`).
+    static SUBTREE_FACTS_SPARSE: RefCell<PerFileMap<SubtreeFacts>> = const { RefCell::new(PerFileMap::new()) };
     /// Go `Node.Text()` results that Go builds with string concatenation. It
     /// forgets the nodes of dead file versions (`PerFileMap`).
     static JOINED_TEXT: RefCell<PerFileMap<&'static str>> = const { RefCell::new(PerFileMap::new()) };
+}
+
+/// The node indexes that a facts column holds (`SUBTREE_FACTS`). A larger
+/// index (a file of over 4 million nodes) goes in `SUBTREE_FACTS_SPARSE`,
+/// so a column never holds more than 16 MiB.
+const FACTS_COLUMN_LIMIT: usize = 1 << 22;
+
+/// The index of non-nil node `n` in its file (`SUBTREE_FACTS`).
+#[inline]
+fn facts_index(n: Node) -> usize {
+    ((n.0 & 0xffff_ffff) - 1) as usize
+}
+
+/// The `SUBTREE_FACTS` key of the file of `n`: the handle of index 0 of
+/// that file, so `PerFileMap` forgets it with the file version.
+#[inline]
+fn facts_file_key(n: Node) -> Node {
+    Node((n.0 & !0xffff_ffff) | 1)
+}
+
+/// The cached `Node::subtree_facts` of `n`, if any. A factory node keeps
+/// them in its arena slot (emitast1 F1), any other node in `SUBTREE_FACTS`.
+#[inline]
+fn cached_subtree_facts(n: Node) -> Option<SubtreeFacts> {
+    if is_synthetic_node(n) {
+        return synthetic_subtree_facts(n);
+    }
+    let index = facts_index(n);
+    if index >= FACTS_COLUMN_LIMIT {
+        return SUBTREE_FACTS_SPARSE.with(|c| c.borrow().get(&n).copied());
+    }
+    SUBTREE_FACTS.with(|c| {
+        let facts = *c.borrow().get(&facts_file_key(n))?.get(index)?;
+        facts
+            .intersects(SubtreeFacts::COMPUTED)
+            .then(|| facts.without(SubtreeFacts::COMPUTED))
+    })
+}
+
+/// Caches `facts` as the `Node::subtree_facts` of `n`.
+#[inline]
+fn cache_subtree_facts(n: Node, facts: SubtreeFacts) {
+    if is_synthetic_node(n) {
+        return set_synthetic_subtree_facts(n, facts);
+    }
+    let index = facts_index(n);
+    if index >= FACTS_COLUMN_LIMIT {
+        return SUBTREE_FACTS_SPARSE.with(|c| {
+            c.borrow_mut().write().insert(n, facts);
+        });
+    }
+    SUBTREE_FACTS.with(|c| {
+        let mut c = c.borrow_mut();
+        let column = c.write().entry(facts_file_key(n)).or_default();
+        if column.len() <= index {
+            // `resize` reserves with doubling, so a column grows in
+            // amortized steps.
+            column.resize(index + 1, SubtreeFacts::NONE);
+        }
+        column[index] = facts | SubtreeFacts::COMPUTED;
+    });
 }
 
 impl Node {
@@ -2447,11 +2516,11 @@ impl Node {
     /// Go `node.SubtreeFacts()`, cached per node like Go `CompositeBase`.
     #[must_use]
     pub fn subtree_facts(self) -> SubtreeFacts {
-        if let Some(facts) = SUBTREE_FACTS.with(|c| c.borrow().get(&self).copied()) {
+        if let Some(facts) = cached_subtree_facts(self) {
             return facts;
         }
         let facts = compute_subtree_facts(self).without(SubtreeFacts::COMPUTED);
-        SUBTREE_FACTS.with(|c| c.borrow_mut().write().insert(self, facts));
+        cache_subtree_facts(self, facts);
         facts
     }
 
@@ -4437,72 +4506,80 @@ fn propagate_node_list(
     facts
 }
 
-/// True for Go node types that embed `TypeSyntaxBase`.
-fn is_type_syntax_data(n: Node) -> bool {
-    // PORT: a PropertyDeclaration that Go parses as a PropertySignature.
-    if with_data!(n, |d| matches!(d, NodeData::PropertyDeclaration(_)))
-        && n.kind() == SyntaxKind::PropertySignature
-    {
-        return true;
-    }
-    with_data!(n, |d| matches!(
-        d,
+/// True for Go node types that embed `TypeSyntaxBase`, on the data `d` of
+/// node `n`.
+// PERF: emitast1 F2. The callers load the data once and pass it in; this
+// was two data reads of its own for each node (`with_data!` twice).
+#[inline]
+fn is_type_syntax_data(n: Node, d: &NodeData) -> bool {
+    match d {
+        // PORT: a PropertyDeclaration that Go parses as a PropertySignature.
+        NodeData::PropertyDeclaration(_) => n.kind() == SyntaxKind::PropertySignature,
         NodeData::InterfaceDeclaration(_)
-            | NodeData::TypeAliasDeclaration(_)
-            | NodeData::NamespaceExportDeclaration(_)
-            | NodeData::CallSignatureDeclaration(_)
-            | NodeData::ConstructSignatureDeclaration(_)
-            | NodeData::IndexSignatureDeclaration(_)
-            | NodeData::MethodSignatureDeclaration(_)
-            | NodeData::PropertySignatureDeclaration(_)
-            | NodeData::TypeParameterDeclaration(_)
-            | NodeData::KeywordTypeNode(_)
-            | NodeData::UnionTypeNode(_)
-            | NodeData::IntersectionTypeNode(_)
-            | NodeData::ConditionalTypeNode(_)
-            | NodeData::TypeOperatorNode(_)
-            | NodeData::InferTypeNode(_)
-            | NodeData::ArrayTypeNode(_)
-            | NodeData::IndexedAccessTypeNode(_)
-            | NodeData::TypeReferenceNode(_)
-            | NodeData::LiteralTypeNode(_)
-            | NodeData::ThisTypeNode(_)
-            | NodeData::TypePredicateNode(_)
-            | NodeData::TypeQueryNode(_)
-            | NodeData::MappedTypeNode(_)
-            | NodeData::TypeLiteralNode(_)
-            | NodeData::TupleTypeNode(_)
-            | NodeData::NamedTupleMember(_)
-            | NodeData::OptionalTypeNode(_)
-            | NodeData::RestTypeNode(_)
-            | NodeData::ParenthesizedTypeNode(_)
-            | NodeData::FunctionTypeNode(_)
-            | NodeData::ConstructorTypeNode(_)
-            | NodeData::TemplateLiteralTypeNode(_)
-            | NodeData::TemplateLiteralTypeSpan(_)
-            | NodeData::ImportTypeNode(_)
-            | NodeData::JsDocTypeExpression(_)
-            | NodeData::JsDocNonNullableType(_)
-            | NodeData::JsDocNullableType(_)
-            | NodeData::JsDocAllType(_)
-            | NodeData::JsDocVariadicType(_)
-            | NodeData::JsDocOptionalType(_)
-            | NodeData::JsDocSignature(_)
-            | NodeData::JsDocNameReference(_)
-            | NodeData::JsDocTypeLiteral(_)
-    ))
+        | NodeData::TypeAliasDeclaration(_)
+        | NodeData::NamespaceExportDeclaration(_)
+        | NodeData::CallSignatureDeclaration(_)
+        | NodeData::ConstructSignatureDeclaration(_)
+        | NodeData::IndexSignatureDeclaration(_)
+        | NodeData::MethodSignatureDeclaration(_)
+        | NodeData::PropertySignatureDeclaration(_)
+        | NodeData::TypeParameterDeclaration(_)
+        | NodeData::KeywordTypeNode(_)
+        | NodeData::UnionTypeNode(_)
+        | NodeData::IntersectionTypeNode(_)
+        | NodeData::ConditionalTypeNode(_)
+        | NodeData::TypeOperatorNode(_)
+        | NodeData::InferTypeNode(_)
+        | NodeData::ArrayTypeNode(_)
+        | NodeData::IndexedAccessTypeNode(_)
+        | NodeData::TypeReferenceNode(_)
+        | NodeData::LiteralTypeNode(_)
+        | NodeData::ThisTypeNode(_)
+        | NodeData::TypePredicateNode(_)
+        | NodeData::TypeQueryNode(_)
+        | NodeData::MappedTypeNode(_)
+        | NodeData::TypeLiteralNode(_)
+        | NodeData::TupleTypeNode(_)
+        | NodeData::NamedTupleMember(_)
+        | NodeData::OptionalTypeNode(_)
+        | NodeData::RestTypeNode(_)
+        | NodeData::ParenthesizedTypeNode(_)
+        | NodeData::FunctionTypeNode(_)
+        | NodeData::ConstructorTypeNode(_)
+        | NodeData::TemplateLiteralTypeNode(_)
+        | NodeData::TemplateLiteralTypeSpan(_)
+        | NodeData::ImportTypeNode(_)
+        | NodeData::JsDocTypeExpression(_)
+        | NodeData::JsDocNonNullableType(_)
+        | NodeData::JsDocNullableType(_)
+        | NodeData::JsDocAllType(_)
+        | NodeData::JsDocVariadicType(_)
+        | NodeData::JsDocOptionalType(_)
+        | NodeData::JsDocSignature(_)
+        | NodeData::JsDocNameReference(_)
+        | NodeData::JsDocTypeLiteral(_) => true,
+        _ => false,
+    }
 }
 
 // Go: ast.go:1246 (*NodeDefault).propagateSubtreeFacts and the per-type
 // propagateSubtreeFacts overrides in ast.go.
 // PORT: the Go overrides are merged into one match on the node data.
+// PERF: emitast1 F2. One data read per child: the type syntax test, the
+// facts of a child that has none cached yet and the exclusion all use it.
 fn propagate_node_facts(n: Node) -> SubtreeFacts {
+    with_data!(n, |d| propagate_node_facts_of_data(n, d))
+}
+
+/// `propagate_node_facts` over the data `d` of `n`, read in place.
+fn propagate_node_facts_of_data(n: Node, d: &NodeData) -> SubtreeFacts {
     // Go: ast.go:1621 (*TypeSyntaxBase).propagateSubtreeFacts
-    if is_type_syntax_data(n) {
+    if is_type_syntax_data(n, d) {
         return TS;
     }
-    let facts = n.subtree_facts();
-    with_data!(n, |d| match d {
+    let facts = subtree_facts_with_data(n, d);
+    let f = n.file_index();
+    match d {
         NodeData::CatchClause(_) => facts.without(EXCL_CATCH_CLAUSE),
         NodeData::VariableDeclarationList(_) => facts.without(EXCL_VARIABLE_DECLARATION_LIST),
         NodeData::BindingPattern(_) => facts.without(EXCL_BINDING_PATTERN),
@@ -4511,21 +4588,37 @@ fn propagate_node_facts(n: Node) -> SubtreeFacts {
         }
         NodeData::ModuleDeclaration(_) => facts.without(EXCL_MODULE),
         NodeData::ConstructorDeclaration(_) => facts.without(EXCL_CONSTRUCTOR),
-        NodeData::GetAccessorDeclaration(_) | NodeData::SetAccessorDeclaration(_) => {
-            facts.without(EXCL_ACCESSOR) | propagate_subtree_facts(n.name())
+        // `req(f, d.name)` is `n.name()` (the name column of a store node
+        // holds the same child).
+        NodeData::GetAccessorDeclaration(d) => {
+            facts.without(EXCL_ACCESSOR) | propagate_subtree_facts(req(f, d.name))
         }
-        NodeData::MethodDeclaration(_) => {
-            facts.without(EXCL_METHOD) | propagate_subtree_facts(n.name())
+        NodeData::SetAccessorDeclaration(d) => {
+            facts.without(EXCL_ACCESSOR) | propagate_subtree_facts(req(f, d.name))
         }
-        NodeData::PropertyDeclaration(_) => {
-            facts.without(EXCL_PROPERTY) | propagate_subtree_facts(n.name())
+        NodeData::MethodDeclaration(d) => {
+            facts.without(EXCL_METHOD) | propagate_subtree_facts(req(f, d.name))
+        }
+        NodeData::PropertyDeclaration(d) => {
+            facts.without(EXCL_PROPERTY) | propagate_subtree_facts(req(f, d.name))
         }
         NodeData::ArrowFunction(_) => facts.without(EXCL_ARROW_FUNCTION),
         NodeData::ObjectLiteralExpression(_) => facts.without(EXCL_OBJECT_LITERAL),
         // Parameter, Class, OuterExpression, PropertyAccess, ElementAccess,
         // Call, New and ArrayLiteral exclusions all equal the Node exclusion.
         _ => facts.without(EXCL_NODE),
-    })
+    }
+}
+
+/// Go `n.SubtreeFacts()` for node `n` whose data `d` the caller loaded:
+/// the cached facts, or the facts computed from `d` (and cached).
+fn subtree_facts_with_data(n: Node, d: &NodeData) -> SubtreeFacts {
+    if let Some(facts) = cached_subtree_facts(n) {
+        return facts;
+    }
+    let facts = subtree_facts_of_data(n, d).without(SubtreeFacts::COMPUTED);
+    cache_subtree_facts(n, facts);
+    facts
 }
 
 // Go: ast.go computeSubtreeFacts overrides (ast.go:1619 to ast.go:2689) and
@@ -4533,18 +4626,15 @@ fn propagate_node_facts(n: Node) -> SubtreeFacts {
 // PORT: the Go per-type methods are merged into one match. Types without an
 // override use Go `(*NodeDefault).computeSubtreeFacts`, which is None.
 fn compute_subtree_facts(n: Node) -> SubtreeFacts {
-    if is_type_syntax_data(n) {
-        // Go: ast.go:1619 (*TypeSyntaxBase).computeSubtreeFacts
-        return TS;
-    }
-    match static_ast_node(n) {
-        Some(node) => subtree_facts_of_data(n, &node.data),
-        None => read_scoped_ast_node(n, |node| subtree_facts_of_data(n, &node.data)),
-    }
+    with_data!(n, |d| subtree_facts_of_data(n, d))
 }
 
 /// `compute_subtree_facts` over the data `d` of `n`, read in place.
 fn subtree_facts_of_data(n: Node, d: &NodeData) -> SubtreeFacts {
+    if is_type_syntax_data(n, d) {
+        // Go: ast.go:1619 (*TypeSyntaxBase).computeSubtreeFacts
+        return TS;
+    }
     let f = n.file_index();
     macro_rules! p {
         ($x:expr) => {

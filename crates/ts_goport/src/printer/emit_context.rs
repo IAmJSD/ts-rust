@@ -35,8 +35,8 @@ pub struct EmitContext {
     pub(crate) factory: EmitContextFactory,
     pub(crate) auto_generate: RefCell<FxHashMap<Node, AutoGenerateInfo>>,
     pub(crate) text_source: RefCell<FxHashMap<Node, Node>>,
-    pub(crate) original: RefCell<FxHashMap<Node, Node>>,
-    pub(crate) emit_nodes: RefCell<LinkStore<Node, Box<EmitNode>>>,
+    pub(crate) original: RefCell<Originals>,
+    pub(crate) emit_nodes: RefCell<EmitNodes>,
     pub(crate) assigned_name: RefCell<FxHashMap<Node, Node>>,
     pub(crate) class_this: RefCell<FxHashMap<Node, Node>>,
     pub(crate) var_scope_stack: RefCell<Vec<Rc<RefCell<VarScope>>>>,
@@ -99,8 +99,8 @@ pub fn new_emit_context() -> Rc<EmitContext> {
 pub struct PrintTables {
     auto_generate: FxHashMap<Node, AutoGenerateInfo>,
     text_source: FxHashMap<Node, Node>,
-    original: FxHashMap<Node, Node>,
-    emit_nodes: LinkStore<Node, Box<EmitNode>>,
+    original: Originals,
+    emit_nodes: EmitNodes,
     assigned_name: FxHashMap<Node, Node>,
     class_this: FxHashMap<Node, Node>,
     emit_helpers: Vec<EmitHelperRef>,
@@ -114,14 +114,10 @@ impl PrintTables {
         for info in self.auto_generate.values() {
             f(info.node);
         }
-        for map in [
-            &self.text_source,
-            &self.original,
-            &self.assigned_name,
-            &self.class_this,
-        ] {
+        for map in [&self.text_source, &self.assigned_name, &self.class_this] {
             map.values().copied().for_each(&mut f);
         }
+        self.original.values().for_each(&mut f);
     }
 
     /// Calls `f` with the nodes that the emit node of `node` holds.
@@ -209,7 +205,7 @@ impl EmitContext {
         self.auto_generate.borrow_mut().clear();
         self.text_source.borrow_mut().clear();
         self.original.borrow_mut().clear();
-        *self.emit_nodes.borrow_mut() = LinkStore::default();
+        *self.emit_nodes.borrow_mut() = EmitNodes::default();
         self.assigned_name.borrow_mut().clear();
         self.class_this.borrow_mut().clear();
         self.var_scope_stack.borrow_mut().clear();
@@ -220,7 +216,7 @@ impl EmitContext {
 
     // Go: printer/emitcontext.go:71 onCreate
     pub(crate) fn on_create(&self, node: Node) {
-        set_node_flags(node, node.flags() | NodeFlags::SYNTHESIZED);
+        crate::ast::synthetic::add_node_flags(node, NodeFlags::SYNTHESIZED);
     }
 
     // Go: printer/emitcontext.go:75 onUpdate
@@ -741,7 +737,7 @@ impl EmitContext {
 
     // Go: printer/emitcontext.go:450 UnsetOriginal
     pub fn unset_original(&self, node: Node) {
-        self.original.borrow_mut().remove(&node);
+        self.original.borrow_mut().remove(node);
     }
 
     // Go: printer/emitcontext.go:454 SetOriginalEx
@@ -750,23 +746,19 @@ impl EmitContext {
             panic!("Original cannot be nil.");
         }
 
-        let existing = self.original.borrow().get(&node).copied();
-        match existing {
-            None => {
-                self.original.borrow_mut().insert(node, original);
-                let mut emit_nodes = self.emit_nodes.borrow_mut();
-                if let Some(emit_node) = emit_nodes.try_get(original).cloned() {
-                    emit_nodes.get(node).copy_from(&emit_node);
-                }
-            }
-            Some(existing) if !allow_overwrite && existing != original => {
-                panic!("Original node already set.");
-            }
-            Some(_) => {
-                if allow_overwrite {
-                    self.original.borrow_mut().insert(node, original);
-                }
-            }
+        // PERF: emitast1. One lookup of `node`, not a get and an insert.
+        if !self
+            .original
+            .borrow_mut()
+            .set(node, original, allow_overwrite)
+        {
+            return;
+        }
+        let mut emit_nodes = self.emit_nodes.borrow_mut();
+        // PERF: emitast2. Copy only the fields that `copy_from` reads, not
+        // the whole boxed emit node with its comment lists.
+        if let Some(source) = emit_nodes.try_get(original).map(|e| e.copied_fields()) {
+            emit_nodes.get(node).copy_from(&source);
         }
     }
 
@@ -776,11 +768,7 @@ impl EmitContext {
     // NOTE: This is the equivalent to reading `node.original` in Strada.
     #[must_use]
     pub fn original(&self, node: Node) -> Node {
-        self.original
-            .borrow()
-            .get(&node)
-            .copied()
-            .unwrap_or(Node::NIL)
+        self.original.borrow().get(node)
     }
 
     // Go: printer/emitcontext.go:487 MostOriginal
@@ -920,6 +908,22 @@ pub(crate) struct EmitNode {
 }
 
 impl EmitNode {
+    /// An emit node with the fields of this one that `copy_from` reads, so
+    /// a copy needs no box and no comment list clone.
+    fn copied_fields(&self) -> EmitNode {
+        EmitNode {
+            flags: self.flags,
+            emit_flags: self.emit_flags,
+            comment_range: self.comment_range,
+            source_map_range: self.source_map_range,
+            token_source_map_ranges: self.token_source_map_ranges.clone(),
+            helpers: self.helpers.clone(),
+            external_helpers_module_name: self.external_helpers_module_name,
+            snippet_element: self.snippet_element,
+            ..EmitNode::default()
+        }
+    }
+
     // Go: printer/emitcontext.go:542 copyFrom
     // NOTE: This method is not guaranteed to be thread-safe
     pub(crate) fn copy_from(&mut self, source: &EmitNode) {
@@ -1622,5 +1626,217 @@ impl EmitContext {
         self.set_original(statement, node);
         self.assign_comment_range(statement, node);
         statement
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Node-keyed side tables
+// ──────────────────────────────────────────────────────────────────────
+
+/// Keys per page of a `SyntheticPages` table.
+const NODE_PAGE: usize = 64;
+
+/// The most pages in the window of a `SyntheticPages` table: 2M handles,
+/// so the page list is at most 256 KiB.
+const NODE_WINDOW_PAGES: usize = 1 << 15;
+
+/// `SyntheticPages::first` of a table with no window yet. A handle page
+/// minus it (wrapping) is never in the window.
+const NO_WINDOW: usize = usize::MAX / 2;
+
+/// The records of an `EmitContext` table whose keys are synthetic (factory)
+/// nodes, in pages by handle number. A synthetic handle is the slot number
+/// of its node in the arena of its thread, and the nodes that a context
+/// sees are mostly the ones its transforms make, which have near numbers.
+/// The window has `NODE_WINDOW_PAGES` pages from the page of the first key
+/// written. A key outside it is not here: the owner table keeps it in its
+/// other store, with the parsed keys.
+// PERF: emitast2. A read is a few loads, not a hash lookup: emit flags,
+// comment ranges and original links are read for each node that a
+// transform makes or the printer prints.
+#[derive(Clone)]
+struct SyntheticPages<V> {
+    /// The handle page of `pages[0]`, or `NO_WINDOW`.
+    first: usize,
+    pages: Vec<Option<Box<[Option<V>; NODE_PAGE]>>>,
+}
+
+impl<V> Default for SyntheticPages<V> {
+    fn default() -> Self {
+        Self {
+            first: NO_WINDOW,
+            pages: Vec::new(),
+        }
+    }
+}
+
+impl<V> SyntheticPages<V> {
+    /// The page index and cell of synthetic key `n` in the window, or
+    /// `None` for a parsed key and a key outside the window.
+    #[inline(always)]
+    fn position(&self, n: Node) -> Option<(usize, usize)> {
+        if n.file_index() != crate::ast::synthetic::SYNTHETIC_NODE_FILE {
+            return None;
+        }
+        let handle = (n.0 & 0xffff_ffff) as usize;
+        let page = (handle / NODE_PAGE).wrapping_sub(self.first);
+        (page < NODE_WINDOW_PAGES).then_some((page, handle % NODE_PAGE))
+    }
+
+    /// The value of key `n`: `Some` for a synthetic key in the window (with
+    /// its value or `None`), `None` for any other key.
+    #[inline(always)]
+    fn read(&self, n: Node) -> Option<Option<&V>> {
+        let (page, cell) = self.position(n)?;
+        Some(
+            self.pages
+                .get(page)
+                .and_then(|p| p.as_deref())
+                .and_then(|p| p[cell].as_ref()),
+        )
+    }
+
+    /// The cell of key `n` to write, or `None` for a key that is not here
+    /// (see `read`). The first synthetic key written starts the window.
+    #[inline(always)]
+    fn cell_mut(&mut self, n: Node) -> Option<&mut Option<V>> {
+        if self.first == NO_WINDOW && n.file_index() == crate::ast::synthetic::SYNTHETIC_NODE_FILE {
+            self.first = (n.0 & 0xffff_ffff) as usize / NODE_PAGE;
+        }
+        let (page, cell) = self.position(n)?;
+        if page >= self.pages.len() || self.pages[page].is_none() {
+            self.add_page(page);
+        }
+        let p = self.pages[page].as_deref_mut().expect("page was added");
+        Some(&mut p[cell])
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn add_page(&mut self, page: usize) {
+        if page >= self.pages.len() {
+            self.pages.resize_with(page + 1, || None);
+        }
+        self.pages[page].get_or_insert_with(|| Box::new(std::array::from_fn(|_| None)));
+    }
+
+    fn values(&self) -> impl Iterator<Item = &V> {
+        self.pages.iter().flatten().flat_map(|p| p.iter().flatten())
+    }
+}
+
+/// Go `EmitContext.original`: the original node of each node that has one.
+// PORT: Go `map[*ast.Node]*ast.Node`; see `SyntheticPages`.
+#[derive(Clone, Default)]
+pub(crate) struct Originals {
+    synthetic: SyntheticPages<Node>,
+    /// Parsed keys, and synthetic keys outside the window.
+    other: FxHashMap<Node, Node>,
+}
+
+impl Originals {
+    /// The original of `node`, or nil.
+    #[inline]
+    fn get(&self, node: Node) -> Node {
+        match self.synthetic.read(node) {
+            Some(original) => original.copied().unwrap_or(Node::NIL),
+            None => self.other.get(&node).copied().unwrap_or(Node::NIL),
+        }
+    }
+
+    /// The map write of Go `SetOriginalEx`: sets the original of `node` when
+    /// it has none and returns true; else panics on a different original
+    /// unless `allow_overwrite`, which replaces it.
+    #[inline]
+    fn set(&mut self, node: Node, original: Node, allow_overwrite: bool) -> bool {
+        let cell = match self.synthetic.cell_mut(node) {
+            Some(cell) => cell,
+            None => {
+                return match self.other.entry(node) {
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        entry.insert(original);
+                        true
+                    }
+                    std::collections::hash_map::Entry::Occupied(mut entry) => {
+                        Self::check_overwrite(*entry.get(), original, allow_overwrite);
+                        if allow_overwrite {
+                            entry.insert(original);
+                        }
+                        false
+                    }
+                };
+            }
+        };
+        match cell {
+            None => {
+                *cell = Some(original);
+                true
+            }
+            Some(old) => {
+                Self::check_overwrite(*old, original, allow_overwrite);
+                if allow_overwrite {
+                    *old = original;
+                }
+                false
+            }
+        }
+    }
+
+    fn check_overwrite(old: Node, original: Node, allow_overwrite: bool) {
+        if !allow_overwrite && old != original {
+            panic!("Original node already set.");
+        }
+    }
+
+    fn remove(&mut self, node: Node) {
+        match self.synthetic.position(node) {
+            Some((page, cell)) => {
+                if let Some(Some(p)) = self.synthetic.pages.get_mut(page) {
+                    p[cell] = None;
+                }
+            }
+            None => {
+                self.other.remove(&node);
+            }
+        }
+    }
+
+    fn clear(&mut self) {
+        self.synthetic = SyntheticPages::default();
+        self.other.clear();
+    }
+
+    fn values(&self) -> impl Iterator<Item = Node> {
+        self.synthetic.values().chain(self.other.values()).copied()
+    }
+}
+
+/// Go `EmitContext.emitNodes`: the emit node of each node that has one.
+/// Parsed keys keep their records in the pages of a `LinkStore`.
+// PORT: Go `core.LinkStore[*ast.Node, emitNode]`; see `SyntheticPages`.
+#[derive(Clone, Default)]
+pub(crate) struct EmitNodes {
+    synthetic: SyntheticPages<Box<EmitNode>>,
+    /// Parsed keys, and synthetic keys outside the window.
+    other: LinkStore<Node, Box<EmitNode>>,
+}
+
+impl EmitNodes {
+    /// Go `emitNodes.TryGet(node)`.
+    #[inline]
+    fn try_get(&self, node: Node) -> Option<&Box<EmitNode>> {
+        match self.synthetic.read(node) {
+            Some(emit_node) => emit_node,
+            None => self.other.try_get(node),
+        }
+    }
+
+    /// Go `emitNodes.Get(node)`: creates the record on first use.
+    #[inline]
+    fn get(&mut self, node: Node) -> &mut Box<EmitNode> {
+        match self.synthetic.cell_mut(node) {
+            Some(cell) => cell.get_or_insert_with(Box::default),
+            None => self.other.get(node),
+        }
     }
 }

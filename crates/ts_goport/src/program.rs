@@ -414,7 +414,7 @@ fn create_emit_pool(count: usize) -> EmitPool {
             let seed = WorkerSeed::take();
             let receiver = Arc::clone(&receiver);
             let released = Arc::clone(&released);
-            std::thread::Builder::new()
+            crate::core::GoThread::new()
                 .name(format!("emit-{index}"))
                 .stack_size(crate::gostd::stack::max_stack_size())
                 .spawn(move || {
@@ -437,7 +437,6 @@ fn create_emit_pool(count: usize) -> EmitPool {
                         forget_synthetic_nodes();
                     }
                 })
-                .unwrap_or_else(|err| crate::core::go_fatal_newosproc(&err))
         })
         .collect();
     EmitPool {
@@ -514,7 +513,7 @@ fn create_dts_twin() -> DtsTwin {
     let (queue, receiver) = std::sync::mpsc::channel::<Job>();
     let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let thread_released = Arc::clone(&released);
-    let thread = std::thread::Builder::new()
+    let thread = crate::core::GoThread::new()
         .name(format!("dts-twin-{index}"))
         .stack_size(crate::gostd::stack::max_stack_size())
         .spawn(move || {
@@ -531,8 +530,7 @@ fn create_dts_twin() -> DtsTwin {
             } else {
                 forget_synthetic_nodes();
             }
-        })
-        .unwrap_or_else(|err| crate::core::go_fatal_newosproc(&err));
+        });
     DtsTwin {
         queue,
         thread,
@@ -1935,7 +1933,8 @@ fn bind_files_parallel(lineage: &mut Lineage) {
         for _ in 0..threads {
             let seed = WorkerSeed::take();
             let (files, order, queue, sender) = (&files, &order, &queue, sender.clone());
-            std::thread::Builder::new()
+            // Go starts its threads on demand and fails the same way.
+            crate::core::GoThread::new()
                 .stack_size(crate::gostd::stack::max_stack_size())
                 .spawn_scoped(scope, move || {
                     seed.install();
@@ -1994,9 +1993,7 @@ fn bind_files_parallel(lineage: &mut Lineage) {
                             .wait(state)
                             .unwrap_or_else(std::sync::PoisonError::into_inner);
                     }
-                })
-                // Go starts its threads on demand and fails the same way.
-                .unwrap_or_else(|err| crate::core::go_fatal_newosproc(&err));
+                });
         }
         drop(sender);
         // Join the files in order as they arrive.
@@ -2438,7 +2435,7 @@ pub fn go_frontend_program() -> Option<Rc<crate::frontend::compiler::NewProgram>
 }
 
 // Go: compiler/program.go:1841 ExplainFiles
-pub fn explain_files(w: &mut String, locale: &crate::locale::Locale) {
+pub fn explain_files(w: &mut dyn std::io::Write, locale: &crate::locale::Locale) {
     go_frontend()
         .expect("explain files of an alias resolver program")
         .explain_files(w, locale);
@@ -3011,13 +3008,12 @@ pub fn spawn_seeded_thread<R: Send + 'static>(
     f: impl FnOnce() -> R + Send + 'static,
 ) -> std::thread::JoinHandle<R> {
     let seed = WorkerSeed::take();
-    std::thread::Builder::new()
+    crate::core::GoThread::new()
         .stack_size(crate::gostd::stack::max_stack_size())
         .spawn(move || {
             seed.install();
             f()
         })
-        .unwrap_or_else(|err| crate::core::go_fatal_newosproc(&err))
 }
 
 // Go: compiler/checkerpool.go:40 newCheckerPoolWithTracing (the count)
@@ -3077,7 +3073,7 @@ fn create_checkers() -> CheckerPool {
         .map(|index| {
             let (sender, receiver) = std::sync::mpsc::channel::<Job>();
             let seed = WorkerSeed::take();
-            let thread = std::thread::Builder::new()
+            let thread = crate::core::GoThread::new()
                 .name(format!("checker-{index}"))
                 .stack_size(crate::gostd::stack::max_stack_size())
                 .spawn(move || {
@@ -3104,8 +3100,7 @@ fn create_checkers() -> CheckerPool {
                         std::mem::forget(WORKER_CHECKER.with(|slot| slot.borrow_mut().take()));
                         forget_synthetic_nodes();
                     }
-                })
-                .unwrap_or_else(|err| crate::core::go_fatal_newosproc(&err));
+                });
             (sender, thread)
         })
         .unzip();

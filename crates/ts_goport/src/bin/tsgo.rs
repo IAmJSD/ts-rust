@@ -61,9 +61,10 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 const JEMALLOC_CONF: &str = "narenas:4,thp:always,metadata_thp:disabled,cache_oblivious:false";
 
 /// The `arg0` of a worker (see `launch`) is this word, the launcher's
-/// process id and the number of the launcher's end of the pipe that takes
-/// the exit code: `tsgo-worker 4242 3`. The arguments, not the environment,
-/// name a worker, so a process that the worker starts gets nothing of it.
+/// process id, and the number, device and inode of the launcher's end of
+/// the pipe that takes the exit code: `tsgo-worker 4242 3 15 81234`. The
+/// arguments, not the environment, name a worker, so a process that the
+/// worker starts gets nothing of it.
 #[cfg(target_os = "linux")]
 const WORKER_ARG0: &str = "tsgo-worker";
 
@@ -73,6 +74,9 @@ const WORKER_ARG0: &str = "tsgo-worker";
 struct Worker {
     /// The number of the launcher's end of the pipe that takes the exit code.
     fd: u32,
+    /// The device and inode of that pipe.
+    dev: u64,
+    ino: u64,
     /// The launcher.
     launcher: rustix::process::Pid,
 }
@@ -202,8 +206,14 @@ fn launch(huge_pages: bool) -> Option<i32> {
     // worker.
     let (read, write) = rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC).ok()?;
     let launcher = rustix::process::getpid().as_raw_pid();
+    let stat = rustix::fs::fstat(&read).ok()?;
     let mut worker = std::process::Command::new(exe)
-        .arg0(format!("{WORKER_ARG0} {launcher} {}", read.as_raw_fd()))
+        .arg0(format!(
+            "{WORKER_ARG0} {launcher} {} {} {}",
+            read.as_raw_fd(),
+            stat.st_dev,
+            stat.st_ino
+        ))
         .args(args)
         .spawn()
         .ok()?;
@@ -249,7 +259,7 @@ fn launch(huge_pages: bool) -> Option<i32> {
 }
 
 /// This process as a worker (see `launch`): its `arg0` is `WORKER_ARG0`
-/// with a launcher and a pipe number, and its parent is that launcher. A
+/// with a launcher and its pipe, and its parent is that launcher. A
 /// worker whose launcher ends before the first call runs as a plain tsgo.
 /// The first call decides, at the start of `main`.
 #[cfg(target_os = "linux")]
@@ -261,10 +271,20 @@ fn worker() -> Option<Worker> {
             .to_str()?
             .strip_prefix(WORKER_ARG0)?
             .strip_prefix(' ')?;
-        let (launcher, fd) = rest.split_once(' ')?;
-        let launcher = rustix::process::Pid::from_raw(launcher.parse().ok()?)?;
-        let fd = fd.parse().ok()?;
-        (rustix::process::getppid() == Some(launcher)).then_some(Worker { fd, launcher })
+        let mut fields = rest.split(' ');
+        let launcher = rustix::process::Pid::from_raw(fields.next()?.parse().ok()?)?;
+        let fd = fields.next()?.parse().ok()?;
+        let dev = fields.next()?.parse().ok()?;
+        let ino = fields.next()?.parse().ok()?;
+        if fields.next().is_some() {
+            return None;
+        }
+        (rustix::process::getppid() == Some(launcher)).then_some(Worker {
+            fd,
+            dev,
+            ino,
+            launcher,
+        })
     })
 }
 
@@ -411,6 +431,7 @@ fn go_runtime_start() {
 /// another thread is in its cleanup.
 #[cfg(target_os = "linux")]
 fn throw(name: &str) -> ! {
+    ts_goport::execute::tsc::stdio::flush_cli_stdout_at_exit();
     let line = format!("{name}\n");
     let _ = rustix::io::write(rustix::stdio::stderr(), line.as_bytes());
     if let Some(worker) = worker() {
@@ -437,15 +458,29 @@ fn exit(code: i32) -> ! {
 /// memory. It takes no std lock (`throw`).
 #[cfg(target_os = "linux")]
 fn send_code(worker: Worker, code: i32) {
+    use std::os::unix::fs::OpenOptionsExt;
     if let Ok(null) = std::fs::File::options().write(true).open("/dev/null") {
         let _ = rustix::stdio::dup2_stdout(&null);
         let _ = rustix::stdio::dup2_stderr(&null);
     }
     // The launcher's end of the pipe, opened for writing by its number. The
     // new file has a close-on-exec flag. When it cannot open, the launcher
-    // takes the code from the worker's exit.
+    // takes the code from the worker's exit. In a PID namespace whose /proc
+    // is not its own, the path names a file of another process: the code is
+    // written only to a FIFO with the device and inode that the launcher
+    // passed, and the open does not wait (`O_NONBLOCK`) for a reader of
+    // another FIFO.
     let pipe = format!("/proc/{}/fd/{}", worker.launcher.as_raw_pid(), worker.fd);
-    if let Ok(mut pipe) = std::fs::File::options().write(true).open(pipe) {
+    if let Ok(mut pipe) = std::fs::File::options()
+        .write(true)
+        .custom_flags(rustix::fs::OFlags::NONBLOCK.bits().cast_signed())
+        .open(pipe)
+        && rustix::fs::fstat(&pipe).is_ok_and(|stat| {
+            rustix::fs::FileType::from_raw_mode(stat.st_mode) == rustix::fs::FileType::Fifo
+                && stat.st_dev == worker.dev
+                && stat.st_ino == worker.ino
+        })
+    {
         let _ = pipe.write_all(&code.to_le_bytes());
     }
 }
@@ -535,6 +570,8 @@ fn install_panic_hook() {
             .location()
             .map(|l| format!(" at {}:{}", l.file(), l.line()))
             .unwrap_or_default();
+        // The output so far comes first, also in one file with stderr.
+        ts_goport::execute::tsc::stdio::flush_cli_stdout_at_exit();
         eprintln!("tsgo: panic{location}: {message}");
         if std::env::var_os("GOPORT_TRACE").is_some() {
             eprintln!("{}", std::backtrace::Backtrace::force_capture());
