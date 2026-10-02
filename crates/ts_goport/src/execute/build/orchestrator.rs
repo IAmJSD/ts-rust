@@ -1250,14 +1250,14 @@ impl Orchestrator {
     }
 
     /// PORT: not in Go (perf). True when the first task that compiles,
-    /// `first`, compiles on a builder thread (builders.rs). With
+    /// `first`, can compile on a builder thread (builders.rs). With
     /// `BuildersSetting::Light`: when it only reports the errors of its
-    /// build info or makes its pending emit, and the forecast says that the
-    /// later tasks use builders too (`known_later_tasks_use_builders`).
-    /// When the forecast is not known yet, the task waits while this thread
-    /// checks the next tasks, and the second task that compiles decides
-    /// (`later_tasks_use_builders`); when no other task can start first,
-    /// the task loads on this thread (`build_all_tasks`).
+    /// build info or makes its pending emit. Then the forecast decides
+    /// (`build_all_tasks`): it does when the later tasks use builders too
+    /// (`known_later_tasks_use_builders`). When the forecast is not known
+    /// yet, the task waits while this thread checks the next tasks, and the
+    /// second task that compiles decides (`later_tasks_use_builders`); when
+    /// no other task can start first, the task loads on this thread.
     fn first_task_uses_builder(&self, setting: BuildersSetting, first: &BuildTask) -> bool {
         match setting {
             BuildersSetting::Off => false,
