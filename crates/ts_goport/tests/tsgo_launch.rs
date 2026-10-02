@@ -183,25 +183,20 @@ fn a_tsgo_with_the_proc_of_another_pid_namespace() {
 /// went on to `abort`, which ends a pid 1 by SIGSEGV. And a launcher whose
 /// caller ignores SIGCHLD takes the exit code from the worker's exit in a
 /// PID namespace with the /proc of another one (`own_proc`), as Go gives
-/// it. Where `unshare -U` or `env --ignore-signal` cannot run, the test
-/// says so and passes.
+/// it. Where `unshare -U`, `env --default-signal` or `env --ignore-signal`
+/// cannot run, the test says so and passes.
 #[test]
 fn a_tsgo_that_is_pid_1_of_a_pid_namespace() {
-    const UNSHARE: [&str; 4] = ["-Upf", "--map-root-user", "--kill-child", "--mount-proc"];
-    let probe = Command::new("unshare")
-        .args(UNSHARE)
-        .arg("true")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
-    if !probe.is_ok_and(|status| status.success()) {
-        eprintln!("skipped: `unshare -Upf --map-root-user --mount-proc` cannot run here");
+    if !unshare_runs(&DEFAULT_HUP) {
+        eprintln!(
+            "skipped: `unshare -Upf --map-root-user --mount-proc env --default-signal=HUP` cannot run here"
+        );
         return;
     }
     let tsgo = env!("CARGO_BIN_EXE_tsgo");
     let unshare = || {
         let mut unshare = Command::new("unshare");
-        unshare.args(UNSHARE).arg(tsgo);
+        unshare.args(UNSHARE).args(DEFAULT_HUP).arg(tsgo);
         unshare
     };
     // unshare's child is tsgo, pid 1; the worker is its child.
@@ -385,6 +380,27 @@ fn signal_run(
         .read_to_string(&mut stderr)
         .unwrap();
     (status, stderr, ended)
+}
+
+/// `env` with the default action of SIGHUP, also when the test runs under
+/// `nohup`: tsgo keeps an ignored SIGHUP, as Go does. `env` execs its
+/// command, so a pid 1 stays pid 1.
+const DEFAULT_HUP: [&str; 2] = ["env", "--default-signal=HUP"];
+
+/// `unshare` with a new user and PID namespace and its own /proc, as
+/// `docker run` without `--init`: its child is pid 1 there.
+const UNSHARE: [&str; 4] = ["-Upf", "--map-root-user", "--kill-child", "--mount-proc"];
+
+/// Whether `unshare` (`UNSHARE`) can run `wrap` with `true` here.
+fn unshare_runs(wrap: &[&str]) -> bool {
+    Command::new("unshare")
+        .args(UNSHARE)
+        .args(wrap)
+        .arg("true")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
 }
 
 /// The pid of a child of `pid`, from /proc.
