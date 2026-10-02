@@ -37,9 +37,10 @@ tikv-jemalloc-ctl = { version = "=0.7.0", optional = true }
 miow = "=0.6.1"
 same-file = "=1.0.6"
 
-# `process`: prctl(PR_SET_THP_DISABLE) in thp_guard.rs.
+# `process`: prctl(PR_SET_THP_DISABLE) in thp_guard.rs. `signal`: the
+# signal mask at start in bin/tsgo.rs (`unblock_go_signals`).
 [target.'cfg(target_os = "linux")'.dependencies]
-nix = { version = "=0.31.3", default-features = false, features = ["process"] }
+nix = { version = "=0.31.3", default-features = false, features = ["process", "signal"] }
 
 [features]
 default = ["jemalloc"]

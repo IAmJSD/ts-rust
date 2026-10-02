@@ -21,10 +21,11 @@
 //! Not Go: when the run gets 4 KiB pages, a worker copy of the binary does
 //! the work, so the exit does not wait for its memory to unmap (`launch`).
 //!
-//! As the Go runtime does at start (`go_runtime_start`): the signals that Go
-//! drops get a handler that does nothing, SIGQUIT prints its name and exits
-//! 2, SIGHUP ends the process by SIGHUP, and the soft open-file limit goes
-//! up (PORTING.md "Process start").
+//! As the Go runtime does at start: each thread unblocks the signals that
+//! Go must get (`GO_UNBLOCKED`), the signals that Go drops get a handler
+//! that does nothing, SIGQUIT prints its name and exits 2, SIGHUP ends the
+//! process by SIGHUP, and the soft open-file limit goes up
+//! (`go_runtime_start`; PORTING.md "Process start").
 //! PORT: Go `core.ApplyDebugStackLimit` (`TS_GO_DEBUG_STACK_LIMIT`) is a
 //! debug setting and is skipped. The work runs on a thread with the stack
 //! size of `gostd::stack::max_stack_size` (1 GiB with no address space or
@@ -84,7 +85,11 @@ struct Worker {
 
 // Go: cmd/tsc/main.go:14 main
 fn main() {
-    // First: it must run before the first heap allocation.
+    // First: before any thread starts (`thp_guard` can start one), so each
+    // thread gets Go's mask. It allocates nothing.
+    #[cfg(target_os = "linux")]
+    unblock_go_signals();
+    // Next: it must run before the first heap allocation.
     let huge_pages = ts_goport::thp_guard::thp_guard();
     #[cfg(target_os = "linux")]
     if let Some(code) = launch(huge_pages) {
@@ -599,6 +604,56 @@ const GO_THROWN: [(rustix::process::Signal, &str); 3] = {
         (Signal::SYS, "SIGSYS: bad system call"),
     ]
 };
+
+/// The signals that the Go runtime unblocks on each of its threads, so a
+/// caller cannot block them (`runtime/signal_unix.go` `minitSignalMask` and
+/// `blockableSig`, go1.27.1): `_SigUnblock`, `_SigKill` or `_SigThrow` in
+/// `runtime/sigtab_linux_generic.go`, and SIGURG, its preemption signal
+/// (`unblock_go_signals`).
+/// PORT: Go also unblocks the signals 32 to 34 (`_SigUnblock`). nix's
+/// `SigSet` has no real-time signals, so tsgo keeps them as the caller set
+/// them (glibc does not block 32 and 33, its own signals).
+/// PORT: with `GODEBUG=asyncpreemptoff=1` Go lets a caller block SIGURG.
+/// tsgo does not read `GODEBUG`; both drop SIGURG (`GO_DROPPED`).
+#[cfg(target_os = "linux")]
+const GO_UNBLOCKED: [nix::sys::signal::Signal; 15] = {
+    use nix::sys::signal::Signal;
+    [
+        Signal::SIGHUP,
+        Signal::SIGINT,
+        Signal::SIGQUIT,
+        Signal::SIGILL,
+        Signal::SIGTRAP,
+        Signal::SIGABRT,
+        Signal::SIGBUS,
+        Signal::SIGFPE,
+        Signal::SIGSEGV,
+        Signal::SIGTERM,
+        Signal::SIGSTKFLT,
+        Signal::SIGCHLD,
+        Signal::SIGURG,
+        Signal::SIGPROF,
+        Signal::SIGSYS,
+    ]
+};
+
+// Go: runtime/signal_unix.go minitSignalMask (go1.27.1)
+/// Unblocks the signals that Go unblocks on each of its threads
+/// (`GO_UNBLOCKED`). `main` calls it first, before any thread starts, so
+/// each thread gets the new mask: in tsgo, in a launcher and in its worker.
+/// A process that tsgo starts gets the mask of the thread that starts it
+/// (std `Command` keeps it), so the caller's mask without these signals,
+/// as from Go: Go saves the mask of the thread before the fork and the
+/// child sets it (runtime/proc.go `syscall_runtime_BeforeFork`,
+/// `syscall_runtime_AfterForkInChild`).
+#[cfg(target_os = "linux")]
+fn unblock_go_signals() {
+    use nix::sys::signal::SigSet;
+    let _ = GO_UNBLOCKED
+        .into_iter()
+        .collect::<SigSet>()
+        .thread_unblock();
+}
 
 /// Gives each signal that Go drops (`GO_DROPPED`, `GO_DROPPED_RT`) a handler
 /// that does nothing. Not `SIG_IGN`: an exec resets a caught signal to its

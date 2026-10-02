@@ -18,9 +18,10 @@
 //!
 //! The ends by a signal: as the pid 1 of a PID namespace, where the kernel
 //! drops a signal with the default action, tsgo exits 128 + N where Go
-//! does (`end_by_signal`, `die_from_signal`, stdio.rs `sigpipe`); and a
+//! does (`end_by_signal`, `die_from_signal`, stdio.rs `sigpipe`); a
 //! launcher whose caller ignores SIGCHLD still gets its worker's exit
-//! (`drop_go_signals`).
+//! (`drop_go_signals`); and the signals that Go unblocks at start end the
+//! run also when the caller blocked them (`GO_UNBLOCKED`).
 #![cfg(target_os = "linux")]
 
 use std::io::{Read, Seek};
@@ -267,6 +268,60 @@ fn a_pid_1_tsgo_whose_stdout_is_broken() {
             Some(141),
             "GOPORT_LAUNCH={launch}: {output:?}"
         );
+    }
+}
+
+/// A tsgo whose caller blocks SIGHUP and SIGQUIT (a signal mask, which an
+/// exec keeps): Go unblocks them on each thread at its start
+/// (`minitSignalMask`), and so does tsgo, in the launcher and in the
+/// worker (`GO_UNBLOCKED`). So SIGQUIT ends the run with Go's text and exit
+/// 2, and SIGHUP ends it by SIGHUP: sent to tsgo with and without a worker,
+/// and to the worker. With the caller's mask the signals stayed pending
+/// and the run went on. Where `env --default-signal` cannot run, the test
+/// says so and passes.
+#[test]
+fn a_tsgo_whose_caller_blocks_signals() {
+    use nix::sys::signal::{SigSet, Signal as NixSignal};
+    let probe = Command::new("env").args(DEFAULT_HUP).arg("true").status();
+    if !probe.is_ok_and(|status| status.success()) {
+        eprintln!("skipped: `env --default-signal=HUP` cannot run here");
+        return;
+    }
+    let runs = [
+        ("1", 0, Signal::QUIT, "SIGQUIT to the launcher"),
+        ("0", 0, Signal::QUIT, "SIGQUIT to tsgo without a worker"),
+        ("1", 1, Signal::HUP, "SIGHUP to the worker"),
+        ("0", 0, Signal::HUP, "SIGHUP to tsgo without a worker"),
+    ];
+    for (launch, depth, signal, case) in runs {
+        let case = format!("SIGHUP and SIGQUIT blocked, {case}");
+        // A child gets the mask of the thread that starts it, so a thread
+        // of its own blocks them.
+        let run = std::thread::spawn(move || {
+            let blocked: SigSet = [NixSignal::SIGHUP, NixSignal::SIGQUIT]
+                .into_iter()
+                .collect();
+            blocked.thread_block().unwrap();
+            // `env` execs tsgo with the default action of SIGHUP.
+            let mut command = Command::new(DEFAULT_HUP[0]);
+            command
+                .args(&DEFAULT_HUP[1..])
+                .arg(env!("CARGO_BIN_EXE_tsgo"));
+            let (status, stderr, ended) = signal_run(command, launch, &[(depth, signal)], &case);
+            if signal == Signal::QUIT {
+                assert_eq!(status.code(), Some(2), "{case}: {status} {stderr}");
+                assert!(stderr.starts_with("SIGQUIT: quit"), "{case}: {stderr}");
+            } else {
+                assert_eq!(status.signal(), Some(1), "{case}: {status} {stderr}");
+            }
+            assert!(
+                ended < Duration::from_secs(1),
+                "{case}: ended {ended:?} after the signal"
+            );
+        });
+        if let Err(panic) = run.join() {
+            std::panic::resume_unwind(panic);
+        }
     }
 }
 

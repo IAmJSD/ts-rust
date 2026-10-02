@@ -534,7 +534,7 @@ goroutine.
 ## Process start
 
 `tsgo` starts as the Go runtime and the Go `syscall` package start a Go
-process (bin/tsgo.rs `go_runtime_start`).
+process (bin/tsgo.rs `unblock_go_signals`, `go_runtime_start`).
 
 - Signals (Linux, Go runtime/sigtab_linux_generic.go): the signals that Go
   drops when nothing asks for them (USR1, USR2, ALRM, CHLD, URG, XCPU,
@@ -572,13 +572,21 @@ process (bin/tsgo.rs `go_runtime_start`).
   limit allows it). A SIGILL, SIGBUS, SIGFPE, SIGABRT or SIGTRAP that was
   ignored at start stays ignored, also in a process that tsgo starts; Go
   catches it, so a process that Go starts gets the default action.
-- PORT: the signal mask. On each thread Go unblocks the signals that it
-  must get (sigtab `_SigUnblock`, `_SigKill` or `_SigThrow`: SIGHUP,
-  SIGINT, SIGTERM, SIGQUIT, SIGILL, SIGSEGV and others), and a process that
-  it starts gets the mask that Go inherited. The port does not change the
-  mask: an inherited blocked SIGINT or SIGTERM stays blocked in tsgo, and a
-  process that the port starts with std `Command` (the content mapper, npm,
-  the launcher's worker) gets an empty mask.
+- The signal mask. At start, before any thread, tsgo unblocks the signals
+  that Go unblocks on each of its threads (`GO_UNBLOCKED`: sigtab
+  `_SigUnblock`, `_SigKill` or `_SigThrow`, and SIGURG: SIGHUP, SIGINT,
+  SIGQUIT, SIGILL, SIGTRAP, SIGABRT, SIGBUS, SIGFPE, SIGSEGV, SIGTERM,
+  SIGSTKFLT, SIGCHLD, SIGURG, SIGPROF and SIGSYS), so every thread of a
+  launcher and of its worker gets them, as Go's threads do. Other blocked
+  signals stay blocked. A process that tsgo starts gets the mask of the
+  thread that starts it (std `Command` keeps it): the caller's mask
+  without these signals, as Go gives its children the mask of the thread
+  before the fork (`syscall_runtime_BeforeFork`). PORT: Go also unblocks
+  the signals 32 to 34; nix's `SigSet` has no real-time signals, so a
+  caller's blocked signal 34 stays blocked in tsgo and its children
+  (glibc does not block 32 and 33). PORT: Go lets a caller block SIGURG
+  under `GODEBUG=asyncpreemptoff=1`; tsgo does not read `GODEBUG`, and
+  both drop SIGURG.
 - PORT: `GOTRACEBACK` does nothing. With `GOTRACEBACK=crash`, Go ends a
   thrown signal or a fatal panic with SIGABRT (`crash`, a core dump) after
   the goroutines; the port exits 2 as with the default setting.
