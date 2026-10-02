@@ -179,8 +179,17 @@ fn set_malloc_tunables(budget: &ThreadBudget) {
         if let Some(arg0) = args.next() {
             command.arg0(arg0);
         }
-        // `exec` returns only when it fails.
+        // `exec` returns only when it fails (a binary that is gone, for
+        // example). It has given SIGPIPE its default action for the new
+        // image (std `Command`), so a write to a closed pipe or socket
+        // would end this process, as the second SIGINT or SIGTERM did
+        // (`notify_context` writes to its closed self-pipe). std ignores
+        // SIGPIPE at start, and Go gets EPIPE there. A handler that does
+        // nothing gives this process EPIPE again.
+        // PORT: std and rustix have no safe `SIG_IGN`.
         let _ = command.args(args).envs(vars).exec();
+        let ignore = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let _ = signal_hook::flag::register(signal_hook::consts::SIGPIPE, ignore);
     }
 }
 

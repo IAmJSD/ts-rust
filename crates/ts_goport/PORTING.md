@@ -572,6 +572,14 @@ process (bin/tsgo.rs `unblock_go_signals`, `go_signal_handlers`,
   PORT: with `--lsp` and `--api`, SIGINT and SIGTERM keep their default
   actions until their own `notify_context` (in cmd/tsgo/lsp.rs and
   api.rs), which `go_signal_handlers` cannot see.
+- A failed exec of `set_malloc_tunables` (a binary that is gone, for
+  example) leaves SIGPIPE with its default action (std `Command` sets it
+  for the new image). tsgo then gives SIGPIPE a handler that does nothing,
+  so a write to a closed pipe or socket gets EPIPE again, as after std's
+  start and as in Go (a write to fd 1 or 2 still ends the run,
+  execute/tsc/stdio.rs `sigpipe`). Before, a second SIGINT or SIGTERM
+  ended such a run by SIGPIPE: `notify_context` writes to its closed
+  self-pipe.
 - The pid 1 of a PID namespace (`docker run` without `--init`, `unshare
   -pf`, `bwrap --as-pid-1`): the kernel drops each signal with the default
   action that such a process gets from its namespace or sends itself. Go
