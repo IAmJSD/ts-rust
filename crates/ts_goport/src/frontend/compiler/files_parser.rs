@@ -1603,6 +1603,10 @@ struct PrefetchShared {
     /// workers claim, parse and publish the `.d.ts` and `.json` files there
     /// (`PublishedParses::publish_job`).
     published: OnceLock<Arc<PublishedParses>>,
+    /// The files of `published` that the workers of this load claimed. The
+    /// load drops those that no loader took when it ends (`PrefetchPool`'s
+    /// drop, `PublishedParses::end_load`).
+    claims: LoadClaims,
     /// Debug counts of `take_prefetched`, kept when `GOPORT_PREFETCH_STATS`
     /// is set and printed to stderr when the pool stops.
     counts: Option<Mutex<PrefetchStats>>,
@@ -1682,6 +1686,7 @@ impl PrefetchShared {
             stats: Arc::new(SharedStatCache::default()),
             resolve: OnceLock::new(),
             published: OnceLock::new(),
+            claims: LoadClaims::default(),
             counts: std::env::var_os("GOPORT_PREFETCH_STATS")
                 .map(|_| Mutex::new(PrefetchStats::default())),
         }
@@ -1949,6 +1954,12 @@ impl Drop for PrefetchPool {
         for thread in self.threads.drain(..) {
             let _ = thread.join();
         }
+        // The load ends: its worker parses that no loader took leave the
+        // build. A worker of a discarded pool that still runs claims
+        // nothing more.
+        if let Some(published) = self.shared.published.get() {
+            published.end_load(&self.shared.claims);
+        }
         if used && let Some(counts) = &self.shared.counts {
             lock(counts).print();
         }
@@ -2121,6 +2132,16 @@ pub fn is_build_cached_file(file_name: &str) -> bool {
 /// workers of the other loads only queue its references. A loader takes a
 /// worker parse that fits its parse options; Go's cache by parse options is
 /// on top of this (`SharedSourceFiles`).
+///
+/// A worker parse enters the build's parse cache only when a loader takes
+/// it, as Go caches a file only when a program asks for it. When a load
+/// ends, the parses that its workers claimed and no loader took leave
+/// (`end_load`), as `BuildStatCache::end_load` keeps only the lookups that
+/// the loader took. The build writes a file only when no load runs
+/// (execute/build/builders.rs, the read rule), so a later program never
+/// gets a worker parse of a file from before a write. A taken parse serves
+/// one parse key: a loader with other options parses the file again, as
+/// Go does.
 #[derive(Default)]
 pub struct PublishedParses {
     files: Mutex<FxHashMap<String, Arc<PublishedSlot>>>,
@@ -2133,6 +2154,19 @@ struct PublishedSlot {
     /// parse, or None when there is none to share.
     state: Mutex<Option<Option<PublishedParse>>>,
     done: Condvar,
+    /// A loader took the parse: it is in the build's parse cache.
+    taken: AtomicBool,
+}
+
+/// The files of `PublishedParses` that the parse workers of one load
+/// claimed, by name. None once the load ended: its workers claim nothing
+/// more.
+struct LoadClaims(Mutex<Option<Vec<(String, Arc<PublishedSlot>)>>>);
+
+impl Default for LoadClaims {
+    fn default() -> Self {
+        LoadClaims(Mutex::new(Some(Vec::new())))
+    }
 }
 
 /// A published parse of a file, for any thread.
@@ -2151,8 +2185,9 @@ pub enum LoaderTake {
     Parse(ParsedSourceFile),
     /// No thread had the file: the loader parses it and finishes the claim.
     Claimed(PublishClaim),
-    /// Another thread's parse that does not fit, or no parse: the loader
-    /// parses the file for itself.
+    /// Another thread's parse that does not fit, a parse that a loader
+    /// took for other options, or no parse: the loader parses the file for
+    /// itself.
     Other,
 }
 
@@ -2164,8 +2199,10 @@ pub struct PublishClaim {
 }
 
 impl PublishClaim {
-    /// Ends the claim with the loader's published parse `file`.
+    /// Ends the claim with the loader's published parse `file`, which the
+    /// loader took.
     pub fn finish(mut self, file: &ParsedSourceFile) {
+        self.slot.taken.store(true, AtomicOrdering::Relaxed);
         self.parse = Some(PublishedParse {
             refs: Arc::new(FileRefs::of_file(file)),
             file: file.clone(),
@@ -2200,9 +2237,9 @@ impl PublishedParses {
 
     /// For a loader of the build: the published parse of the file of
     /// `opts`, when a worker made one that fits `opts` and `script_kind`
-    /// (as `take_prefetched` checks a worker parse). Waits while another
-    /// thread parses the file. A thread that parses never waits for
-    /// another file, so the wait ends.
+    /// (as `take_prefetched` checks a worker parse) and no loader took it
+    /// yet. Waits while another thread parses the file. A thread that
+    /// parses never waits for another file, so the wait ends.
     pub fn take_for_loader(
         &self,
         opts: &SourceFileParseOptions,
@@ -2234,7 +2271,8 @@ impl PublishedParses {
             && (!parse.read_module_indicator_options
                 || parsed.external_module_indicator_options
                     == opts.external_module_indicator_options);
-        if !fits {
+        // One loader takes the parse, for one parse key.
+        if !fits || slot.taken.swap(true, AtomicOrdering::Relaxed) {
             return LoaderTake::Other;
         }
         let mut file = parse.file.clone();
@@ -2243,12 +2281,27 @@ impl PublishedParses {
     }
 
     /// A parse worker's job for a file that the build host caches: claims
-    /// the file, parses it and publishes it. Returns the references to
-    /// queue: those of this parse, or of a parse that another thread
-    /// published. None when another thread parses the file now, or when
-    /// there is no usable parse (the loader parses the file then).
-    fn publish_job(&self, fs: &dyn Fs, job: &PrefetchJob, cwd: &str) -> Option<Arc<FileRefs>> {
-        let (slot, claim) = self.claim(&job.opts.file_name);
+    /// the file for the load of `claims`, parses it and publishes it.
+    /// Returns the references to queue: those of this parse, or of a parse
+    /// that another thread published. None when another thread parses the
+    /// file now, when there is no usable parse (the loader parses the file
+    /// then), or when the load ended.
+    fn publish_job(
+        &self,
+        fs: &dyn Fs,
+        job: &PrefetchJob,
+        cwd: &str,
+        claims: &LoadClaims,
+    ) -> Option<Arc<FileRefs>> {
+        let (slot, claim) = {
+            let mut claims = lock(&claims.0);
+            let claims = claims.as_mut()?;
+            let (slot, claim) = self.claim(&job.opts.file_name);
+            if claim.is_some() {
+                claims.push((job.opts.file_name.clone(), slot.clone()));
+            }
+            (slot, claim)
+        };
         let Some(mut claim) = claim else {
             return lock(&slot.state)
                 .as_ref()
@@ -2274,6 +2327,26 @@ impl PublishedParses {
             script_kind: job.script_kind,
         });
         Some(refs)
+    }
+
+    /// The load of `claims` ended, after its workers (a discarded load: its
+    /// workers may still run, and claim nothing more): the files that they
+    /// claimed and no loader took leave, so a later loader parses them
+    /// again.
+    fn end_load(&self, claims: &LoadClaims) {
+        let Some(claimed) = lock(&claims.0).take() else {
+            return;
+        };
+        let mut files = lock(&self.files);
+        for (file_name, slot) in claimed {
+            if !slot.taken.load(AtomicOrdering::Relaxed)
+                && files
+                    .get(&file_name)
+                    .is_some_and(|mapped| Arc::ptr_eq(mapped, &slot))
+            {
+                files.remove(&file_name);
+            }
+        }
     }
 }
 
@@ -2372,7 +2445,7 @@ fn run_prefetch_worker(shared: &PrefetchShared) {
             // The loader takes this parse from `published`, not from the job.
             (None, Some(published)) => (
                 None,
-                published.publish_job(&*fs, &job, &shared.config.current_directory),
+                published.publish_job(&*fs, &job, &shared.config.current_directory, &shared.claims),
             ),
             (None, None) => {
                 let mut result = prefetch_parse(&*fs, &job);
@@ -3078,5 +3151,102 @@ pub fn take_prefetched(
     } else {
         unusable();
         Prefetched::Text(worker_text)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The parse options of the `.d.ts` file `file_name`, as the `tsc -b`
+    /// loader and the workers give them (`queue_names`).
+    fn dts_opts(file_name: &str) -> SourceFileParseOptions {
+        SourceFileParseOptions {
+            file_name: file_name.to_string(),
+            path: to_path(file_name, "/", true),
+            external_module_indicator_options: ExternalModuleIndicatorOptions::default(),
+        }
+    }
+
+    /// Runs one load's parse worker on `file_name` for `published`, and
+    /// gives back the pool once the worker published the file.
+    fn worker_publishes(
+        published: &Arc<PublishedParses>,
+        dir: &str,
+        file_name: &str,
+    ) -> PrefetchPool {
+        let pool = PrefetchPool::start(
+            PrefetchConfig {
+                current_directory: dir.to_string(),
+                use_case_sensitive_file_names: true,
+                default_library_path: String::new(),
+            },
+            1,
+        );
+        let _ = pool.shared.published.set(published.clone());
+        pool.shared.queue_names(vec![file_name.to_string()]);
+        let job = lock(&pool.shared.queue).by_name[file_name].clone();
+        let mut state = lock(&job.state);
+        while !matches!(*state, PrefetchState::Done(_)) {
+            state = job
+                .done
+                .wait(state)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        drop(state);
+        pool
+    }
+
+    // tscbpar1d-skeptic staleAXB: in a parallel `tsc -b`, a parse worker of
+    // pX (noResolve, `/// <reference path>` to pA/dist/a.d.ts) parses the
+    // old a.d.ts, which pX's loader never asks for. pA then writes a new
+    // a.d.ts, and pB, which imports `v2` from it, must get the new file
+    // (Go caches only the files that a program asks for). So a worker parse
+    // that no loader took leaves with its load. A parse that a loader took
+    // stays in the build's parse cache, for its parse key only.
+    #[test]
+    fn untaken_worker_parse_leaves_with_its_load() {
+        let dir = std::env::temp_dir().join(format!("goport-published-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir_name = normalize_path(&dir.to_string_lossy());
+        let a = combine_paths(&dir_name, &["a.d.ts"]);
+        let b = combine_paths(&dir_name, &["b.d.ts"]);
+        std::fs::write(&a, "export declare const v1: number;\n").unwrap();
+        std::fs::write(&b, "export declare const b1: number;\n").unwrap();
+        let published = Arc::new(PublishedParses::default());
+
+        // pX's load: its worker publishes a.d.ts, and its loader does not
+        // take it.
+        drop(worker_publishes(&published, &dir_name, &a));
+        // pA writes a.d.ts; pB's loader asks for it and parses it again.
+        std::fs::write(
+            &a,
+            "export declare const v1: number;\nexport declare const v2: number;\n",
+        )
+        .unwrap();
+        let kind = get_script_kind_from_file_name(&a);
+        assert!(
+            matches!(
+                published.take_for_loader(&dts_opts(&a), kind),
+                LoaderTake::Claimed(_)
+            ),
+            "a worker parse that no loader took left with its load"
+        );
+
+        // A load whose loader takes the worker parse of b.d.ts.
+        let pool = worker_publishes(&published, &dir_name, &b);
+        assert!(matches!(
+            published.take_for_loader(&dts_opts(&b), kind),
+            LoaderTake::Parse(_)
+        ));
+        drop(pool);
+        // The taken parse stays (the workers of later loads skip the file),
+        // and serves no second parse key.
+        assert!(lock(&published.files).contains_key(&b));
+        assert!(matches!(
+            published.take_for_loader(&dts_opts(&b), kind),
+            LoaderTake::Other
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

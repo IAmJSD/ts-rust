@@ -269,9 +269,11 @@ pub struct BuilderShared {
 /// process once (`program::bind_all`, Go `BindOnce`). The parse workers of
 /// the loads claim, parse and publish these files too (`workers`,
 /// `PublishedParses`), so the workers of two loads do not parse one file
-/// twice. A parse that made state of its thread (synthetic nodes or node
-/// ids) is not shared: the other threads parse the same text for
-/// themselves (`SharedFile::Text`).
+/// twice. A worker parse enters this cache only when a loader takes it,
+/// and leaves the build at the end of its load if none does, as Go caches
+/// only the files that a program asks for. A parse that made state of its
+/// thread (synthetic nodes or node ids) is not shared: the other threads
+/// parse the same text for themselves (`SharedFile::Text`).
 #[derive(Default)]
 pub(crate) struct SharedSourceFiles {
     files: SyncParseCache<SourceFileCacheKey, SharedFile>,
