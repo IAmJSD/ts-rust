@@ -82,6 +82,14 @@ pub trait CompilerHost {
         FxHashMap::default()
     }
 
+    /// In a parallel `tsc -b`, where the parse workers of a program load
+    /// publish the `.d.ts` and `.json` files for every thread of the build
+    /// (`PublishedParses`). Only the `tsc -b` host has them.
+    // PORT: not in Go (perf). Go parse tasks share the build host's cache.
+    fn published_parses(&self) -> Option<std::sync::Arc<PublishedParses>> {
+        None
+    }
+
     /// Drops the data that the host keeps for its programs (for example a
     /// snapshot file system). `ls_program` calls it when the last live
     /// program that uses this host is released. The host must not read
@@ -320,10 +328,11 @@ impl CompilerHost for CompilerHostImpl {
 }
 
 /// PORT: not in Go (perf). The parse of the file of `opts` from `text`, as
-/// `CompilerHostImpl::get_source_file` makes it after its read: a `tsc -b`
-/// builder thread parses a `.d.ts` or `.json` file from the text that the
-/// build read first (execute/build/host.rs `BuilderShared`). A parse
-/// worker's parse of the same text is used.
+/// `CompilerHostImpl::get_source_file` makes it after its read: a thread of
+/// a parallel `tsc -b` parses a `.d.ts` or `.json` file for itself from the
+/// text of the build's first parse, when that parse cannot be shared
+/// (execute/build/host.rs `SharedSourceFiles`). A parse worker's parse of
+/// the same text is used.
 pub fn parse_source_file_text(
     opts: &SourceFileParseOptions,
     text: FileText,

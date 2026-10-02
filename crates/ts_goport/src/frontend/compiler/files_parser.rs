@@ -430,6 +430,11 @@ impl FilesParser {
         // workers still resolve their references, as Go parse tasks do for
         // a file that the host gives from its cache.
         lock(&pool.shared.queue).cached = loader.opts.host.cached_source_file_refs();
+        // In a parallel `tsc -b` the workers publish the `.d.ts` and `.json`
+        // files for every thread of the build. An early pool has it already.
+        if let Some(published) = loader.opts.host.published_parses() {
+            let _ = pool.shared.published.set(published);
+        }
         // A `tsc -b` program loads the output `.d.ts` files of its
         // references in place of their sources, so the workers parse those.
         if build_host && !loader.opts.can_use_project_reference_source() {
@@ -1594,6 +1599,10 @@ struct PrefetchShared {
     /// Set when the loader takes the workers (`FilesParser::parse`). Until
     /// then, and with `None` inside, the workers do not resolve.
     resolve: OnceLock<Option<WorkerResolveConfig>>,
+    /// In a parallel `tsc -b`, the published parses of the build: the
+    /// workers claim, parse and publish the `.d.ts` and `.json` files there
+    /// (`PublishedParses::publish_job`).
+    published: OnceLock<Arc<PublishedParses>>,
     /// Debug counts of `take_prefetched`, kept when `GOPORT_PREFETCH_STATS`
     /// is set and printed to stderr when the pool stops.
     counts: Option<Mutex<PrefetchStats>>,
@@ -1672,6 +1681,7 @@ impl PrefetchShared {
             config,
             stats: Arc::new(SharedStatCache::default()),
             resolve: OnceLock::new(),
+            published: OnceLock::new(),
             counts: std::env::var_os("GOPORT_PREFETCH_STATS")
                 .map(|_| Mutex::new(PrefetchStats::default())),
         }
@@ -1961,6 +1971,25 @@ pub fn start_default_lib_prefetch(
     use_case_sensitive_file_names: bool,
     default_library_path: &str,
 ) {
+    start_default_lib_prefetch_into(
+        config,
+        current_directory,
+        use_case_sensitive_file_names,
+        default_library_path,
+        None,
+    );
+}
+
+/// `start_default_lib_prefetch`. In a parallel `tsc -b`, `published` holds
+/// the published parses of the build (`PublishedParses`): the workers
+/// publish the lib files there, unless another thread of the build has them.
+pub fn start_default_lib_prefetch_into(
+    config: &ParsedCommandLine,
+    current_directory: &str,
+    use_case_sensitive_file_names: bool,
+    default_library_path: &str,
+    published: Option<Arc<PublishedParses>>,
+) {
     let options = config.compiler_options();
     // Go `processAllProgramFiles` loads lib files only for a program with
     // root files and without noLib.
@@ -2008,6 +2037,9 @@ pub fn start_default_lib_prefetch(
         },
         prefetch_worker_count(),
     );
+    if let Some(published) = published {
+        let _ = pool.shared.published.set(published);
+    }
     pool.shared.queue_names(
         names
             .iter()
@@ -2070,6 +2102,179 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// True for a file that the `tsc -b` build host caches for the whole build
+/// (Go build/host.go:54 `GetSourceFile`): a `.d.ts` or a `.json` file.
+pub fn is_build_cached_file(file_name: &str) -> bool {
+    is_declaration_file_name(file_name) || file_extension_is(file_name, EXTENSION_JSON)
+}
+
+/// PORT: not in Go (perf). The published parses of the `.d.ts` and `.json`
+/// files of a parallel `tsc -b` (execute/build/host.rs `SharedSourceFiles`),
+/// by file name. In Go a parse task gets such a file from the build host's
+/// one cache: the first task that asks parses it, and the others wait for
+/// it. Here the first thread of the build that reaches the file claims it:
+/// a parse worker of any load (`publish_job`), or a loader (`take_for_loader`).
+/// The worker parses the file and publishes it at once
+/// (`ast::with_own_build_stores`), so any thread can read it, and the
+/// workers of the other loads only queue its references. A loader takes a
+/// worker parse that fits its parse options; Go's cache by parse options is
+/// on top of this (`SharedSourceFiles`).
+#[derive(Default)]
+pub struct PublishedParses {
+    files: Mutex<FxHashMap<String, Arc<PublishedSlot>>>,
+}
+
+/// One file of `PublishedParses`.
+#[derive(Default)]
+struct PublishedSlot {
+    /// None while the thread that claimed the file parses it; then the
+    /// parse, or None when there is none to share.
+    state: Mutex<Option<Option<PublishedParse>>>,
+    done: Condvar,
+}
+
+/// A published parse of a file, for any thread.
+struct PublishedParse {
+    file: ParsedSourceFile,
+    refs: Arc<FileRefs>,
+    /// The parse read `external_module_indicator_options` (a loader's
+    /// parse counts as one that read them).
+    read_module_indicator_options: bool,
+    script_kind: ScriptKind,
+}
+
+/// What a loader gets for a file from `PublishedParses::take_for_loader`.
+pub enum LoaderTake {
+    /// A worker parse that fits the loader's options, published.
+    Parse(ParsedSourceFile),
+    /// No thread had the file: the loader parses it and finishes the claim.
+    Claimed(PublishClaim),
+    /// Another thread's parse that does not fit, or no parse: the loader
+    /// parses the file for itself.
+    Other,
+}
+
+/// The claim of a file of `PublishedParses`. Dropped without `finish`, it
+/// leaves no parse, so the threads that wait for it go on.
+pub struct PublishClaim {
+    slot: Arc<PublishedSlot>,
+    parse: Option<PublishedParse>,
+}
+
+impl PublishClaim {
+    /// Ends the claim with the loader's published parse `file`.
+    pub fn finish(mut self, file: &ParsedSourceFile) {
+        self.parse = Some(PublishedParse {
+            refs: Arc::new(FileRefs::of_file(file)),
+            file: file.clone(),
+            read_module_indicator_options: true,
+            script_kind: file.script_kind,
+        });
+    }
+}
+
+impl Drop for PublishClaim {
+    fn drop(&mut self) {
+        *lock(&self.slot.state) = Some(self.parse.take());
+        self.slot.done.notify_all();
+    }
+}
+
+impl PublishedParses {
+    /// The slot of `file_name`, and a claim when this call made it.
+    fn claim(&self, file_name: &str) -> (Arc<PublishedSlot>, Option<PublishClaim>) {
+        let mut files = lock(&self.files);
+        if let Some(slot) = files.get(file_name) {
+            return (slot.clone(), None);
+        }
+        let slot = Arc::new(PublishedSlot::default());
+        files.insert(file_name.to_string(), slot.clone());
+        let claim = PublishClaim {
+            slot: slot.clone(),
+            parse: None,
+        };
+        (slot, Some(claim))
+    }
+
+    /// For a loader of the build: the published parse of the file of
+    /// `opts`, when a worker made one that fits `opts` and `script_kind`
+    /// (as `take_prefetched` checks a worker parse). Waits while another
+    /// thread parses the file. A thread that parses never waits for
+    /// another file, so the wait ends.
+    pub fn take_for_loader(
+        &self,
+        opts: &SourceFileParseOptions,
+        script_kind: ScriptKind,
+    ) -> LoaderTake {
+        let (slot, claim) = self.claim(&opts.file_name);
+        if let Some(claim) = claim {
+            return LoaderTake::Claimed(claim);
+        }
+        let mut state = lock(&slot.state);
+        let parse = loop {
+            match &*state {
+                Some(parse) => break parse,
+                None => {
+                    state = slot
+                        .done
+                        .wait(state)
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                }
+            }
+        };
+        let Some(parse) = parse else {
+            return LoaderTake::Other;
+        };
+        let parsed = &parse.file.parse_options;
+        let fits = parse.script_kind == script_kind
+            && parsed.file_name == opts.file_name
+            && parsed.path == opts.path
+            && (!parse.read_module_indicator_options
+                || parsed.external_module_indicator_options
+                    == opts.external_module_indicator_options);
+        if !fits {
+            return LoaderTake::Other;
+        }
+        let mut file = parse.file.clone();
+        file.parse_options = opts.clone();
+        LoaderTake::Parse(file)
+    }
+
+    /// A parse worker's job for a file that the build host caches: claims
+    /// the file, parses it and publishes it. Returns the references to
+    /// queue: those of this parse, or of a parse that another thread
+    /// published. None when another thread parses the file now, or when
+    /// there is no usable parse (the loader parses the file then).
+    fn publish_job(&self, fs: &dyn Fs, job: &PrefetchJob, cwd: &str) -> Option<Arc<FileRefs>> {
+        let (slot, claim) = self.claim(&job.opts.file_name);
+        let Some(mut claim) = claim else {
+            return lock(&slot.state)
+                .as_ref()
+                .and_then(|parse| parse.as_ref().map(|parse| parse.refs.clone()));
+        };
+        let mut parse = prefetch_parse(fs, job)?.parse?;
+        let refs = Arc::new(FileRefs::take_from(&mut parse));
+        let read_module_indicator_options = parse.read_module_indicator_options;
+        // A publish that panics leaves no parse (the claim drops).
+        let file = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::ast::with_own_build_stores(|| {
+                let file = Rc::new(adopt_detached_parse(parse, &job.opts));
+                crate::program::note_parsed_source_file(&file);
+                crate::program::publish_parsed_files(cwd);
+                ParsedSourceFile::clone(&file)
+            })
+        }))
+        .ok()?;
+        claim.parse = Some(PublishedParse {
+            file,
+            refs: refs.clone(),
+            read_module_indicator_options,
+            script_kind: job.script_kind,
+        });
+        Some(refs)
+    }
 }
 
 /// What `queue_references` reads from a parse. It is taken before the
@@ -2158,9 +2363,18 @@ fn run_prefetch_worker(shared: &PrefetchShared) {
         }
         // A cached file's job reads nothing: `Done(None)` makes the loader
         // parse the file itself if it asks for it (a cache miss).
-        let (result, refs) = match &job.cached {
-            Some(refs) => (None, Some(refs.clone())),
-            None => {
+        let published = shared
+            .published
+            .get()
+            .filter(|_| is_build_cached_file(&job.opts.file_name));
+        let (result, refs) = match (&job.cached, published) {
+            (Some(refs), _) => (None, Some(refs.clone())),
+            // The loader takes this parse from `published`, not from the job.
+            (None, Some(published)) => (
+                None,
+                published.publish_job(&*fs, &job, &shared.config.current_directory),
+            ),
+            (None, None) => {
                 let mut result = prefetch_parse(&*fs, &job);
                 let refs = result
                     .as_mut()

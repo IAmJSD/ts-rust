@@ -1259,6 +1259,53 @@ pub fn reserve_file_ids() {
     RESERVE_IDS.set(true);
 }
 
+/// Runs `f` with no build stores on this thread, then gives the thread its
+/// stores back. The stores that `f` makes take their ids in runs of their
+/// own (`reserve_file_ids`), and `f` must publish them
+/// (`program::publish_parsed_files`). Call it on a thread that reserves its
+/// ids, or that has no build stores (a parse worker).
+// PORT: not in Go (perf). In a parallel `tsc -b` the first parse of a
+// `.d.ts` or `.json` file is published at once, in the middle of a program
+// load, so the other threads of the build can use it, as Go's one parse
+// cache gives it to them (execute/build/host.rs `SharedSourceFiles`).
+pub fn with_own_build_stores<R>(f: impl FnOnce() -> R) -> R {
+    /// Gives the thread its stores and its id mode back, also when `f`
+    /// panics. The stores of a panicked `f` are dropped: their ids stay
+    /// unused.
+    struct Restore {
+        outer: Option<BuildStores>,
+        reserve: bool,
+    }
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            ACTIVE.set(None);
+            let outer = self.outer.take().unwrap_or_default();
+            BUILD.with(|b| *b.borrow_mut() = outer);
+            RESERVE_IDS.set(self.reserve);
+        }
+    }
+    let outer = BUILD.with(|b| std::mem::take(&mut *b.borrow_mut()));
+    let reserve = RESERVE_IDS.replace(true);
+    assert!(
+        reserve || outer.stores.is_empty(),
+        "a thread with build stores must reserve its ids to build more stores apart"
+    );
+    // The active store is a store of `outer`.
+    ACTIVE.set(None);
+    let _restore = Restore {
+        outer: Some(outer),
+        reserve,
+    };
+    let result = f();
+    BUILD.with(|b| {
+        assert!(
+            b.borrow().stores.is_empty(),
+            "with_own_build_stores: a store was not published"
+        );
+    });
+    result
+}
+
 /// File index that marks a parent in the same store inside a stored
 /// header. Reads give the handle of the store (`NodeHeader::read`), so a
 /// store keeps its records when its id changes (`adopt_detached_store`).

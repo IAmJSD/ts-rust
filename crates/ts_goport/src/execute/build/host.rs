@@ -14,9 +14,10 @@ use crate::contentmapper::{self, Mapper, Project, SourceFiles};
 use crate::execute::build::command_line::ParsedBuildCommandLine;
 use crate::execute::build::config_prefetch::ConfigPrefetch;
 use crate::execute::build::orchestrator::MTimePrefetch;
-use crate::execute::build::parse_cache::ParseCache;
+use crate::execute::build::parse_cache::{ParseCache, SyncParseCache};
 use crate::execute::incremental::incremental;
 use crate::execute::tsc::compile::System;
+use crate::frontend::compiler::files_parser::{LoaderTake, PublishedParses};
 use crate::frontend::compiler::host::parse_source_file_text;
 use crate::frontend::prelude::*;
 use crate::gostd::GoError;
@@ -227,6 +228,11 @@ pub struct BuildHost {
     // PORT: not in Go (perf). On a builder thread (builders.rs), what it
     // shares with the build host and the other builders (`BuilderShared`).
     builder: Option<BuilderShared>,
+    // PORT: not in Go (perf). In a parallel build, the parse cache of the
+    // whole build (`SharedSourceFiles`), in front of `source_files`: for
+    // the builders, and for this thread once the builders start
+    // (`builder_shared`).
+    shared_parses: RefCell<Option<Arc<SharedSourceFiles>>>,
 }
 
 /// PORT: not in Go (perf). What the host of a builder thread of a parallel
@@ -236,16 +242,8 @@ pub struct BuildHost {
 /// - the cached lookups and `Stat` results of the file system and the
 ///   mtimes (`BuildCachedFs`, `m_times`); each builder keeps the lookups of
 ///   its own load apart (`BuildStatCache::for_builder`);
-/// - the `.d.ts` and `.json` parses of the first program of the build
-///   (`parses`, `SharedParses`). Go keeps the first parse of these files
-///   for the whole build (`host.sourceFiles`), and so does each builder
-///   that takes them;
-/// - the text of each other `.d.ts` and `.json` file that a load of the
-///   build read first (`first_reads`). Each builder parses its own, from
-///   that text, so a later load gets the text that Go's cache would give
-///   it, also after the build wrote the file. No task writes while a load
-///   runs (the read rule of builders.rs), so two loads that read a file
-///   first at the same time read the same text;
+/// - the parse cache of the build (`parses`, `SharedSourceFiles`): Go's
+///   `host.sourceFiles` of `.d.ts` and `.json` files;
 /// - the configs of the build (`configs`), each with its parse time: the
 ///   build host parsed them all when it made the graph.
 #[derive(Clone)]
@@ -253,24 +251,40 @@ pub struct BuilderShared {
     stats: Arc<BuildStatCache>,
     stat_cache: StatResults,
     m_times: Arc<Mutex<FxHashMap<Path, Option<SystemTime>>>>,
-    parses: Arc<SharedParses>,
-    first_reads: Arc<Mutex<FxHashMap<SourceFileCacheKey, FileText>>>,
+    parses: Arc<SharedSourceFiles>,
     configs: Arc<FxHashMap<Path, (Option<SendParsedCommandLine>, Duration)>>,
 }
 
-/// PORT: not in Go (perf). The cached `.d.ts` and `.json` parses of the
-/// first program that a builder of a parallel build makes (the lib files
-/// and the shared declaration files), for the other builders. Their stores
-/// are published, so any thread reads their nodes, and their binds join
-/// the lineage of the process once (`program::bind_all`). A builder that
-/// takes them parses and binds none of them again: without them each
-/// builder parsed and bound its own lib files, which cost a wide build
-/// with 4 light rebuilds about 2x CPU and 45% more memory.
+/// PORT: not in Go (perf). The parse cache of a parallel `tsc -b`: Go's
+/// `host.sourceFiles` (build/host.go:54), one cache of the `.d.ts` and
+/// `.json` files for the whole build, that the build host thread and every
+/// builder thread use (`BuildHost::parse_for_cache`). The first parse of a
+/// key wins, and the threads that ask for it meanwhile wait for it and use
+/// it (`SyncParseCache`). So each such file is parsed and bound once in the
+/// build, and a later program gets the parse that Go's cache gives it, also
+/// after the build wrote the file.
+///
+/// A first parse is published at once (`ast::with_own_build_stores`), so
+/// every thread reads its nodes, and its bind joins the lineage of the
+/// process once (`program::bind_all`, Go `BindOnce`). The parse workers of
+/// the loads claim, parse and publish these files too (`workers`,
+/// `PublishedParses`), so the workers of two loads do not parse one file
+/// twice. A parse that made state of its thread (synthetic nodes or node
+/// ids) is not shared: the other threads parse the same text for
+/// themselves (`SharedFile::Text`).
 #[derive(Default)]
-pub(crate) struct SharedParses {
-    /// None until the first program shares its parses (`share`).
-    parses: Mutex<Option<Vec<(SourceFileCacheKey, ParsedSourceFile)>>>,
-    shared: std::sync::Condvar,
+pub(crate) struct SharedSourceFiles {
+    files: SyncParseCache<SourceFileCacheKey, SharedFile>,
+    workers: Arc<PublishedParses>,
+}
+
+/// A first parse of `SharedSourceFiles`.
+#[derive(Clone)]
+enum SharedFile {
+    /// A published parse that any thread can use.
+    Parse(ParsedSourceFile),
+    /// The text of a parse that only its thread can use.
+    Text(FileText),
 }
 
 impl BuildHost {
@@ -310,12 +324,15 @@ impl BuildHost {
             m_times: Arc::default(),
             m_time_prefetch: RefCell::new(None),
             builder: None,
+            shared_parses: RefCell::new(None),
         }
     }
 
     /// What the hosts of builder threads share with this host
     /// (`BuilderShared`), with the configs that it parsed. None when a
-    /// config has content mappers.
+    /// config has content mappers. Else this host uses the parse cache of
+    /// the builders from now on (`SharedSourceFiles`), until
+    /// `end_shared_parses`. Call it before this host caches a parse.
     pub(crate) fn builder_shared(&self) -> Option<BuilderShared> {
         let mut configs = FxHashMap::default();
         let times = self.config_times.borrow();
@@ -326,68 +343,23 @@ impl BuildHost {
             let time = times.get(path).copied().unwrap_or_default();
             configs.insert(path.clone(), (config.flatten(), time));
         });
-        sendable.then(|| BuilderShared {
+        if !sendable {
+            return None;
+        }
+        let parses = Arc::new(SharedSourceFiles::default());
+        *self.shared_parses.borrow_mut() = Some(parses.clone());
+        Some(BuilderShared {
             stats: self.cached_fs.stats.clone(),
             stat_cache: self.cached_fs.stat_cache.clone(),
             m_times: self.m_times.clone(),
-            parses: Arc::default(),
-            first_reads: Arc::default(),
+            parses,
             configs: Arc::new(configs),
         })
     }
 
-    /// On a builder thread, shares the published parses of this host's
-    /// cache with the other builders (`SharedParses`), once per build: the
-    /// first program of the build calls it when it is made. A later call
-    /// shares nothing.
-    pub(crate) fn share_parses(&self) {
-        let Some(shared) = &self.builder else {
-            return;
-        };
-        let mut parses = lock(&shared.parses.parses);
-        if parses.is_some() {
-            return;
-        }
-        let mut files = Vec::new();
-        self.source_files.for_each_stored(|key, file| {
-            if crate::ast::is_published(file.store) {
-                files.push((key.clone(), ParsedSourceFile::clone(file)));
-            }
-        });
-        *parses = Some(files);
-        shared.parses.shared.notify_all();
-    }
-
-    /// On a builder thread, waits until the first program of the build has
-    /// shared its parses (`share_parses`), and puts them into this host's
-    /// cache where it has no entry.
-    pub(crate) fn take_shared_parses(&self) {
-        if let Some(shared) = &self.builder {
-            self.take_parses_of(shared);
-        }
-    }
-
-    /// Waits until the first program of the build of `shared` has shared
-    /// its parses (`share_parses`), and puts them into this host's cache
-    /// where it has no entry. The build host takes them before it compiles
-    /// a task beside the first one (orchestrator.rs
-    /// `later_tasks_use_builders`).
-    pub(crate) fn take_parses_of(&self, shared: &BuilderShared) {
-        let mut parses = lock(&shared.parses.parses);
-        let parses = loop {
-            if let Some(parses) = &*parses {
-                break parses;
-            }
-            parses = shared
-                .parses
-                .shared
-                .wait(parses)
-                .unwrap_or_else(PoisonError::into_inner);
-        };
-        for (key, file) in parses {
-            self.source_files
-                .load_or_store(key.clone(), |_| Some(Rc::new(file.clone())), false);
-        }
+    /// The parallel build ended: this host parses for its own cache again.
+    pub(crate) fn end_shared_parses(&self) {
+        self.shared_parses.borrow_mut().take();
     }
 
     /// The host of a builder thread (builders.rs) on `sys`, a system of
@@ -424,36 +396,77 @@ impl BuildHost {
             config_prefetch: RefCell::new(None),
             m_times: shared.m_times.clone(),
             m_time_prefetch: RefCell::new(None),
+            shared_parses: RefCell::new(Some(shared.parses.clone())),
             builder: Some(shared),
         }
     }
 
     /// The parse of the `.d.ts` or `.json` file of `opts` for the cache
-    /// (`get_source_file`). On a builder thread it is made from the text
-    /// that the first load of the build read (`BuilderShared`), and a first
-    /// read keeps its text there.
+    /// (`get_source_file`). In a parallel build it comes from the parse
+    /// cache of the build (`SharedSourceFiles`): Go's `loadOrStore`, where
+    /// the first parse of the key wins. That parse is a parse worker's
+    /// (`PublishedParses::take_for_loader`), or this thread's own, which it
+    /// publishes at once (`parse_published`).
     fn parse_for_cache(&self, opts: &SourceFileParseOptions) -> Option<Rc<ParsedSourceFile>> {
-        let Some(shared) = &self.builder else {
+        let Some(shared) = self.shared_parses.borrow().clone() else {
             return self.host.get_source_file(opts);
         };
-        let key = SourceFileCacheKey(opts.clone());
-        let first = lock(&shared.first_reads).get(&key).cloned();
-        if let Some(text) = first {
-            return Some(parse_source_file_text(opts, text));
-        }
-        let file = self.host.get_source_file(opts)?;
-        let first = match lock(&shared.first_reads).entry(key) {
-            std::collections::hash_map::Entry::Occupied(first) => first.get().clone(),
-            std::collections::hash_map::Entry::Vacant(entry) => {
-                entry.insert(file.text.clone());
-                return Some(file);
+        let script_kind = ensure_script_kind_from_file_name(&opts.file_name);
+        // This thread's first parse, when other threads cannot use it.
+        let mut own = None;
+        let first = shared.files.load_or_store(
+            SourceFileCacheKey(opts.clone()),
+            |_| {
+                let claim = match shared.workers.take_for_loader(opts, script_kind) {
+                    LoaderTake::Parse(file) => return Some(SharedFile::Parse(file)),
+                    LoaderTake::Claimed(claim) => Some(claim),
+                    LoaderTake::Other => None,
+                };
+                let (file, shareable) = self.parse_published(opts, None)?;
+                if !shareable {
+                    let text = file.text.clone();
+                    own = Some(file);
+                    return Some(SharedFile::Text(text));
+                }
+                if let Some(claim) = claim {
+                    claim.finish(&file);
+                }
+                Some(SharedFile::Parse(file))
+            },
+            false, /* allowZero */
+        )?;
+        let file = match (first, own) {
+            (_, Some(own)) => own,
+            (SharedFile::Parse(mut file), None) => {
+                file.parse_options = opts.clone();
+                file
             }
+            (SharedFile::Text(text), None) => self.parse_published(opts, Some(text))?.0,
         };
-        // Another builder read the file first, at the same time.
-        Some(if first == file.text {
-            file
-        } else {
-            parse_source_file_text(opts, first)
+        Some(Rc::new(file))
+    }
+
+    /// Parses the file of `opts` on this thread, from `text` or else from a
+    /// read, in build stores of its own, and publishes it at once
+    /// (`ast::with_own_build_stores`). True with the parse when other
+    /// threads can read it: the parse made no state of this thread
+    /// (synthetic nodes or node ids, as a parse worker checks). None when
+    /// the file cannot be read.
+    fn parse_published(
+        &self,
+        opts: &SourceFileParseOptions,
+        text: Option<FileText>,
+    ) -> Option<(ParsedSourceFile, bool)> {
+        crate::ast::with_own_build_stores(|| {
+            let before = crate::program::bind_thread_fingerprint();
+            let file = match text {
+                Some(text) => parse_source_file_text(opts, text),
+                None => self.host.get_source_file(opts)?,
+            };
+            let shareable = crate::program::bind_thread_fingerprint() == before;
+            crate::program::note_parsed_source_file(&file);
+            crate::program::publish_parsed_files(&self.host.get_current_directory());
+            Some((ParsedSourceFile::clone(&file), shareable))
         })
     }
 
@@ -624,7 +637,9 @@ impl CompilerHost for BuildHost {
             // package imports) and be a program file of a later one. Go
             // keeps the whole `*ast.SourceFile`. The note makes the publish
             // of the first program give the store its complete Go file, so
-            // the later program can use it.
+            // the later program can use it. A parse of the parse cache of a
+            // parallel build is published already (`parse_for_cache`).
+            // The workers use the same rule (`is_build_cached_file`).
             return self.source_files.load_or_store(
                 SourceFileCacheKey(opts.clone()),
                 |key| {
@@ -664,6 +679,14 @@ impl CompilerHost for BuildHost {
     // PORT: not in Go (see `CompilerHost::stat_cache`).
     fn stat_cache(&self) -> Option<Arc<BuildStatCache>> {
         Some(self.cached_fs.stats.clone())
+    }
+
+    // PORT: not in Go (see `CompilerHost::published_parses`).
+    fn published_parses(&self) -> Option<Arc<PublishedParses>> {
+        self.shared_parses
+            .borrow()
+            .as_ref()
+            .map(|shared| shared.workers.clone())
     }
 
     // PORT: not in Go (see `CompilerHost::cached_source_file_refs`). The
@@ -873,5 +896,10 @@ impl CompilerHost for BuildCompilerHost {
     // PORT: not in Go (see `CompilerHost::cached_source_file_refs`).
     fn cached_source_file_refs(&self) -> FxHashMap<String, Arc<FileRefs>> {
         self.host.cached_source_file_refs()
+    }
+
+    // PORT: not in Go (see `CompilerHost::published_parses`).
+    fn published_parses(&self) -> Option<Arc<PublishedParses>> {
+        self.host.published_parses()
     }
 }

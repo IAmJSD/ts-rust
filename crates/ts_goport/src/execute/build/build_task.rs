@@ -430,11 +430,6 @@ pub trait BuildTaskOrchestrator {
     fn load_gate(&self) -> Option<Arc<LoadGate>> {
         None
     }
-    /// PORT: not in Go (perf). Called when the program of a task is made,
-    /// before its check starts. On a builder thread the first program of
-    /// the build shares its parses with the other builders then
-    /// (`BuildHost::share_parses`).
-    fn program_made(&self) {}
 }
 
 // Go: build/buildtask.go:55 BuildTask
@@ -1039,8 +1034,17 @@ impl BuildTask {
         let mut host_has_parses = false;
         host.source_files
             .for_each_stored(|_, _| host_has_parses = true);
-        if !host_has_parses {
-            crate::execute::execute_tsc::start_lib_prefetch(&*sys, &resolved, testing.is_some());
+        // In a parallel build the workers publish the lib files for the
+        // whole build (`CompilerHost::published_parses`), so a lib file that
+        // another thread has is not parsed again.
+        if !host_has_parses && testing.is_none() {
+            crate::frontend::compiler::files_parser::start_default_lib_prefetch_into(
+                &resolved,
+                &sys.get_current_directory(),
+                sys.fs().use_case_sensitive_file_names(),
+                &sys.default_library_path(),
+                host.published_parses(),
+            );
         }
         let build_info_read_start = sys.now();
         let mut old_program = None;
@@ -1080,7 +1084,6 @@ impl BuildTask {
         // Go: compiler.NewProgram(compiler.ProgramOptions{Config, Host})
         let program = crate::execute::execute_tsc::new_program_version(compiler_host, resolved);
         compile_times.borrow_mut().parse_time = elapsed(&*sys, parse_start);
-        orchestrator.program_made();
         let written_build_info: WrittenBuildInfo = Arc::default();
         let deferred_writes = (!sys.emit_writes_through_osvfs()).then(DeferredWrites::default);
         let write_file = new_task_write_file(

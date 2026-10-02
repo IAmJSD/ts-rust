@@ -973,16 +973,18 @@ impl Orchestrator {
                         if builders.is_none() || later_on_builders.is_some() {
                             self.end_forecast();
                         }
-                    } else if let Some(builders) = &builders
-                        && later_on_builders.is_none()
-                    {
-                        let on_builders = self.later_tasks_use_builders(builders_setting);
+                    } else if builders.is_some() && later_on_builders.is_none() {
+                        later_on_builders = Some(self.later_tasks_use_builders(builders_setting));
                         self.end_forecast();
-                        if !on_builders {
-                            self.host.take_parses_of(builders.shared());
-                        }
-                        later_on_builders = Some(on_builders);
                     }
+                }
+                // The read rule (builders.rs): beside builders, this thread
+                // loads a program only when no builder loads one.
+                if compiles
+                    && later_on_builders == Some(false)
+                    && let Some(builders) = &builders
+                {
+                    builders.wait_for_loads();
                 }
                 let mut task = task.borrow_mut();
                 states[index] = if !compiles {
@@ -1067,6 +1069,7 @@ impl Orchestrator {
         // The builders end; they free their programs unless the process
         // ends after this build.
         drop(builders);
+        self.host.end_shared_parses();
         // The kept released programs free now, unless the process ends
         // after this build (`start_exported`).
         if !self.ends_process.get() {
@@ -1148,9 +1151,10 @@ impl Orchestrator {
     /// PORT: not in Go (perf). True when the first task that compiles,
     /// `first`, compiles on a builder thread (builders.rs). With
     /// `BuildersSetting::Light`: when it only reports the errors of its
-    /// build info or makes its pending emit. Its program loads alone, so
-    /// the decision for the later tasks waits for the second task that
-    /// compiles (`later_tasks_use_builders`).
+    /// build info or makes its pending emit. Unless the forecast knows the
+    /// answer for the later tasks already, their decision waits for the
+    /// second task that compiles (`later_tasks_use_builders`), behind the
+    /// load of the first one.
     fn first_task_uses_builder(&self, setting: BuildersSetting, first: &BuildTask) -> bool {
         match setting {
             BuildersSetting::Off => false,
@@ -1170,8 +1174,9 @@ impl Orchestrator {
     /// one has its status. With `BuildersSetting::Light`: when the build
     /// info threads forecast no heavy rebuild (no task with changed inputs)
     /// and two or more light ones (`RebuildForecast::light`). Else they
-    /// compile on this thread, with the parses of the first program
-    /// (`BuildHost::take_parses_of`), as in a serial build.
+    /// compile on this thread, after the first program loads, with the
+    /// parse cache of the build (host.rs `SharedSourceFiles`), as in a
+    /// serial build.
     // PERF (tscbpar1, stable bins): parallel loads cut hono-b noop (3 light
     // rebuilds) from about 122 to 101 ms on the minis. Where a task checks,
     // the checkers keep the cores busy, and before the builders shared the
