@@ -1051,6 +1051,14 @@ impl Orchestrator {
                         if on_builders {
                             builders = self.start_builders(num_routines, &ready);
                         }
+                        // The deferred task loads first, as in Go, where the
+                        // tasks start in order: this one waits too, and both
+                        // load in the next pass.
+                        if deferred {
+                            states[index] = State::Deferred;
+                            progressed = true;
+                            continue;
+                        }
                     }
                 }
                 // PORT: not in Go (perf). SLOTS (P4): a task that compiles
@@ -1121,18 +1129,23 @@ impl Orchestrator {
             // first task that is not built, `next_report`, has its upstream
             // tasks done). A Go builder writes the outputs of its task
             // when the task's check ends, and then takes the next task. So
-            // the task whose started check and emit ended first finishes
-            // now: it writes its outputs, and its builder takes the next
-            // task. When the outputs overlap, only the first task that is not
-            // built finishes, as in Go when the tasks end in build order.
-            // When no task can finish yet, this waits for a signal, and frees
-            // a kept released program first.
+            // a task whose started check and emit ended finishes now: it
+            // writes its outputs, and its builder takes the next task. Of
+            // the tasks whose check and emit ended by now, the first in
+            // build order finishes: Go starts the tasks in that order, and
+            // can end them in any order. When the outputs overlap, only the
+            // first task that is not built finishes, as in Go when the tasks
+            // end in build order. When no task can finish yet, this waits
+            // for a signal, and frees a kept released program first.
             let index = loop {
                 while let Ok(index) = ready_calls.try_recv() {
                     signal_arrived(&mut signals, &mut compiled, index);
                 }
-                let can_finish = |&index: &usize| !in_build_order || index == next_report;
-                if let Some(at) = compiled.iter().position(can_finish) {
+                let can_finish = |index: usize| !in_build_order || index == next_report;
+                let first = (0..compiled.len())
+                    .filter(|&at| can_finish(compiled[at]))
+                    .min_by_key(|&at| compiled[at]);
+                if let Some(at) = first {
                     break compiled.remove(at).expect("the position is in the queue");
                 }
                 if !self.free_released() {
