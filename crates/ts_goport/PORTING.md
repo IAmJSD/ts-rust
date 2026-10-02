@@ -534,7 +534,8 @@ goroutine.
 ## Process start
 
 `tsgo` starts as the Go runtime and the Go `syscall` package start a Go
-process (bin/tsgo.rs `unblock_go_signals`, `go_runtime_start`).
+process (bin/tsgo.rs `unblock_go_signals`, `go_signal_handlers`,
+`go_runtime_start`).
 
 - Signals (Linux, Go runtime/sigtab_linux_generic.go): the signals that Go
   drops when nothing asks for them (USR1, USR2, ALRM, CHLD, URG, XCPU,
@@ -549,8 +550,21 @@ process (bin/tsgo.rs `unblock_go_signals`, `go_runtime_start`).
   SIGHUP ends the process by SIGHUP, as Go's `dieFromSignal`, unless it
   was ignored at start (the `SigIgn` line of /proc/self/status; Go then
   keeps it ignored, so a process that tsgo starts gets it ignored too).
-  PORT: SIGABRT and SIGTRAP keep their default actions. Other systems keep
-  the default actions.
+  Before `notify_context` (Go `NotifyContext` in `runMain`), SIGINT and
+  SIGTERM end the process in the same way (Go `_SigKill`); an ignored
+  SIGINT stays ignored there, as in Go. PORT: SIGABRT and SIGTRAP keep
+  their default actions. Other systems keep the default actions.
+- The start window: Go sets these handlers before `main`. tsgo sets them
+  as early as the heap allows: after `thp_guard` (which runs before the
+  first heap allocation) and the launcher choice, before the thread
+  budget and the exec of `set_malloc_tunables` (the new image sets them
+  again at the same point). A signal that comes before them has its
+  default action, as one that comes before Go's runtime start. A worker
+  sets no early SIGINT and SIGTERM handlers: its launcher holds them until
+  `notify_context` in the worker catches them. PORT: with `--lsp` and
+  `--api`, SIGINT and SIGTERM keep their default actions until their own
+  `notify_context` (in cmd/tsgo/lsp.rs and api.rs), which the early
+  handlers cannot see.
 - The pid 1 of a PID namespace (`docker run` without `--init`, `unshare
   -pf`, `bwrap --as-pid-1`): the kernel drops each signal with the default
   action that such a process gets from its namespace or sends itself. Go
