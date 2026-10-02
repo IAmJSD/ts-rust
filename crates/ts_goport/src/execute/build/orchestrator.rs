@@ -898,6 +898,17 @@ impl Orchestrator {
             .map(|(i, p)| (p.clone(), i))
             .collect();
         let mut states = vec![State::NotTaken; paths.len()];
+        // The root files of each task, for the finish order (below).
+        let roots: Vec<usize> = paths
+            .iter()
+            .map(|path| {
+                let task = self.get_task(path);
+                let task = task.borrow();
+                task.resolved
+                    .as_ref()
+                    .map_or(0, |resolved| resolved.file_names().len())
+            })
+            .collect();
         // PORT: perf. Each checker thread of a compiling task's program
         // drops a `ReadySignal` of the task when the check and emit that it
         // started are done (`BuildTask::notify_when_compiled`); `signals`
@@ -967,9 +978,9 @@ impl Orchestrator {
         // taken only when the same number of tasks finished (G1), and W can
         // be one of them or come before them. A task finishes after its
         // check and emit ended (the first in build order of those that
-        // ended, or in build order, see `in_build_order`), and Go can finish
-        // its tasks in that order. So each order of a load and a write here
-        // is one that Go can make.
+        // ended, after the smaller tasks before it, or in build order, see
+        // `in_build_order`), and Go can finish its tasks in that order. So
+        // each order of a load and a write here is one that Go can make.
         // Tasks taken (Go `currentTaskIndex`), taken and not built, and
         // reported. The tasks before `next_report` are built.
         let mut next_take = 0;
@@ -1134,15 +1145,23 @@ impl Orchestrator {
             // writes its outputs, and its builder takes the next task. Of
             // the tasks whose check and emit ended by now, the first in
             // build order finishes: Go starts the tasks in that order, and
-            // can end them in any order. When the outputs overlap, only the
-            // first task that is not built finishes, as in Go when the tasks
-            // end in build order. When no task can finish yet, this waits
-            // for a signal, and frees a kept released program first.
+            // can end them in any order. A task with more root files than a
+            // task before it that still compiles waits for that task: in Go
+            // the smaller task, which started first, ends first. When the
+            // outputs overlap, only the first task that is not built
+            // finishes, as in Go when the tasks end in build order. When no
+            // task can finish yet, this waits for a signal, and frees a kept
+            // released program first.
             let index = loop {
                 while let Ok(index) = ready_calls.try_recv() {
                     signal_arrived(&mut signals, &mut compiled, index);
                 }
-                let can_finish = |index: usize| !in_build_order || index == next_report;
+                let can_finish = |index: usize| {
+                    (!in_build_order || index == next_report)
+                        && (next_report..index).all(|before| {
+                            states[before] != State::Compiling || roots[before] >= roots[index]
+                        })
+                };
                 let first = (0..compiled.len())
                     .filter(|&at| can_finish(compiled[at]))
                     .min_by_key(|&at| compiled[at]);
