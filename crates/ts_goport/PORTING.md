@@ -667,7 +667,9 @@ process (bin/tsgo.rs `unblock_go_signals`, `go_signal_handlers`,
     until the run sets its own handlers, as in a run that never was a
     launcher. PORT: SIGSTKFLT does nothing there (signal-hook has no
     default action for it). In a pid 1 they do nothing there, as their
-    default actions do.
+    default actions do. PORT: a signal that came while the launcher tried
+    to start the worker (after `forward_signals`) is lost when the start
+    fails: the thread that took it ends without a worker to send it to.
 - Stdout (execute/tsc/stdio.rs): each write of the tsc output is one write
   of fd 1, in Go's pieces (Go `fmt.Fprint` on the unbuffered
   `os.Stdout`). PORT: when fd 1 is a regular file, the writes of one report
