@@ -1173,10 +1173,10 @@ impl Orchestrator {
     /// first one compile on builder threads too, decided when the second
     /// one has its status. With `BuildersSetting::Light`: when the build
     /// info threads forecast no heavy rebuild (no task with changed inputs)
-    /// and two or more light ones (`RebuildForecast::light`). Else they
-    /// compile on this thread, after the first program loads, with the
-    /// parse cache of the build (host.rs `SharedSourceFiles`), as in a
-    /// serial build.
+    /// and light ones in two tasks that can compile at the same time
+    /// (`RebuildForecast::light`). Else they compile on this thread, after
+    /// the first program loads, with the parse cache of the build
+    /// (host.rs `SharedSourceFiles`), as in a serial build.
     // PERF (tscbpar1, stable bins): parallel loads cut hono-b noop (3 light
     // rebuilds) from about 122 to 101 ms on the minis. Where a task checks,
     // the checkers keep the cores busy, and before the builders shared the
@@ -1186,7 +1186,9 @@ impl Orchestrator {
     // builders after a light first compile only, a hono-b rebuild after an
     // edit of a test file of one later project used 50% to 90% more CPU and
     // 20% to 45% more memory, for the same time or 1% to 2% more. One light
-    // task alone gains nothing. Before the decision waited for the
+    // task alone gains nothing, and neither do light tasks of which no two
+    // can compile at the same time (a chain): there builders cost 0.5 to
+    // 0.9 ms (tscbpar1 round c). Before the decision waited for the
     // second task that compiles (tscbpar1 round c), it waited at the first
     // one for the forecast: about 1 ms in wide-1err.
     fn later_tasks_use_builders(&self, setting: BuildersSetting) -> bool {
@@ -1312,11 +1314,12 @@ impl Orchestrator {
         let fs = self.opts.sys.fs();
         let keys = PathKeys::new(&fs, &self.compare_paths_options);
         let mut named: FxHashMap<String, usize> = FxHashMap::default();
-        let mut reads: Vec<(String, BuildInfoRead)> = Vec::new();
+        // Each read with its build info key and the index of its task.
+        let mut reads: Vec<(String, usize, BuildInfoRead)> = Vec::new();
         // A task that can compile and has no read: then no forecast is
         // light.
         let mut unread = false;
-        for path in paths {
+        for (index, path) in paths.iter().enumerate() {
             let task = self.get_task(path);
             let task = task.borrow();
             let Some(resolved) = &task.resolved else {
@@ -1347,6 +1350,7 @@ impl Orchestrator {
                 };
                 reads.push((
                     build_info_key,
+                    index,
                     BuildInfoRead {
                         name,
                         input_files: resolved.file_names().to_vec(),
@@ -1357,10 +1361,10 @@ impl Orchestrator {
             }
         }
         let read_count = reads.len();
-        let reads: Vec<BuildInfoRead> = reads
+        let (tasks, reads): (Vec<usize>, Vec<BuildInfoRead>) = reads
             .into_iter()
-            .filter_map(|(key, read)| (named[&key] == 1).then_some(read))
-            .collect();
+            .filter_map(|(key, task, read)| (named[&key] == 1).then_some((task, read)))
+            .unzip();
         unread |= reads.len() < read_count;
         if reads.len() < 2 {
             return None;
@@ -1378,8 +1382,16 @@ impl Orchestrator {
             None => PrefetchPool::start()?,
         };
         // Two light rebuilds need two tasks that can compile, each with a
-        // read.
-        let forecast = (forecast && !unread).then(|| Arc::new(RebuildForecast::new(reads.len())));
+        // read, and that can compile at the same time. A build with no such
+        // two tasks (a chain) forecasts nothing, as a serial build.
+        let forecast = if forecast && !unread {
+            let graph = TaskGraph::new(tasks, self.upstream_sets(paths));
+            graph
+                .has_independent_pair()
+                .then(|| Arc::new(RebuildForecast::new(graph)))
+        } else {
+            None
+        };
         let prefetch = BuildInfoPrefetch::start(
             &pool,
             reads,
@@ -1390,6 +1402,29 @@ impl Orchestrator {
         drop(pool);
         *self.host.m_time_prefetch.borrow_mut() = Some(m_times);
         Some(prefetch)
+    }
+
+    /// PORT: not in Go (perf). For each task of `paths` (a build order, so
+    /// upstream tasks come first), the tasks of `paths` that it waits for,
+    /// directly or through others (`TaskGraph`).
+    fn upstream_sets(&self, paths: &[Path]) -> Vec<TaskSet> {
+        let index_of: FxHashMap<&Path, usize> =
+            paths.iter().enumerate().map(|(i, p)| (p, i)).collect();
+        let mut sets: Vec<TaskSet> = Vec::with_capacity(paths.len());
+        for path in paths {
+            let mut set = TaskSet::new(paths.len());
+            for upstream in &self.get_task(path).borrow().up_stream {
+                let upstream = self.to_path(&upstream.task.borrow().config);
+                if let Some(&index) = index_of.get(&upstream) {
+                    set.insert(index);
+                    if let Some(of_upstream) = sets.get(index) {
+                        set.union_with(of_upstream);
+                    }
+                }
+            }
+            sets.push(set);
+        }
+        sets
     }
 
     // Go: build/buildtask.go:119 (*BuildTask).report, the orchestrator part
@@ -1643,18 +1678,79 @@ enum Rebuild {
     Heavy,
 }
 
+/// PORT: not in Go (perf). A set of tasks of a build, by their index in
+/// the build order.
+#[derive(Clone)]
+struct TaskSet(Vec<u64>);
+
+impl TaskSet {
+    /// An empty set for a build of `tasks` tasks.
+    fn new(tasks: usize) -> Self {
+        TaskSet(vec![0; tasks.div_ceil(64)])
+    }
+
+    fn insert(&mut self, task: usize) {
+        self.0[task / 64] |= 1 << (task % 64);
+    }
+
+    fn contains(&self, task: usize) -> bool {
+        self.0
+            .get(task / 64)
+            .is_some_and(|word| word & (1 << (task % 64)) != 0)
+    }
+
+    fn union_with(&mut self, other: &TaskSet) {
+        for (word, other) in self.0.iter_mut().zip(&other.0) {
+            *word |= other;
+        }
+    }
+}
+
+/// PORT: not in Go (perf). The tasks of the reads of a forecast and the
+/// tasks that each task of the build waits for (`upstream_sets`), to tell
+/// which two reads can compile at the same time: neither waits for the
+/// other.
+struct TaskGraph {
+    /// The task of each read.
+    tasks: Vec<usize>,
+    /// By task: the tasks that it waits for.
+    upstream: Vec<TaskSet>,
+}
+
+impl TaskGraph {
+    fn new(tasks: Vec<usize>, upstream: Vec<TaskSet>) -> Self {
+        TaskGraph { tasks, upstream }
+    }
+
+    /// True when the tasks of reads `a` and `b` can compile at the same
+    /// time.
+    fn independent(&self, a: usize, b: usize) -> bool {
+        let (a, b) = (self.tasks[a], self.tasks[b]);
+        !self.upstream[a].contains(b) && !self.upstream[b].contains(a)
+    }
+
+    /// True when the tasks of two reads can compile at the same time.
+    fn has_independent_pair(&self) -> bool {
+        (0..self.tasks.len()).any(|a| (a + 1..self.tasks.len()).any(|b| self.independent(a, b)))
+    }
+}
+
 /// PORT: not in Go (perf). The rebuilds that the build info threads
 /// forecast for the tasks of a build (`Rebuild`), for
-/// `Orchestrator::later_tasks_use_builders`. Builders gain only where the loads of
-/// two or more tasks run at the same time and little is checked. A changed
-/// input shows in the mtimes alone (`unchanged_inputs`), so it is known
-/// before a large build info is parsed.
+/// `Orchestrator::later_tasks_use_builders`. Builders gain only where the
+/// loads of two or more tasks run at the same time and little is checked:
+/// two light rebuilds whose tasks can compile at the same time (`graph`),
+/// and no heavy one. A changed input shows in the mtimes alone
+/// (`unchanged_inputs`), so it is known before a large build info is
+/// parsed. Once the answer is "no", the forecast ends itself (`ended`), so
+/// the threads do no more forecast work than a serial build.
 struct RebuildForecast {
     state: Mutex<ForecastState>,
     changed: Condvar,
-    /// The orchestrator made its decision (`end`): the mtimes jobs that
-    /// have not started read nothing.
+    /// The answer is "no", or the orchestrator made its decision (`end`):
+    /// the mtimes jobs read nothing more.
     ended: std::sync::atomic::AtomicBool,
+    graph: TaskGraph,
 }
 
 struct ForecastState {
@@ -1664,8 +1760,12 @@ struct ForecastState {
     unclassed: usize,
     /// The reads whose rebuild is not known yet (`add_parse`).
     unparsed: usize,
-    /// The light rebuilds.
-    light: usize,
+    /// By read: whether its build info makes a light rebuild, once parsed.
+    classes: Vec<Option<bool>>,
+    /// The reads with a light rebuild.
+    light: Vec<usize>,
+    /// Two reads of `light` can compile at the same time.
+    pair: bool,
     /// A rebuild is heavy.
     heavy: bool,
 }
@@ -1674,9 +1774,9 @@ impl ForecastState {
     /// `RebuildForecast::light` from what is known now, or None when it
     /// waits.
     fn light_now(&self) -> Option<bool> {
-        if self.heavy || (self.light < 2 && self.unclassed == 0) {
+        if self.heavy || (!self.pair && self.unclassed == 0) {
             Some(false)
-        } else if self.light >= 2 && self.unstated == 0 {
+        } else if self.pair && self.unstated == 0 {
             Some(true)
         } else {
             None
@@ -1685,17 +1785,21 @@ impl ForecastState {
 }
 
 impl RebuildForecast {
-    fn new(reads: usize) -> Self {
+    fn new(graph: TaskGraph) -> Self {
+        let reads = graph.tasks.len();
         RebuildForecast {
             state: Mutex::new(ForecastState {
                 unstated: reads,
                 unclassed: reads,
                 unparsed: reads,
-                light: 0,
+                classes: vec![None; reads],
+                light: Vec::new(),
+                pair: false,
                 heavy: false,
             }),
             changed: Condvar::new(),
             ended: std::sync::atomic::AtomicBool::new(false),
+            graph,
         }
     }
 
@@ -1708,37 +1812,64 @@ impl RebuildForecast {
         self.ended.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// The mtimes of a read (`unchanged_inputs`).
-    fn add_mtimes(&self, unchanged: bool) {
+    /// Runs `update` on the state, ends the forecast when the answer is
+    /// "no", and wakes the waits.
+    fn update(&self, update: impl FnOnce(&mut ForecastState)) {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        state.unstated -= 1;
-        state.heavy |= !unchanged;
+        update(&mut state);
+        if state.light_now() == Some(false) {
+            self.end();
+        }
         self.changed.notify_all();
     }
 
-    /// Whether the build info of a read makes a light rebuild, as soon as
-    /// it is parsed: before the thread reads the source mtimes of a check
-    /// that reads them (`forecast_rebuild` tells the rest).
-    fn add_class(&self, light: bool) {
-        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        state.unclassed -= 1;
-        state.light += usize::from(light);
-        self.changed.notify_all();
+    /// The mtimes of a read (`unchanged_inputs`).
+    fn add_mtimes(&self, unchanged: bool) {
+        self.update(|state| {
+            state.unstated -= 1;
+            state.heavy |= !unchanged;
+        });
+    }
+
+    /// Whether the build info of read `read` makes a light rebuild, as soon
+    /// as it is parsed: before the thread reads the source mtimes of a
+    /// check that reads them (`forecast_rebuild` tells the rest).
+    fn add_class(&self, read: usize, light: bool) {
+        self.update(|state| {
+            state.unclassed -= 1;
+            state.classes[read] = Some(light);
+            if light {
+                state.pair |= state
+                    .light
+                    .iter()
+                    .any(|&other| self.graph.independent(read, other));
+                state.light.push(read);
+            }
+        });
+    }
+
+    /// Whether the build info of read `read` makes a light rebuild, when it
+    /// is parsed.
+    fn class(&self, read: usize) -> Option<bool> {
+        self.state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .classes[read]
     }
 
     /// The rebuild of a read, from its build info (`add_class` counted a
     /// light one).
     fn add_parse(&self, rebuild: Rebuild) {
-        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        state.unparsed -= 1;
-        state.heavy |= rebuild == Rebuild::Heavy;
-        self.changed.notify_all();
+        self.update(|state| {
+            state.unparsed -= 1;
+            state.heavy |= rebuild == Rebuild::Heavy;
+        });
     }
 
-    /// True when no rebuild is heavy and two or more are light. Waits
-    /// until a rebuild is heavy, until every build info is parsed with
-    /// fewer than two light rebuilds, or until two rebuilds are light and
-    /// the mtimes of every read are read. So a build with fewer than two
+    /// True when no rebuild is heavy and two light ones can compile at the
+    /// same time. Waits until a rebuild is heavy, until every build info is
+    /// parsed with no such two light rebuilds, or until there are two and
+    /// the mtimes of every read are read. So a build with no such two
     /// light rebuilds waits for no mtime.
     /// A heavy rebuild that only a later parse shows (another version or
     /// options with no newer config file) is missed; that task compiles on
@@ -1827,11 +1958,13 @@ impl BuildInfoPrefetch {
     ) -> Self {
         let reads: Vec<Arc<PrefetchRead>> = reads
             .into_iter()
-            .map(|read| {
+            .enumerate()
+            .map(|(index, read)| {
                 Arc::new(PrefetchRead {
                     read,
+                    index,
                     slot: Arc::default(),
-                    roots: OnceLock::new(),
+                    roots: RootTimes::default(),
                 })
             })
             .collect();
@@ -1841,7 +1974,12 @@ impl BuildInfoPrefetch {
             .collect();
         let mut jobs: Vec<PrefetchJob> = reads.iter().cloned().map(PrefetchJob::Parse).collect();
         if forecast.is_some() {
-            jobs.extend(reads.iter().cloned().map(PrefetchJob::Mtimes));
+            // The reads with the fewest root files first: a changed input of
+            // a small task ends the forecast before a large task reads its
+            // root mtimes.
+            let mut by_size = reads.clone();
+            by_size.sort_by_key(|read| read.read.input_files.len());
+            jobs.extend(by_size.into_iter().map(PrefetchJob::Mtimes));
         }
         let threads = pool.threads().min(reads.len());
         let queue = Mutex::new(jobs.into_iter());
@@ -1865,7 +2003,7 @@ impl BuildInfoPrefetch {
                         };
                         let unchanged = forecast.ended()
                             || std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                unchanged_inputs(&*fs, &read)
+                                unchanged_inputs(&*fs, &read, forecast)
                             }))
                             .unwrap_or(false);
                         forecast.add_mtimes(unchanged);
@@ -1923,10 +2061,12 @@ impl BuildInfoPrefetch {
 /// share.
 struct PrefetchRead {
     read: BuildInfoRead,
+    /// The index of the read in the forecast (`RebuildForecast::add_class`).
+    index: usize,
     slot: Arc<BuildInfoSlot>,
-    /// With a forecast: the mtimes of the root files, in order, read once
-    /// by the first of the two jobs that needs them (`root_m_times`).
-    roots: OnceLock<Vec<Option<SystemTime>>>,
+    /// With a forecast: the mtimes of the root files, read once by the
+    /// first of the two jobs that needs them.
+    roots: RootTimes,
 }
 
 /// A job of the build info threads. The parses come first, in build order,
@@ -1949,7 +2089,8 @@ fn parse_build_info_job(
     m_times: &MTimePrefetch,
     forecast: Option<&RebuildForecast>,
 ) {
-    let roots = forecast.map(|_| read.roots_cell());
+    let roots = forecast.map(|_| &read.roots);
+    let index = read.index;
     // A read that panics is left to the task, which panics on it too.
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let read = &read.read;
@@ -1959,7 +2100,7 @@ fn parse_build_info_job(
             .as_ref()
             .map(|build_info| read.check.early_return(build_info));
         if let Some(forecast) = forecast {
-            forecast.add_class(early == Some(EarlyReturn::ErrorsOrPendingEmit));
+            forecast.add_class(index, early == Some(EarlyReturn::ErrorsOrPendingEmit));
         }
         // A check that returns before the input mtimes reads neither the
         // check parts nor the mtimes.
@@ -1977,7 +2118,14 @@ fn parse_build_info_job(
                 sources = Some(prefetch_m_times(fs, read, &status, m_times, roots));
                 status
             });
-        let rebuild = forecast.map(|_| forecast_rebuild(fs, read, early, sources));
+        // An ended forecast reads nothing more (`RebuildForecast::ended`).
+        let rebuild = forecast.map(|forecast| {
+            if forecast.ended() {
+                Rebuild::None
+            } else {
+                forecast_rebuild(fs, read, early, sources)
+            }
+        });
         ((build_info, status), rebuild)
     }));
     let (result, rebuild) = match result {
@@ -1995,33 +2143,78 @@ fn parse_build_info_job(
     }
 }
 
-impl PrefetchRead {
-    /// The shared root mtimes, for `root_m_times`.
-    fn roots_cell(&self) -> RootTimes<'_> {
-        RootTimes {
-            files: &self.read.input_files,
-            times: &self.roots,
-        }
+/// The mtimes of the root files of a read, in order, read once by the
+/// first of its two jobs that needs them (`get`).
+#[derive(Default)]
+struct RootTimes {
+    state: Mutex<RootRead>,
+    read: Condvar,
+}
+
+#[derive(Default)]
+enum RootRead {
+    #[default]
+    Unread,
+    /// A job reads them now.
+    Reading,
+    Read(Arc<[Option<SystemTime>]>),
+}
+
+/// Sets `RootTimes` to `Unread` when a read stops without a result, also
+/// when it panics, and wakes the jobs that wait.
+struct UnreadOnStop<'a>(&'a RootTimes, Option<Arc<[Option<SystemTime>]>>);
+
+impl Drop for UnreadOnStop<'_> {
+    fn drop(&mut self) {
+        let mut state = self.0.state.lock().unwrap_or_else(PoisonError::into_inner);
+        *state = match self.1.take() {
+            Some(times) => RootRead::Read(times),
+            None => RootRead::Unread,
+        };
+        self.0.read.notify_all();
     }
 }
 
-/// The root files of a read and their shared mtimes (`PrefetchRead::roots`).
-#[derive(Clone, Copy)]
-struct RootTimes<'a> {
-    files: &'a [String],
-    times: &'a OnceLock<Vec<Option<SystemTime>>>,
-}
+/// How many root files a read with `stop` reads between two checks.
+const ROOT_STOP_CHECK: usize = 64;
 
-impl<'a> RootTimes<'a> {
-    /// The mtimes of the root files, in order: read now by the first job
+impl RootTimes {
+    /// The mtimes of `files`, the root files: read now by the first job
     /// that asks; a job that asks while another reads them waits for it.
-    fn root_m_times(self, fs: &dyn Fs) -> &'a [Option<SystemTime>] {
-        self.times.get_or_init(|| {
-            self.files
-                .iter()
-                .map(|file| fs.stat(file).and_then(|stat| stat.mod_time()))
-                .collect()
-        })
+    /// With `stop`, the read stops when `stop` is true between files and
+    /// gives None; then the next job that asks reads them.
+    fn get(
+        &self,
+        fs: &dyn Fs,
+        files: &[String],
+        stop: Option<&dyn Fn() -> bool>,
+    ) -> Option<Arc<[Option<SystemTime>]>> {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        loop {
+            match &*state {
+                RootRead::Read(times) => return Some(times.clone()),
+                RootRead::Reading => {
+                    state = self
+                        .read
+                        .wait(state)
+                        .unwrap_or_else(PoisonError::into_inner);
+                }
+                RootRead::Unread => break,
+            }
+        }
+        *state = RootRead::Reading;
+        drop(state);
+        let mut done = UnreadOnStop(self, None);
+        let mut times = Vec::with_capacity(files.len());
+        for (index, file) in files.iter().enumerate() {
+            if index % ROOT_STOP_CHECK == 0 && stop.is_some_and(|stop| stop()) {
+                return None;
+            }
+            times.push(fs.stat(file).and_then(|stat| stat.mod_time()));
+        }
+        let times: Arc<[Option<SystemTime>]> = times.into();
+        done.1 = Some(times.clone());
+        Some(times)
     }
 }
 
@@ -2057,16 +2250,18 @@ fn prefetch_m_times(
     read: &BuildInfoRead,
     status: &StatusPrefetch,
     m_times: &MTimePrefetch,
-    roots: Option<RootTimes<'_>>,
+    roots: Option<&RootTimes>,
 ) -> NewestTime {
-    let root_times = roots.map(|roots| roots.root_m_times(fs));
+    let root_times = roots.and_then(|roots| roots.get(fs, &read.input_files, None));
     let roots = read
         .input_files
         .iter()
         .zip(&status.input_paths)
         .enumerate()
         .map(|(index, (file, path))| {
-            let known = root_times.and_then(|times| times.get(index).copied());
+            let known = root_times
+                .as_ref()
+                .and_then(|times| times.get(index).copied());
             (file, path, known)
         });
     let files = status
@@ -2096,23 +2291,33 @@ fn prefetch_m_times(
 /// (`PrefetchJob::Mtimes`): true when the build info of `read` exists and
 /// no config or root file of its task is missing or newer than it. Else the
 /// task builds with changed inputs. Go's check of a light rebuild reads no
-/// root mtime (it returns first); the forecast reads them all, on a thread.
-fn unchanged_inputs(fs: &dyn Fs, read: &PrefetchRead) -> bool {
+/// root mtime (it returns first); the forecast reads them, on a thread.
+/// The parse job of a read that is not a light rebuild reads the source
+/// mtimes for its check, and `forecast_rebuild` compares them, so this
+/// job reads no root mtime there. It stops when the forecast ends (true:
+/// the answer no longer depends on it).
+fn unchanged_inputs(fs: &dyn Fs, read: &PrefetchRead, forecast: &RebuildForecast) -> bool {
     let m_time = |file: &str| fs.stat(file).and_then(|stat| stat.mod_time());
     let Some(build_info_time) = m_time(&read.read.name) else {
         return false;
     };
     let unchanged =
         |m_time: Option<SystemTime>| m_time.is_some_and(|m_time| m_time <= build_info_time);
-    read.read
+    if !read
+        .read
         .config_files
         .iter()
         .all(|file| unchanged(m_time(file)))
-        && read
-            .roots_cell()
-            .root_m_times(fs)
-            .iter()
-            .all(|root| unchanged(*root))
+    {
+        return false;
+    }
+    if forecast.class(read.index) == Some(false) {
+        return true;
+    }
+    let stop = || forecast.ended();
+    read.roots
+        .get(fs, &read.read.input_files, Some(&stop))
+        .is_none_or(|roots| roots.iter().all(|root| unchanged(*root)))
 }
 
 /// PORT: not in Go (perf). The rebuild of the task of `read` as its build
@@ -2209,17 +2414,22 @@ pub fn new_orchestrator(opts: Options) -> Orchestrator {
 mod tests {
     use super::*;
 
+    /// The graph of `reads` reads whose tasks wait for no other task.
+    fn independent(reads: usize) -> TaskGraph {
+        TaskGraph::new((0..reads).collect(), vec![TaskSet::new(reads); reads])
+    }
+
     /// `RebuildForecast::light`: builders start only with no heavy rebuild
-    /// and two or more light ones.
+    /// and two light ones that can compile at the same time.
     #[test]
     fn rebuild_forecast_needs_two_light_rebuilds_and_no_heavy_one() {
         let forecast = |mtimes: &[bool], parses: &[Rebuild]| {
-            let forecast = RebuildForecast::new(3);
+            let forecast = RebuildForecast::new(independent(3));
             mtimes
                 .iter()
                 .for_each(|&unchanged| forecast.add_mtimes(unchanged));
-            for &rebuild in parses {
-                forecast.add_class(rebuild == Rebuild::Light);
+            for (read, &rebuild) in parses.iter().enumerate() {
+                forecast.add_class(read, rebuild == Rebuild::Light);
                 forecast.add_parse(rebuild);
             }
             forecast.light()
@@ -2232,12 +2442,42 @@ mod tests {
             &[Rebuild::Light, Rebuild::None, Rebuild::None]
         ));
         assert!(!forecast(&unchanged, &[Rebuild::Light, Rebuild::Heavy]));
-        // A changed input decides before any parse.
-        assert!(!forecast(&[true, false], &[]));
+        // A changed input decides before any parse, and ends the forecast.
+        let changed = RebuildForecast::new(independent(3));
+        changed.add_mtimes(true);
+        changed.add_mtimes(false);
+        assert!(changed.ended() && !changed.light());
         // Fewer than two light rebuilds decide without the mtimes.
         assert!(!forecast(
             &[],
             &[Rebuild::Light, Rebuild::None, Rebuild::None]
         ));
+    }
+
+    /// A chain (each task waits for the one before it) forecasts nothing,
+    /// and light rebuilds count only when two of them can compile at the
+    /// same time.
+    #[test]
+    fn rebuild_forecast_counts_light_rebuilds_that_can_compile_together() {
+        // Task 1 and 2 wait for task 0; task 2 waits for task 1.
+        let mut upstream = vec![TaskSet::new(3); 3];
+        upstream[1].insert(0);
+        upstream[2].insert(0);
+        upstream[2].insert(1);
+        let chain = TaskGraph::new(vec![0, 1, 2], upstream.clone());
+        assert!(!chain.has_independent_pair());
+        // A fan: tasks 1 and 2 wait for task 0 only.
+        upstream[2] = TaskSet::new(3);
+        upstream[2].insert(0);
+        let fan = TaskGraph::new(vec![0, 1, 2], upstream);
+        assert!(fan.has_independent_pair());
+        let forecast = RebuildForecast::new(fan);
+        (0..3).for_each(|_| forecast.add_mtimes(true));
+        // Task 0 and task 1 cannot compile together.
+        forecast.add_class(0, true);
+        forecast.add_class(1, true);
+        assert_eq!(forecast.known_light(), None);
+        forecast.add_class(2, true);
+        assert!(forecast.light());
     }
 }
