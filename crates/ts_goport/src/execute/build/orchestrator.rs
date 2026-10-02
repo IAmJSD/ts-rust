@@ -930,6 +930,13 @@ impl Orchestrator {
                 if states[index] != State::Waiting {
                     continue;
                 }
+                // PORT: not in Go (perf). A task that can go to a builder
+                // waits while every builder is busy (`start_builders`).
+                if later_on_builders != Some(false)
+                    && builders.as_ref().is_some_and(Builders::all_busy)
+                {
+                    continue;
+                }
                 let task = self.get_task(&paths[index]);
                 if !clean {
                     let upstream_done = task.borrow().up_stream.iter().all(|upstream| {
@@ -1226,9 +1233,10 @@ impl Orchestrator {
     }
 
     /// PORT: not in Go (perf). The builder threads of a parallel build
-    /// (builders.rs), at most `num_routines`, which send the index of each
-    /// task whose check and emit are done to `ready`
-    /// (`first_task_uses_builder`).
+    /// (builders.rs), which send the index of each task whose check and emit
+    /// are done to `ready` (`first_task_uses_builder`). There are one fewer
+    /// builders than `num_routines`, and at least 2 (Go builds on
+    /// `num_routines` goroutines).
     /// None when a config cannot go to a builder (`BuildHost::builder_shared`).
     /// The output is the same with or without builders.
     /// This thread then publishes the stores of the configs that it parsed,
@@ -1254,7 +1262,16 @@ impl Orchestrator {
                 .unwrap_or_else(std::time::Instant::now),
             ends_process: self.ends_process.get(),
         };
-        Some(Builders::new(setup, num_routines, ready.clone()))
+        // PERF (tscbpar1 round d, mini-743d, fresh copies of the stable
+        // bins against R153, 30 rounds): with 4 routines, a 4th builder
+        // added 6 to 7 points of peak RSS where 4 or more light rebuilds
+        // compile together (mixlib5s +11.3% against +4.0% with 3 builders,
+        // sametypes5s +6.1% against -0.6%, bigfan8 +8.4% against +1.6%) and
+        // 10% to 20% of the sys CPU. Its wall gain was -3.5 to +3 points
+        // (wide-4err 23.6% against 20.7%), and 5.5 in bigfan8 (8 light
+        // leaves of a 1,500 file root: 29.2% against 23.7%).
+        let max = num_routines.saturating_sub(1).max(2).min(num_routines);
+        Some(Builders::new(setup, max, ready.clone()))
     }
 
     /// PORT: not in Go (perf). Keeps `released` to free later (see

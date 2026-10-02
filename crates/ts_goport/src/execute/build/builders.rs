@@ -138,7 +138,9 @@ struct Builder {
 /// The builder threads of one build, on the orchestrator thread. A task
 /// goes to the first idle builder (`compile`), so a chain of tasks stays on
 /// the first builder and its parse cache. A builder starts with its first
-/// task.
+/// task. There are at most `max` builders (`Orchestrator::start_builders`).
+/// When all of them are busy, a task that compiles waits until one is free
+/// (`all_busy`).
 pub(crate) struct Builders {
     setup: Arc<BuilderSetup>,
     max: usize,
@@ -193,6 +195,12 @@ impl Builders {
         }
         self.builders[builder].busy = true;
         self.builder_of.insert(index, builder);
+    }
+
+    /// True when every builder is busy and no other can start: then a task
+    /// that compiles waits for a finish (orchestrator.rs `build_all_tasks`).
+    pub(crate) fn all_busy(&self) -> bool {
+        self.builders.len() >= self.max && self.builders.iter().all(|builder| builder.busy)
     }
 
     /// True when the task at build order index `index` compiles on a
