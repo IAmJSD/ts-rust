@@ -871,9 +871,9 @@ impl Orchestrator {
         let builders_setting = self.builders_setting(num_routines);
         let mut builders: Option<Builders> = None;
         // PORT: not in Go (perf). With builders, whether the tasks after the
-        // first one that compiles go to them too (`later_tasks_use_builders`),
-        // known at a later one that compiles (`light_unchanged`). With
-        // `Some(false)` they compile on this thread.
+        // first one that compiles go to them too, known when the second one
+        // compiles (`later_tasks_use_builders`). With `Some(false)` they
+        // compile on this thread.
         let mut later_on_builders = None;
         if !clean {
             *self.build_info_prefetch.borrow_mut() =
@@ -1022,20 +1022,8 @@ impl Orchestrator {
                             self.end_forecast();
                         }
                     } else if builders.is_some() && later_on_builders.is_none() {
-                        // A light task with unchanged inputs goes to a
-                        // builder too, and the decision waits for the next
-                        // task that compiles.
-                        let light = self.light_unchanged(builders_setting, &task.borrow(), index);
-                        later_on_builders =
-                            match self.known_later_tasks_use_builders(builders_setting) {
-                                Some(true) => Some(true),
-                                _ if light => None,
-                                Some(false) => Some(false),
-                                None => Some(self.later_tasks_use_builders(builders_setting)),
-                            };
-                        if later_on_builders.is_some() {
-                            self.end_forecast();
-                        }
+                        later_on_builders = Some(self.later_tasks_use_builders(builders_setting));
+                        self.end_forecast();
                     }
                 }
                 // PORT: not in Go (perf). SLOTS (P4): a task that compiles
@@ -1217,9 +1205,8 @@ impl Orchestrator {
     /// `first`, compiles on a builder thread (builders.rs). With
     /// `BuildersSetting::Light`: when it only reports the errors of its
     /// build info or makes its pending emit. Unless the forecast knows the
-    /// answer for the later tasks already, their decision waits for a later
-    /// task that compiles (`later_tasks_use_builders`, `light_unchanged`),
-    /// behind the load of the first one.
+    /// answer for the later tasks already, their decision waits for the
+    /// second task that compiles (`later_tasks_use_builders`).
     fn first_task_uses_builder(&self, setting: BuildersSetting, first: &BuildTask) -> bool {
         match setting {
             BuildersSetting::Off => false,
@@ -1235,10 +1222,8 @@ impl Orchestrator {
     }
 
     /// PORT: not in Go (perf). True when the tasks that compile after the
-    /// first one compile on builder threads too, decided at a later one
-    /// that compiles: yes once the forecast says so, else at the first one
-    /// that is not a light rebuild with unchanged inputs (`light_unchanged`
-    /// tasks compile on builders until then). With
+    /// first one compile on builder threads too, decided when the second
+    /// one has its status: a "no" holds for every later task. With
     /// `BuildersSetting::Light`: when the build
     /// info threads forecast no heavy rebuild (no task with changed inputs)
     /// and light ones in tasks that can compile at the same time, with
@@ -1259,7 +1244,11 @@ impl Orchestrator {
     // can compile at the same time (a chain): there builders cost 0.5 to
     // 0.9 ms (tscbpar1 round c). Before the decision waited for the
     // second task that compiles (tscbpar1 round c), it waited at the first
-    // one for the forecast: about 1 ms in wide-1err.
+    // one for the forecast: about 1 ms in wide-1err. In tiny2-of-12 (2
+    // light tasks of 68 files among 10 up-to-date tasks) the forecast says
+    // no at the second light task; until tscbpar1 round f that task waited
+    // on this thread for the load of the first one on its builder (about
+    // 13 ms of a 20 ms build on zbook). Now it loads beside it.
     fn later_tasks_use_builders(&self, setting: BuildersSetting) -> bool {
         match setting {
             BuildersSetting::Off => false,
@@ -1270,30 +1259,6 @@ impl Orchestrator {
                 .as_ref()
                 .is_some_and(BuildInfoPrefetch::light_rebuilds),
         }
-    }
-
-    /// PORT: not in Go (perf). True when `task`, at build order index
-    /// `index`, is a light rebuild as the forecast finds one: its status is
-    /// `first_task_uses_builder`'s, its build info makes a light rebuild,
-    /// and its config and root files are not newer than its build info,
-    /// read now (`BuildInfoPrefetch::light_unchanged`). Once builders run,
-    /// such a task compiles on one also when the forecast says no for too
-    /// few files, and the decision for the later tasks waits for the next
-    /// one that compiles.
-    // PERF (tscbpar1 round e, mini-743d, 100 rounds against R155): in
-    // tiny2-of-12 (2 light tasks of 68 files among 10 up-to-date tasks of
-    // 300 files) the forecast said no at the second light task, which
-    // then waited on this thread for the load of the first one on its
-    // builder (`Builders::wait_for_loads`, about 13 ms of a 20 ms build on
-    // zbook): +2.1% against R155, where the serial path was -2.3%.
-    fn light_unchanged(&self, setting: BuildersSetting, task: &BuildTask, index: usize) -> bool {
-        setting == BuildersSetting::Light
-            && self.first_task_uses_builder(setting, task)
-            && self
-                .build_info_prefetch
-                .borrow()
-                .as_ref()
-                .is_some_and(|prefetch| prefetch.light_unchanged(&*self.opts.sys.fs(), index))
     }
 
     /// PORT: not in Go (perf). `later_tasks_use_builders` when the forecast
@@ -1739,9 +1704,6 @@ impl BuildTaskOrchestrator for Orchestrator {
 struct BuildInfoPrefetch {
     slots: FxHashMap<String, Arc<BuildInfoSlot>>,
     forecast: Option<Arc<RebuildForecast>>,
-    /// With a forecast: the reads, by their index in the forecast
-    /// (`light_unchanged`).
-    reads: Vec<Arc<PrefetchRead>>,
 }
 
 /// One build info file that the threads read, the root files of its task
@@ -2146,11 +2108,6 @@ impl BuildInfoPrefetch {
             by_size.sort_by_key(|read| read.read.input_files.len());
             jobs.extend(by_size.into_iter().map(PrefetchJob::Mtimes));
         }
-        let kept = if forecast.is_some() {
-            reads.clone()
-        } else {
-            Vec::new()
-        };
         let threads = pool.threads().min(reads.len());
         let queue = Mutex::new(jobs.into_iter());
         let thread_forecast = forecast.clone();
@@ -2181,11 +2138,7 @@ impl BuildInfoPrefetch {
                 }
             }
         });
-        BuildInfoPrefetch {
-            slots,
-            forecast,
-            reads: kept,
-        }
+        BuildInfoPrefetch { slots, forecast }
     }
 
     /// The build info of `name` that a thread read, and its check parts,
@@ -2213,20 +2166,6 @@ impl BuildInfoPrefetch {
         self.forecast
             .as_ref()
             .is_some_and(|forecast| forecast.light())
-    }
-
-    /// True when the build info of the task at build order index `task`
-    /// makes a light rebuild and its config and root files are not newer
-    /// than its build info (`inputs_not_newer`; with `fs`, this thread
-    /// reads the mtimes that the forecast jobs have not read).
-    fn light_unchanged(&self, fs: &dyn Fs, task: usize) -> bool {
-        let Some(forecast) = &self.forecast else {
-            return false;
-        };
-        let Some(read) = forecast.graph.tasks.iter().position(|&t| t == task) else {
-            return false;
-        };
-        forecast.class(read) == Some(true) && inputs_not_newer(fs, &self.reads[read], true, None)
     }
 
     /// `light_rebuilds` when the threads know it already, else None.
@@ -2495,25 +2434,6 @@ fn prefetch_m_times(
 /// job reads no root mtime there. It stops when the forecast ends (true:
 /// the answer no longer depends on it).
 fn unchanged_inputs(fs: &dyn Fs, read: &PrefetchRead, forecast: &RebuildForecast) -> bool {
-    let stop = || forecast.ended();
-    inputs_not_newer(
-        fs,
-        read,
-        forecast.class(read.index) != Some(false),
-        Some(&stop),
-    )
-}
-
-/// PORT: not in Go (perf). True when the config files of `read` and, with
-/// `roots`, its root files are not newer than its build info. With `stop`,
-/// the root mtimes read stops when `stop` is true (`RootTimes::get`), and
-/// the files count as not newer.
-fn inputs_not_newer(
-    fs: &dyn Fs,
-    read: &PrefetchRead,
-    roots: bool,
-    stop: Option<&dyn Fn() -> bool>,
-) -> bool {
     let m_time = |file: &str| fs.stat(file).and_then(|stat| stat.mod_time());
     let Some(build_info_time) = m_time(&read.read.name) else {
         return false;
@@ -2528,11 +2448,13 @@ fn inputs_not_newer(
     {
         return false;
     }
-    !roots
-        || read
-            .roots
-            .get(fs, &read.read.input_files, stop)
-            .is_none_or(|roots| roots.iter().all(|root| unchanged(*root)))
+    if forecast.class(read.index) == Some(false) {
+        return true;
+    }
+    let stop = || forecast.ended();
+    read.roots
+        .get(fs, &read.read.input_files, Some(&stop))
+        .is_none_or(|roots| roots.iter().all(|root| unchanged(*root)))
 }
 
 /// PORT: not in Go (perf). The rebuild of the task of `read` as its build
