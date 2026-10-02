@@ -561,10 +561,9 @@ process (bin/tsgo.rs `go_runtime_start`).
   whose worker a signal ended exits 128 + N. PORT: std and rustix have no
   safe `SIG_DFL`, and signal-hook's default action calls `abort` when the
   raise returns, which ends a pid 1 by SIGSEGV (rc 139). So a pid 1 does
-  not raise the signal; it exits 128 + N at once. PORT: the SIGPIPE of a
-  broken stdout or stderr (execute/tsc/stdio.rs `sigpipe`) still uses
-  signal-hook's default action, so a pid 1 that runs the work itself
-  (no worker) ends there by SIGSEGV (139) where Go exits 141.
+  not raise the signal; it exits 128 + N at once. So does the SIGPIPE of
+  a broken stdout or stderr (execute/tsc/stdio.rs `sigpipe`): a pid 1 that
+  runs the work itself (no worker) exits 141, as Go does.
 - PORT: SIGILL, SIGBUS, SIGFPE and SIGSEGV keep their default actions,
   also when another process sends them (`kill`). Go throws a sent one
   (`sigFromUser`) as it throws SIGQUIT: it prints the name (`SIGSEGV:

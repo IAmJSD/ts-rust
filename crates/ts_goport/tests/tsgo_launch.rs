@@ -18,8 +18,9 @@
 //!
 //! The ends by a signal: as the pid 1 of a PID namespace, where the kernel
 //! drops a signal with the default action, tsgo exits 128 + N where Go
-//! does (`end_by_signal`, `die_from_signal`); and a launcher whose caller
-//! ignores SIGCHLD still gets its worker's exit (`drop_go_signals`).
+//! does (`end_by_signal`, `die_from_signal`, stdio.rs `sigpipe`); and a
+//! launcher whose caller ignores SIGCHLD still gets its worker's exit
+//! (`drop_go_signals`).
 #![cfg(target_os = "linux")]
 
 use std::io::{Read, Seek};
@@ -235,6 +236,38 @@ fn a_tsgo_that_is_pid_1_of_a_pid_namespace() {
         output.stdout.starts_with(b"Version "),
         "SIGCHLD ignored: {output:?}"
     );
+}
+
+/// tsgo as the pid 1 of a PID namespace whose stdout is a pipe with no
+/// reader: its write gets EPIPE, and as in Go N the run exits 141 (Go
+/// `dieFromSignal`: 128 + SIGPIPE, as the raise of SIGPIPE does nothing
+/// there), with and without a worker (stdio.rs `sigpipe`). A run without a
+/// worker went on to signal-hook's `abort`, which ends a pid 1 by SIGSEGV.
+/// Where `unshare -U` cannot run, the test says so and passes.
+#[test]
+fn a_pid_1_tsgo_whose_stdout_is_broken() {
+    if !unshare_runs(&[]) {
+        eprintln!("skipped: `unshare -Upf --map-root-user --mount-proc` cannot run here");
+        return;
+    }
+    for launch in ["0", "1"] {
+        let (read, write) = rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC).unwrap();
+        drop(read);
+        let output = Command::new("unshare")
+            .args(UNSHARE)
+            .args([env!("CARGO_BIN_EXE_tsgo"), "--all"])
+            .env("GOPORT_LAUNCH", launch)
+            .stdout(Stdio::from(write))
+            .stderr(Stdio::piped())
+            .output()
+            .unwrap();
+        // unshare exits with its child's exit code.
+        assert_eq!(
+            output.status.code(),
+            Some(141),
+            "GOPORT_LAUNCH={launch}: {output:?}"
+        );
+    }
 }
 
 /// A launcher whose caller ignores SIGCHLD (`env --ignore-signal=CHLD`):

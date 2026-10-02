@@ -52,10 +52,12 @@ pub struct Stdout;
 /// (`flush_cli_stdout_at_exit`). Each other write goes out at once, in
 /// Go's pieces, so a status line, a trace line or a `[watch]` line is in
 /// the file when Go's is. A report only formats and writes, so it ends in
-/// milliseconds. A process that dies inside one (SIGKILL, SIGHUP, an OOM
-/// kill, `core::go_fatal_newosproc`) loses the kept bytes, at most 64 KiB:
-/// Go's file has the pieces written so far. The reports ignore their write
-/// errors, as Go's do, so the error of a kept write changes nothing.
+/// milliseconds. A process that dies inside one (SIGKILL, an OOM kill,
+/// `core::go_fatal_newosproc`) loses the kept bytes, at most 64 KiB: Go's
+/// file has the pieces written so far. A thrown signal and SIGHUP write
+/// them first (bin/tsgo.rs `throw`, `die_from_signal`). The reports ignore
+/// their write errors, as Go's do, so the error of a kept write changes
+/// nothing.
 pub struct CliStdout;
 
 /// Go `os.Stderr`.
@@ -339,13 +341,17 @@ mod sys {
     // Go: runtime/signal_unix.go sigpipe and dieFromSignal. tsgo neither
     // ignores nor catches SIGPIPE through os/signal, so this always ends
     // the process. `emulate_default_handler` sets the default action,
-    // unblocks the signal and raises it (it aborts if that returns).
+    // unblocks the signal and raises it. When the raise returns (the pid 1
+    // of a PID namespace: the kernel drops a signal with the default action
+    // that the process sends itself), Go exits 128 + N. signal-hook aborts
+    // there instead, which ends a pid 1 by SIGSEGV, so a pid 1 does not
+    // raise the signal (as bin/tsgo.rs `end_by_signal`).
     fn sigpipe() -> ! {
-        let _ = signal_hook::low_level::emulate_default_handler(signal_hook::consts::SIGPIPE);
-        // PORT: not reached: for SIGPIPE `emulate_default_handler` does not
-        // return. When the raised signal does not end the process, it
-        // aborts (SIGABRT), where Go's `dieFromSignal` exits 2.
-        std::process::exit(2)
+        use signal_hook::consts::SIGPIPE;
+        if !rustix::process::getpid().is_init() {
+            let _ = signal_hook::low_level::emulate_default_handler(SIGPIPE);
+        }
+        signal_hook::low_level::exit(128 + SIGPIPE)
     }
 }
 
