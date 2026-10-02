@@ -2,8 +2,8 @@
   "schemaVersion": 1,
   "status": "ready",
   "decision": "PASS",
-  "updated": "2026-10-01T20:54:57.432504+00:00",
-  "reason": "Batch recovery-continuation-go-checker-port-38 accepted at R153.",
+  "updated": "2026-10-02T00:50:06.408321+00:00",
+  "reason": "Batch recovery-continuation-go-checker-port-39 accepted at R154.",
   "goalAuthorization": {
     "date": "2026-09-07T23:13:28.547569+00:00",
     "instruction": "Continue working toward the active thread goal. Keep iterating on the ts-rust port until it is Able to properly type-check Tanstack Core and Hono.",
@@ -613,6 +613,11 @@
       "path": "docs/typechecker-batches/recovery-continuation-go-checker-port-37.json",
       "sha256": "96cea2330210e3bc83b5a2c0826a54f476fd18fa3052d552c8b9c2e515503a41",
       "bytes": 402172
+    },
+    {
+      "path": "docs/typechecker-batches/recovery-continuation-go-checker-port-38.json",
+      "sha256": "e684b3a876aec577a43582cddcdbd7a946a55cd551e0a8430d9bef47499262d9",
+      "bytes": 404458
     }
   ],
   "batch": {
@@ -631,28 +636,28 @@
       },
       {
         "id": "editor-long-growth",
-        "status": "open; r153-full caps 1.00"
+        "status": "open; r154-full caps 1.00"
       }
     ],
-    "id": "recovery-continuation-go-checker-port-38",
+    "id": "recovery-continuation-go-checker-port-39",
     "previousBatch": {
-      "id": "recovery-continuation-go-checker-port-37",
+      "id": "recovery-continuation-go-checker-port-38",
       "archive": {
-        "path": "docs/typechecker-batches/recovery-continuation-go-checker-port-37.json",
-        "sha256": "96cea2330210e3bc83b5a2c0826a54f476fd18fa3052d552c8b9c2e515503a41",
-        "bytes": 402172
+        "path": "docs/typechecker-batches/recovery-continuation-go-checker-port-38.json",
+        "sha256": "e684b3a876aec577a43582cddcdbd7a946a55cd551e0a8430d9bef47499262d9",
+        "bytes": 404458
       }
     },
     "latestHono": {
-      "runner": "goport --profile release (207b96057), bound runs r58,r58b",
+      "runner": "goport --profile release (d8d7a932b), bound runs r59,r59b",
       "runs": [
         {
-          "manifest": "target/continuation-r97-goport/measure/r58/manifest.json",
-          "sha256": "5a11ad1bb495921cf0a63e5fcf626026eba4fdb8f870a3c986f7761f0baaa568"
+          "manifest": "target/continuation-r97-goport/measure/r59/manifest.json",
+          "sha256": "c7cb534caa6a256fde3589a07fedff04a0bb98a40cab20b6261685ba0a4f8d95"
         },
         {
-          "manifest": "target/continuation-r97-goport/measure/r58b/manifest.json",
-          "sha256": "e54fa4c6ece6b15bad819861b2df62a2912401c6bc5daa0b432d5e7c14d0f7cf"
+          "manifest": "target/continuation-r97-goport/measure/r59b/manifest.json",
+          "sha256": "b6aa29107a1001eb722b007fd04fb484850b51b8bcb9da05a365f5a1ee923d99"
         }
       ],
       "config": "target/project-inputs/hono/source/tsconfig.build.json",
@@ -662,29 +667,29 @@
       "oracleDiagnostics": 0,
       "matchesOracle": true,
       "repeatIdentical": true,
-      "date": "2026-10-01",
-      "sourceFingerprint": "d793653e14b8c091d7b6c6392edd9ac68ab9596064c2cdfcdf7cf59bd2bf504b"
+      "date": "2026-10-02",
+      "sourceFingerprint": "636b2e875967e198577aa60405b88c415bb37735dca81d229816e5be0fd31241"
     },
-    "origin": "Theo's standing goal (complete the port, drop-in for tsgo, 2x perf); int26 skeptic PASS (wf_676fe7df-758): target/continuation-r97-goport/int26/open.md",
+    "origin": "Theo's standing goal (complete the port, drop-in for tsgo, 2x perf); int27 skeptic PASS (wf_e99fb22c-480): target/continuation-r97-goport/int27/open.md",
     "protectedSet": "goport",
     "protectedBase": {
-      "batch": "recovery-continuation-go-checker-port-37",
-      "revision": 152,
+      "batch": "recovery-continuation-go-checker-port-38",
+      "revision": 153,
       "tests": {
-        "path": "target/continuation-r97-goport/evidence-cache/b434da8a98646dc9/tests-run/results.json",
-        "sha256": "94293ec3b1d8a813d9271be1ea304ee932a21cef2a5d041bee588d0e67330b0f"
+        "path": "target/continuation-r97-goport/evidence-cache/34c750b3d129efaa/tests-run/results.json",
+        "sha256": "3066948b2c49fdbf786892355bf4c6201924d4836b005357af46501dc5cb27c1"
       },
       "gate": {
-        "path": "target/continuation-r97-goport/compat/gate/r152-full/manifest.json",
-        "sha256": "115baa51e65599eab0353fd0cb872c7dc8d9bc70b95382616e207023b13aab27"
+        "path": "target/continuation-r97-goport/compat/gate/r153-full/manifest.json",
+        "sha256": "f0a58164e0d97193d817bbcc1c2ce73b197014413f9bcd81e1bab698952f3be8"
       },
       "lsp": {
-        "label": "lsp-r152",
-        "dir": "target/continuation-r97-goport/ls-oracle/battery/results/lsp-r152"
+        "label": "lsp-r153",
+        "dir": "target/continuation-r97-goport/ls-oracle/battery/results/lsp-r153"
       },
       "api": {
-        "label": "api-r152",
-        "dir": "target/continuation-r97-goport/tests2/api/results/api-r152"
+        "label": "api-r153",
+        "dir": "target/continuation-r97-goport/tests2/api/results/api-r153"
       },
       "oracleAnswers": [
         {
@@ -761,12 +766,12 @@
     "verdictHistory": [
       {
         "role": "audit_accepted_roster",
-        "agent": "ac07aab6bfeffdf5c",
+        "agent": "a59f313bc2ac59a59",
         "verdict": "PASS",
-        "batchId": "recovery-continuation-go-checker-port-38",
-        "sourceFingerprint": "d793653e14b8c091d7b6c6392edd9ac68ab9596064c2cdfcdf7cf59bd2bf504b",
-        "goportTestsSha256": "3066948b2c49fdbf786892355bf4c6201924d4836b005357af46501dc5cb27c1",
-        "gateSha256": "f0a58164e0d97193d817bbcc1c2ce73b197014413f9bcd81e1bab698952f3be8",
+        "batchId": "recovery-continuation-go-checker-port-39",
+        "sourceFingerprint": "636b2e875967e198577aa60405b88c415bb37735dca81d229816e5be0fd31241",
+        "goportTestsSha256": "bcca1ceb4a984be5a914769f312266335a187f58cc46eb3db340de7d0a00035e",
+        "gateSha256": "a652a3e26411a588f7cf0b3372b3c282898716383d069d722bdf5137dfbb6067",
         "nameMapSha256": null,
         "gateIdMapSha256": null,
         "oracleRebaseSha256": null,
@@ -775,16 +780,16 @@
           "cebd3ae35f2dd1ef7b34a2a578e9a83a898be5d250f753174744b1dd2ef505ba",
           "e3541a7f31b70f74bea5db9855bb187ad2fdffa30cd75c3a717d23f56b7d4253"
         ],
-        "utc": "2026-10-01T20:54:57.432504+00:00"
+        "utc": "2026-10-02T00:50:06.408321+00:00"
       },
       {
         "role": "independent_reviewer",
-        "agent": "ae9067181860f79cd",
+        "agent": "a3c38e8119d9c2b56",
         "verdict": "PASS",
-        "batchId": "recovery-continuation-go-checker-port-38",
-        "sourceFingerprint": "d793653e14b8c091d7b6c6392edd9ac68ab9596064c2cdfcdf7cf59bd2bf504b",
-        "goportTestsSha256": "3066948b2c49fdbf786892355bf4c6201924d4836b005357af46501dc5cb27c1",
-        "gateSha256": "f0a58164e0d97193d817bbcc1c2ce73b197014413f9bcd81e1bab698952f3be8",
+        "batchId": "recovery-continuation-go-checker-port-39",
+        "sourceFingerprint": "636b2e875967e198577aa60405b88c415bb37735dca81d229816e5be0fd31241",
+        "goportTestsSha256": "bcca1ceb4a984be5a914769f312266335a187f58cc46eb3db340de7d0a00035e",
+        "gateSha256": "a652a3e26411a588f7cf0b3372b3c282898716383d069d722bdf5137dfbb6067",
         "nameMapSha256": null,
         "gateIdMapSha256": null,
         "oracleRebaseSha256": null,
@@ -793,7 +798,7 @@
           "cebd3ae35f2dd1ef7b34a2a578e9a83a898be5d250f753174744b1dd2ef505ba",
           "e3541a7f31b70f74bea5db9855bb187ad2fdffa30cd75c3a717d23f56b7d4253"
         ],
-        "utc": "2026-10-01T20:54:57.432504+00:00"
+        "utc": "2026-10-02T00:50:06.408321+00:00"
       }
     ],
     "focusedResults": [],
@@ -804,61 +809,61 @@
       "from": "673a5f17d713",
       "to": "673a5f17d713",
       "rule": null,
-      "note": "same pin as recovery-continuation-go-checker-port-37"
+      "note": "same pin as recovery-continuation-go-checker-port-38"
     },
     "goportTests": {
-      "results": "target/continuation-r97-goport/evidence-cache/34c750b3d129efaa/tests-run/results.json",
-      "sha256": "3066948b2c49fdbf786892355bf4c6201924d4836b005357af46501dc5cb27c1",
-      "base": "target/continuation-r97-goport/evidence-cache/b434da8a98646dc9/tests-run/results.json",
-      "baseSha256": "94293ec3b1d8a813d9271be1ea304ee932a21cef2a5d041bee588d0e67330b0f",
+      "results": "target/continuation-r97-goport/evidence-cache/8a2b3bfd161330ea/tests-run/results.json",
+      "sha256": "bcca1ceb4a984be5a914769f312266335a187f58cc46eb3db340de7d0a00035e",
+      "base": "target/continuation-r97-goport/evidence-cache/34c750b3d129efaa/tests-run/results.json",
+      "baseSha256": "3066948b2c49fdbf786892355bf4c6201924d4836b005357af46501dc5cb27c1",
       "compare": {
         "lost": 0,
         "absent": 0,
         "unrun": 0,
-        "retained": 181463,
+        "retained": 181472,
         "recovered": 0,
-        "newNames": 9,
+        "newNames": 1,
         "removedByMap": 0,
         "newFailed": 0
       },
       "nameMap": null,
-      "testbin": "target/continuation-r97-goport/evidence-cache/34c750b3d129efaa/testbin",
-      "commit": "207b96057ad7a9d157cf052c7c0c86f4d2b3c4f7",
+      "testbin": "target/continuation-r97-goport/evidence-cache/8a2b3bfd161330ea/testbin",
+      "commit": "d8d7a932bf542b43d3243bc89a6356e2752637ec",
       "compareOutput": {
-        "path": "target/continuation-r97-goport/evidence-cache/34c750b3d129efaa/tests-compare.json",
-        "sha256": "f51111036ee7c818025c55d33e5e37a733293ffc148bdec0583143ee1da55351"
+        "path": "target/continuation-r97-goport/evidence-cache/8a2b3bfd161330ea/tests-compare.json",
+        "sha256": "66c609876a882e2e49f3823066ef4a90f17d2109319cf9ffe23cc87124f87649"
       }
     },
     "gateCompare": {
-      "base": "target/continuation-r97-goport/compat/gate/r152-full/manifest.json",
-      "baseSha256": "115baa51e65599eab0353fd0cb872c7dc8d9bc70b95382616e207023b13aab27",
-      "new": "target/continuation-r97-goport/compat/gate/r153-full/manifest.json",
-      "sha256": "f0a58164e0d97193d817bbcc1c2ce73b197014413f9bcd81e1bab698952f3be8",
+      "base": "target/continuation-r97-goport/compat/gate/r153-full/manifest.json",
+      "baseSha256": "f0a58164e0d97193d817bbcc1c2ce73b197014413f9bcd81e1bab698952f3be8",
+      "new": "target/continuation-r97-goport/compat/gate/r154-full/manifest.json",
+      "sha256": "a652a3e26411a588f7cf0b3372b3c282898716383d069d722bdf5137dfbb6067",
       "regressions": 0,
       "knownOpen": [],
       "output": {
-        "path": "target/continuation-r97-goport/evidence-cache/34c750b3d129efaa/gate-compare.json",
-        "sha256": "982475d7a52d084e1fb34633b49ce3acaa95b2856faabe4efd2a29c7c1d90edc"
+        "path": "target/continuation-r97-goport/evidence-cache/8a2b3bfd161330ea/gate-compare.json",
+        "sha256": "2fbdfd3ef530906fd633276e5f2bae5215745cafb4b91e5d1f3ebbf3c4290dc8"
       }
     },
     "gate": {
-      "manifest": "target/continuation-r97-goport/compat/gate/r153-full/manifest.json",
-      "sha256": "f0a58164e0d97193d817bbcc1c2ce73b197014413f9bcd81e1bab698952f3be8"
+      "manifest": "target/continuation-r97-goport/compat/gate/r154-full/manifest.json",
+      "sha256": "a652a3e26411a588f7cf0b3372b3c282898716383d069d722bdf5137dfbb6067"
     },
     "gateRuns": [
       {
-        "label": "r153-full",
-        "manifest": "target/continuation-r97-goport/compat/gate/r153-full/manifest.json",
-        "sha256": "f0a58164e0d97193d817bbcc1c2ce73b197014413f9bcd81e1bab698952f3be8",
+        "label": "r154-full",
+        "manifest": "target/continuation-r97-goport/compat/gate/r154-full/manifest.json",
+        "sha256": "a652a3e26411a588f7cf0b3372b3c282898716383d069d722bdf5137dfbb6067",
         "compare": {
-          "path": "target/continuation-r97-goport/evidence-cache/34c750b3d129efaa/gate-compare.json",
-          "sha256": "982475d7a52d084e1fb34633b49ce3acaa95b2856faabe4efd2a29c7c1d90edc"
+          "path": "target/continuation-r97-goport/evidence-cache/8a2b3bfd161330ea/gate-compare.json",
+          "sha256": "2fbdfd3ef530906fd633276e5f2bae5215745cafb4b91e5d1f3ebbf3c4290dc8"
         },
         "regressions": []
       }
     ],
     "gateVerdict": {
-      "label": "r153-full",
+      "label": "r154-full",
       "verdict": "PASS",
       "host": "dbook-lan",
       "counts": {
@@ -868,14 +873,14 @@
       "failing": []
     },
     "languageServerOracle": {
-      "label": "lsp-r153",
-      "summary": "target/continuation-r97-goport/ls-oracle/battery/results/lsp-r153/summary.md",
-      "dir": "target/continuation-r97-goport/ls-oracle/battery/results/lsp-r153",
+      "label": "lsp-r154",
+      "summary": "target/continuation-r97-goport/ls-oracle/battery/results/lsp-r154/summary.md",
+      "dir": "target/continuation-r97-goport/ls-oracle/battery/results/lsp-r154",
       "host": "dbook-lan",
       "result": "257,681 requests: 241,439 same, 0 diff, 0 crash, 0 timeout, 0 goport_error",
       "base": {
-        "label": "lsp-r152",
-        "dir": "target/continuation-r97-goport/ls-oracle/battery/results/lsp-r152"
+        "label": "lsp-r153",
+        "dir": "target/continuation-r97-goport/ls-oracle/battery/results/lsp-r153"
       },
       "compare": {
         "retained": 243558,
@@ -887,19 +892,19 @@
         "retainedByAnswers": 166
       },
       "output": {
-        "path": "target/continuation-r97-goport/evidence-cache/34c750b3d129efaa/lsp-compare.json",
-        "sha256": "2be162f4c316ee80ae1ca62b8e6752a6f889a46f4558b6c31521587379de5dbe"
+        "path": "target/continuation-r97-goport/evidence-cache/8a2b3bfd161330ea/lsp-compare.json",
+        "sha256": "4732d83b1ad2b8d32765d65f7ba97106fc4f6c721a08a8a904a99c74456fe2ff"
       }
     },
     "apiOracle": {
-      "label": "api-r153",
-      "summary": "target/continuation-r97-goport/tests2/api/results/api-r153/summary.md",
-      "dir": "target/continuation-r97-goport/tests2/api/results/api-r153",
+      "label": "api-r154",
+      "summary": "target/continuation-r97-goport/tests2/api/results/api-r154/summary.md",
+      "dir": "target/continuation-r97-goport/tests2/api/results/api-r154",
       "host": "dbook-lan",
       "result": "111,926 requests: 111,610 same, 4 diff, 0 crash, 0 timeout, 0 goport_error",
       "base": {
-        "label": "api-r152",
-        "dir": "target/continuation-r97-goport/tests2/api/results/api-r152"
+        "label": "api-r153",
+        "dir": "target/continuation-r97-goport/tests2/api/results/api-r153"
       },
       "compare": {
         "retained": 111804,
@@ -912,28 +917,28 @@
         "retainedByMaskedAnswers": 21
       },
       "output": {
-        "path": "target/continuation-r97-goport/evidence-cache/34c750b3d129efaa/api-compare.json",
-        "sha256": "44e21753b84998eb159c0b7b14fe6bac44dc7d66a163ee5aa6f7870d16cf4560"
+        "path": "target/continuation-r97-goport/evidence-cache/8a2b3bfd161330ea/api-compare.json",
+        "sha256": "c1987ec0a748befc652562650328988afadfcdbf2a247c10e8c3bb5bf78ee9bf"
       }
     },
     "quality": {
-      "record": "target/continuation-r97-goport/evidence-cache/34c750b3d129efaa/quality.json",
+      "record": "target/continuation-r97-goport/evidence-cache/8a2b3bfd161330ea/quality.json",
       "result": "rustfmt 0, clippy 0, 0 ts_goport warnings, 0 kept crate warnings, fingerprint unchanged True"
     },
     "qualityEvidence": {
-      "sourceFingerprint": "d793653e14b8c091d7b6c6392edd9ac68ab9596064c2cdfcdf7cf59bd2bf504b",
-      "dir": "target/continuation-r97-goport/evidence-cache/34c750b3d129efaa"
+      "sourceFingerprint": "636b2e875967e198577aa60405b88c415bb37735dca81d229816e5be0fd31241",
+      "dir": "target/continuation-r97-goport/evidence-cache/8a2b3bfd161330ea"
     },
     "ordinaryQuery": {
-      "runner": "goport --profile release (207b96057), bound runs r58,r58b",
+      "runner": "goport --profile release (d8d7a932b), bound runs r59,r59b",
       "runs": [
         {
-          "manifest": "target/continuation-r97-goport/measure/r58/manifest.json",
-          "sha256": "5a11ad1bb495921cf0a63e5fcf626026eba4fdb8f870a3c986f7761f0baaa568"
+          "manifest": "target/continuation-r97-goport/measure/r59/manifest.json",
+          "sha256": "c7cb534caa6a256fde3589a07fedff04a0bb98a40cab20b6261685ba0a4f8d95"
         },
         {
-          "manifest": "target/continuation-r97-goport/measure/r58b/manifest.json",
-          "sha256": "e54fa4c6ece6b15bad819861b2df62a2912401c6bc5daa0b432d5e7c14d0f7cf"
+          "manifest": "target/continuation-r97-goport/measure/r59b/manifest.json",
+          "sha256": "b6aa29107a1001eb722b007fd04fb484850b51b8bcb9da05a365f5a1ee923d99"
         }
       ],
       "config": "target/project-inputs/query/source/packages/query-core/tsconfig.prod.json",
@@ -943,41 +948,41 @@
       "oracleDiagnostics": 0,
       "matchesOracle": true,
       "repeatIdentical": true,
-      "date": "2026-10-01",
-      "sourceFingerprint": "d793653e14b8c091d7b6c6392edd9ac68ab9596064c2cdfcdf7cf59bd2bf504b"
+      "date": "2026-10-02",
+      "sourceFingerprint": "636b2e875967e198577aa60405b88c415bb37735dca81d229816e5be0fd31241"
     },
     "localCheck": {
       "command": "node scripts/check-typechecker-batch.mjs docs/typechecker-state",
       "exit": 0,
       "verdict": "PASS",
       "rule": "goport-protected-set",
-      "ranUtc": "2026-10-01T20:54:57.432504+00:00"
+      "ranUtc": "2026-10-02T00:50:06.408321+00:00"
     },
     "acceptance": {
-      "acceptedUtc": "2026-10-01T20:54:57.432504+00:00",
-      "scope": "int26 at pin N: followups2 (with followups1), lspata1, lspreg1, spawn1 (37 paths, none protected)",
+      "acceptedUtc": "2026-10-02T00:50:06.408321+00:00",
+      "scope": "int27: emitast1 (perfplan4 R5 emit AST reads) and R14 (spelling suggestion buffers) on R153 at pin 673a5f17d713",
       "acceptedBy": "root, with both independent PASS verdicts",
       "rules": [
-        "goport-protected-set (standing, Theo 2026-09-28; base recovery-continuation-go-checker-port-37 R152)"
+        "goport-protected-set (standing, Theo 2026-09-28; base recovery-continuation-go-checker-port-38 R153)"
       ]
     },
-    "recoveryRevision": 153,
-    "hypothesis": "Four lanes on R152 go in at pin 673a5f17d713 with no -p output change on the 4 projects: followups2 with followups1 (UTF-8 column fast path, go_text_slice at U+FDD0, Go newosproc text at thread starts, the API callback wait serves didChange, shutdown and exit, editfast1 and refs1 tests, services.rs next-byte check), lspata1 (ATA npm on a helper thread with a post-once wake-up; first diagnostics at once, 0 CPU while waiting), lspreg1 (auto-import registry parses only what its checker can ask for; query-core LSP peak RSS about 375 to 230 MiB), spawn1 (intern cache on the heap, one timer thread per owner thread, ST checker-0 arena): every R152 test name keeps its status (9 new), the gate has 0 regressions, the LSP and API oracles keep every class, np-suite keeps 879/879.",
-    "sourceFingerprint": "d793653e14b8c091d7b6c6392edd9ac68ab9596064c2cdfcdf7cf59bd2bf504b",
-    "beforeEditingSourceFingerprint": "097dbc7f89aac72ead4d779f5c982c7bd37a1efb63e65784150040bd0ed2304c",
+    "recoveryRevision": 154,
+    "hypothesis": "Two skeptic-checked items on R153 go in at pin 673a5f17d713 with no -p output change on the 4 projects: emitast1 (perfplan4 R5: subtree facts read node data once, a per-file facts column for parsed nodes, the synthetic arena as a const thread local; emit ST uses fewer instructions, effect emit ST about 2% faster on release builds) and R14 from typearena2 (get_spelling_suggestion reuses one rune buffer and one Levenshtein buffer pair per call, as Go core.go): every R153 test name keeps its status (1 new), the gate has 0 regressions, the LSP and API oracles keep every class, np-suite keeps 879/879.",
+    "sourceFingerprint": "636b2e875967e198577aa60405b88c415bb37735dca81d229816e5be0fd31241",
+    "beforeEditingSourceFingerprint": "d793653e14b8c091d7b6c6392edd9ac68ab9596064c2cdfcdf7cf59bd2bf504b",
     "sourceBindingStatus": "SOURCE_BOUND",
-    "commit": "207b96057",
+    "commit": "d8d7a932b",
     "completedRuns": [],
     "compilerAccepted": true,
     "passingCredit": true,
     "auditor": {
       "role": "audit_accepted_roster",
-      "agent": "ac07aab6bfeffdf5c",
+      "agent": "a59f313bc2ac59a59",
       "verdict": "PASS",
-      "batchId": "recovery-continuation-go-checker-port-38",
-      "sourceFingerprint": "d793653e14b8c091d7b6c6392edd9ac68ab9596064c2cdfcdf7cf59bd2bf504b",
-      "goportTestsSha256": "3066948b2c49fdbf786892355bf4c6201924d4836b005357af46501dc5cb27c1",
-      "gateSha256": "f0a58164e0d97193d817bbcc1c2ce73b197014413f9bcd81e1bab698952f3be8",
+      "batchId": "recovery-continuation-go-checker-port-39",
+      "sourceFingerprint": "636b2e875967e198577aa60405b88c415bb37735dca81d229816e5be0fd31241",
+      "goportTestsSha256": "bcca1ceb4a984be5a914769f312266335a187f58cc46eb3db340de7d0a00035e",
+      "gateSha256": "a652a3e26411a588f7cf0b3372b3c282898716383d069d722bdf5137dfbb6067",
       "nameMapSha256": null,
       "gateIdMapSha256": null,
       "oracleRebaseSha256": null,
@@ -986,16 +991,16 @@
         "cebd3ae35f2dd1ef7b34a2a578e9a83a898be5d250f753174744b1dd2ef505ba",
         "e3541a7f31b70f74bea5db9855bb187ad2fdffa30cd75c3a717d23f56b7d4253"
       ],
-      "utc": "2026-10-01T20:54:57.432504+00:00"
+      "utc": "2026-10-02T00:50:06.408321+00:00"
     },
     "reviewer": {
       "role": "independent_reviewer",
-      "agent": "ae9067181860f79cd",
+      "agent": "a3c38e8119d9c2b56",
       "verdict": "PASS",
-      "batchId": "recovery-continuation-go-checker-port-38",
-      "sourceFingerprint": "d793653e14b8c091d7b6c6392edd9ac68ab9596064c2cdfcdf7cf59bd2bf504b",
-      "goportTestsSha256": "3066948b2c49fdbf786892355bf4c6201924d4836b005357af46501dc5cb27c1",
-      "gateSha256": "f0a58164e0d97193d817bbcc1c2ce73b197014413f9bcd81e1bab698952f3be8",
+      "batchId": "recovery-continuation-go-checker-port-39",
+      "sourceFingerprint": "636b2e875967e198577aa60405b88c415bb37735dca81d229816e5be0fd31241",
+      "goportTestsSha256": "bcca1ceb4a984be5a914769f312266335a187f58cc46eb3db340de7d0a00035e",
+      "gateSha256": "a652a3e26411a588f7cf0b3372b3c282898716383d069d722bdf5137dfbb6067",
       "nameMapSha256": null,
       "gateIdMapSha256": null,
       "oracleRebaseSha256": null,
@@ -1004,9 +1009,9 @@
         "cebd3ae35f2dd1ef7b34a2a578e9a83a898be5d250f753174744b1dd2ef505ba",
         "e3541a7f31b70f74bea5db9855bb187ad2fdffa30cd75c3a717d23f56b7d4253"
       ],
-      "utc": "2026-10-01T20:54:57.432504+00:00"
+      "utc": "2026-10-02T00:50:06.408321+00:00"
     },
-    "nextPermittedAction": "R153 accepted.",
+    "nextPermittedAction": "R154 accepted.",
     "oracleAnswers": [
       {
         "kind": "api",
@@ -1028,32 +1033,29 @@
       }
     ],
     "npSuite": {
-      "label": "np-r153",
-      "dir": "target/continuation-r97-goport/compat-backlog/np-suite/np-r153",
-      "resultsSha256": "3c7ef0d890ec42fbe85261cc53d80d3ed8bc6a1e94c5744ab1ef9e3a40ad324f",
-      "result": "879 of 879 pass on the R153 tsgo at microsoft/TypeScript 673a5f17d713/tsc; np-suite.sh diff np-r152 np-r153: changes {}",
-      "base": "np-r152"
+      "label": "np-r154",
+      "dir": "target/continuation-r97-goport/compat-backlog/np-suite/np-r154",
+      "resultsSha256": "8adf0d7599c79cd29e4bdb8813fe12f06cb6ac43815715bc3f41fbc16a32a480",
+      "result": "879 of 879 pass on the R154 tsgo at microsoft/TypeScript 673a5f17d713/tsc; np-suite.sh diff np-r153 np-r154: changes {}",
+      "base": "np-r153"
     },
     "lanes": {
-      "openText": "target/continuation-r97-goport/int26/open.md",
-      "integration": "target/continuation-r97-goport/int26/summary.md",
+      "openText": "target/continuation-r97-goport/int27/open.md",
+      "integration": "target/continuation-r97-goport/int27/handoff.md",
       "skeptics": [
-        "target/continuation-r97-goport/int26-skeptic"
+        "target/continuation-r97-goport/int27-skeptic"
       ],
       "laneSummaries": [
-        "target/continuation-r97-goport/followups1/summary.md",
-        "target/continuation-r97-goport/followups2/summary.md",
-        "target/continuation-r97-goport/lspata1/b/summary-with-skeptic.md",
-        "target/continuation-r97-goport/lspreg1/summary-with-skeptic.md",
-        "target/continuation-r97-goport/spawn1/summary-with-skeptic.md"
+        "target/continuation-r97-goport/emitast1/summary-with-skeptic.md",
+        "target/continuation-r97-goport/typearena2/c/summary-with-skeptic.md"
       ]
     },
     "verdicts": {
-      "auditor": "target/continuation-r153-auditor-verdict.txt",
-      "reviewer": "target/continuation-r153-reviewer-verdict.jsonl"
+      "auditor": "target/continuation-r154-auditor-verdict.txt",
+      "reviewer": "target/continuation-r154-reviewer-verdict.jsonl"
     },
-    "gateMoves": "corpus-diag/04541 ALLOWED to MATCH; 10448 and 10455 stay ALLOWED by base entries",
-    "reviewerItems": "not blocking: (1) ATA thread (ata.rs:534) and timer thread (local.rs:476) panic with Rust text if the thread cannot start; local.rs:476 panics after thread_running = true (caught: wait_pending loops); fix both with go_fatal_newosproc; Go retries clone on EAGAIN about 20 times; (2) weak tests: api_callback_wait_serves_shutdown_and_exit_behind_other_messages does not check didChange served or hover kept; utf8_columns_without_marker_skip_the_scan passes on old code; (3) test gaps: lspreg1 miss fallback, ATA thread path, redirect bailout; (4) exit served during a callback wait lets the API request run to its end, extra messages after exit; (5) extra LSP batteries complete-u1, b3-zod, fourslash-nonfatal not run on int26; (6) stale Go line comments converters.rs:823/:904, server.rs:4627/:3689/:3704, aliasresolver.rs:37; (7) hono editor cap is 1.00 (request text said 1.28). Decisions accepted: tikv-jemalloc-ctl and paste; effect emit +0.5% layout; LSP RSS +10 MiB and hono growth 0.195; callback wait serves shutdown and exit first."
+    "gateMoves": "none; 10448 and 10455 stay ALLOWED by base entries",
+    "reviewerItems": "not blocking: (1) facts_index(NIL) underflows (release wraps to the same nil panic; debug gives an overflow message); (2) slot kind equals data kind check is debug only; (3) nil slot made with the first slot: a wrong-thread handle read can read a wrong node (R153 panicked), not reachable by correct code; (4) a facts read on a freed synthetic slot now panics (R153 gave stale facts); (5) per-thread facts column grows to the highest node index read (memory only, gate memory MATCH); (6) the R14 test compares with fresh buffers, not the R153 code; does not test the candidate_runes clear and extend; (7) stale Go line refs in scanner_util.rs (getSpellingSuggestion 590, GetSpellingSuggestionForStrings 635); (8) extra LSP batteries not run on int27; (9) batch check STOP only while in REVIEW."
   },
   "parallelModelPreference": {
     "model": "GPT-6 Astra",
@@ -1076,19 +1078,19 @@
     "runtimeOwner": "/root"
   },
   "latestAcceptedHono": {
-    "date": "2026-10-01",
-    "sourceFingerprint": "d793653e14b8c091d7b6c6392edd9ac68ab9596064c2cdfcdf7cf59bd2bf504b",
+    "date": "2026-10-02",
+    "sourceFingerprint": "636b2e875967e198577aa60405b88c415bb37735dca81d229816e5be0fd31241",
     "complete": true,
     "diagnostics": 0,
     "matchesOracle": true,
     "runs": [
       {
-        "manifest": "target/continuation-r97-goport/measure/r58/manifest.json",
-        "sha256": "5a11ad1bb495921cf0a63e5fcf626026eba4fdb8f870a3c986f7761f0baaa568"
+        "manifest": "target/continuation-r97-goport/measure/r59/manifest.json",
+        "sha256": "c7cb534caa6a256fde3589a07fedff04a0bb98a40cab20b6261685ba0a4f8d95"
       },
       {
-        "manifest": "target/continuation-r97-goport/measure/r58b/manifest.json",
-        "sha256": "e54fa4c6ece6b15bad819861b2df62a2912401c6bc5daa0b432d5e7c14d0f7cf"
+        "manifest": "target/continuation-r97-goport/measure/r59b/manifest.json",
+        "sha256": "b6aa29107a1001eb722b007fd04fb484850b51b8bcb9da05a365f5a1ee923d99"
       }
     ]
   },

@@ -750,21 +750,24 @@ impl EmitContext {
             panic!("Original cannot be nil.");
         }
 
-        let existing = self.original.borrow().get(&node).copied();
-        match existing {
-            None => {
-                self.original.borrow_mut().insert(node, original);
+        // PERF: emitast1. One hash lookup (the entry), not a get and an
+        // insert.
+        let mut originals = self.original.borrow_mut();
+        match originals.entry(node) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(original);
+                drop(originals);
                 let mut emit_nodes = self.emit_nodes.borrow_mut();
                 if let Some(emit_node) = emit_nodes.try_get(original).cloned() {
                     emit_nodes.get(node).copy_from(&emit_node);
                 }
             }
-            Some(existing) if !allow_overwrite && existing != original => {
-                panic!("Original node already set.");
-            }
-            Some(_) => {
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                if !allow_overwrite && *entry.get() != original {
+                    panic!("Original node already set.");
+                }
                 if allow_overwrite {
-                    self.original.borrow_mut().insert(node, original);
+                    entry.insert(original);
                 }
             }
         }
