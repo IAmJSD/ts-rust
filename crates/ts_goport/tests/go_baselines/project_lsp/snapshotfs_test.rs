@@ -12,19 +12,18 @@ use ts_goport::flags::ScriptKind;
 use ts_goport::frontend::tspath::Path;
 use ts_goport::frontend::vfs::Fs;
 use ts_goport::lsp::lsproto;
-use ts_goport::project::dirty::CloneableMap;
 use ts_goport::project::{
-    AutoImportBuilderFS, CachedFile, FileBase, FileChangeSummary, FileContent, FileHandle,
-    FileHandleSource, FileSource, LayeredFileSystem, Overlay, RealpathAliasSet, SnapshotFS,
-    SnapshotFSBuilder, layer_overlay_file_system, new_cached_file, new_cached_file_handle,
-    new_overlay_fs, new_snapshot_fs_builder_from_source, new_source_fs,
+    AutoImportBuilderFS, CachedDirectory, CachedFile, FileBase, FileChangeSummary, FileContent,
+    FileHandle, FileHandleSource, FileSource, LayeredFileSystem, Overlay, RealpathAliasSet,
+    SnapshotFS, SnapshotFSBuilder, layer_overlay_file_system, new_cached_file,
+    new_cached_file_handle, new_overlay_fs, new_snapshot_fs_builder_from_source, new_source_fs,
 };
 
 use super::util::uri;
 use crate::support::vfstest::{self, MapFile};
 
 type CacheFiles = FxHashMap<Path, Rc<RefCell<CachedFile>>>;
-type Dirs = FxHashMap<Path, CloneableMap<Path, String>>;
+type Dirs = FxHashMap<Path, CachedDirectory>;
 type Aliases = FxHashMap<Path, Rc<RefCell<RealpathAliasSet>>>;
 type Overlays = IndexMap<Path, Rc<Overlay>>;
 
@@ -201,11 +200,11 @@ fn dirs(entries: &[(&str, &[(&str, &str)])]) -> Dirs {
     entries
         .iter()
         .map(|(dir, children)| {
-            let map: FxHashMap<Path, String> = children
+            let map: IndexMap<Path, String> = children
                 .iter()
                 .map(|(k, v)| (p(k), v.to_string()))
                 .collect();
-            (p(dir), CloneableMap(Rc::new(RefCell::new(map))))
+            (p(dir), Rc::new(RefCell::new(map)))
         })
         .collect()
 }
@@ -242,7 +241,7 @@ fn overlays(entries: &[(&str, &str)]) -> Overlays {
 /// Go `snapshot.cacheDirectories[dir][child]` presence.
 fn dir_has(dirs: &Dirs, dir: &str, child: &str) -> bool {
     dirs.get(&p(dir))
-        .is_some_and(|d| d.0.borrow().contains_key(&p(child)))
+        .is_some_and(|d| d.borrow().contains_key(&p(child)))
 }
 
 /// Go `builder.cacheFiles.Load(path)` then `entry.Delete()`.
@@ -1578,4 +1577,38 @@ fn expands_tracked_directory_deletion_into_file_deletions() {
         !expanded.deleted.contains(&uri("file:///src")),
         "the directory URI itself should be replaced by its files"
     );
+}
+
+// PORT: no Go counterpart (editfuzz2 R1). Go ranges over a small directory
+// map, which gives a rotation of its insertion order. The port keeps
+// insertion order: the open files of a directory come in the order they
+// were opened, and its cached files in the order they were read. The order
+// of the path hashes gave orders that Go never gives.
+#[test]
+fn accessible_entries_keep_the_open_order_and_the_read_order() {
+    let names: Vec<String> = [5, 2, 7, 1, 8, 3, 6, 4]
+        .iter()
+        .map(|i| format!("o{i}.ts"))
+        .collect();
+    let paths: Vec<String> = names.iter().map(|name| format!("/src/{name}")).collect();
+    let files: Vec<(&str, &str)> = paths
+        .iter()
+        .map(|path| (path.as_str(), "export {};"))
+        .collect();
+
+    let open = builder(
+        text_fs(&[], false),
+        overlays(&files),
+        CacheFiles::default(),
+        Dirs::default(),
+        Aliases::default(),
+    );
+    assert_eq!(open.get_accessible_entries("/src").files, names);
+
+    let read = empty_builder(text_fs(&files, false));
+    for (path, _) in &files {
+        assert!(read.get_file(path).is_some());
+    }
+    let (snapshot, _) = read.finalize();
+    assert_eq!(snapshot.get_accessible_entries("/src").files, names);
 }

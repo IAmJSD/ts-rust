@@ -5573,8 +5573,8 @@ impl Node {
     /// to the source file.
     // PORT: Go resolves a lazy cache miss with the parser hook
     // `parseJSDocForNode`. A file that is not published yet runs it through
-    // `resolve_file_store_js_doc`; a program file runs it through
-    // `program::resolve_lazy_js_doc`.
+    // `resolve_file_store_js_doc`; a published file runs it through
+    // `program::resolve_lazy_js_doc`, with the inputs of the file itself.
     // PERF: U4 (CH7). `HAS_JS_DOC` is a parser bit (`Node::parser_flags`).
     #[must_use]
     pub fn js_doc(self, file: Node) -> NodeSlice {
@@ -5606,10 +5606,9 @@ impl Node {
         let info = source_file_info(file);
         match cached_js_doc(file, &info, self) {
             Some(jsdocs) => jsdocs,
-            None if info.has_lazy_js_doc => match crate::program::resolve_lazy_js_doc(file, self) {
-                Some(jsdocs) => NodeSlice::from_nodes(jsdocs),
-                None => unported!("parseJSDocForNode"),
-            },
+            None if info.has_lazy_js_doc => {
+                NodeSlice::from_nodes(crate::program::resolve_lazy_js_doc(file, &info, self))
+            }
             None => NodeSlice::NIL,
         }
     }

@@ -1,7 +1,7 @@
 //! Go: internal/fswatch/canonicalize_other.go.
 //!
 //! PORT: Go builds this file on every platform except darwin (amd64 and
-//! arm64), which uses canonicalize_darwin.go (NFD path normalization); so
+//! arm64), which uses canonicalize_darwin.go (NFC path normalization); so
 //! does the port (canonicalize_darwin.rs).
 
 use crate::fswatch::prelude::*;

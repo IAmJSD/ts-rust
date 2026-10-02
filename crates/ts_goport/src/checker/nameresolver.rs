@@ -992,8 +992,6 @@ pub fn is_type_parameter_symbol_declared_in_container(
     false
 }
 
-// Go: binder/nameresolver.go:489 isSelfReferenceLocation
-// PERF: `kind` is `node.kind()`, which the caller has read.
 /// True for the kinds of the locals containers (`locals_container_variants!`
 /// in `ast/node.rs`, Go `LocalsContainerData`): only a node of one of these
 /// kinds can have locals.
@@ -1032,6 +1030,8 @@ pub fn is_locals_container_kind(kind: SyntaxKind) -> bool {
     )
 }
 
+// Go: binder/nameresolver.go:497 isSelfReferenceLocation
+// PERF: `kind` is `node.kind()`, which the caller has read.
 pub fn is_self_reference_location(node: Node, kind: SyntaxKind, last_location: Node) -> bool {
     match kind {
         SyntaxKind::Parameter => last_location.is_some() && last_location == node.name(),

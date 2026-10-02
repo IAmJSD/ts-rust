@@ -392,7 +392,7 @@ impl Checker {
                 );
                 return self.error_type;
             }
-            prop_type = if self.is_this_property_access_in_constructor_p13(node, prop) {
+            prop_type = if self.is_this_property_access_in_constructor(node, prop) {
                 self.auto_type
             } else if write_only || is_write_only_access(node) {
                 self.get_write_type_of_symbol(prop)
@@ -491,25 +491,6 @@ impl Checker {
             return self.get_base_type_of_literal_type(flow_type);
         }
         flow_type
-    }
-
-    /// Go `isThisPropertyAccessInConstructor` (`checker_p30`).
-    // PERF: chkA. Go compares `GetThisContainer(node)`, which is never nil,
-    // with the constructor. With no constructor the answer is false, so the
-    // walk (it only reads the tree) is not made.
-    fn is_this_property_access_in_constructor_p13(&mut self, node: Node, prop: SymbolId) -> bool {
-        let mut constructor = Node::NIL;
-        let (kind, location) = self.is_constructor_declared_this_property(prop);
-        if kind == ThisAssignmentDeclarationKind::THIS_ASSIGNMENT_DECLARATION_CONSTRUCTOR {
-            constructor = location;
-        } else if is_this_property(node) && self.is_auto_typed_property(prop) {
-            constructor = self.get_declaring_constructor(prop);
-        }
-        constructor.is_some()
-            && get_this_container(
-                node, true,  /*includeArrowFunctions*/
-                false, /*includeClassComputedPropertyName*/
-            ) == constructor
     }
 
     // Go: checker/checker.go:11405 getControlFlowContainer

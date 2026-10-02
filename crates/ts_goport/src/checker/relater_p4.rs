@@ -103,7 +103,7 @@ fn relate_variances(
 }
 
 impl Checker {
-    // Go: checker/relater.go:2796 getTypeOfPropertyInTypes
+    // Go: checker/relater.go:2829 getTypeOfPropertyInTypes
     pub fn get_type_of_property_in_types(&mut self, types: &[TypeId], name: &str) -> TypeId {
         let mut prop_types: Vec<TypeId> = Vec::new();
         for &t in types {
@@ -113,7 +113,7 @@ impl Checker {
         self.get_union_type(&prop_types)
     }
 
-    // Go: checker/relater.go:2804 getTypeOfPropertyInType
+    // Go: checker/relater.go:2837 getTypeOfPropertyInType
     pub fn get_type_of_property_in_type(&mut self, t: TypeId, name: &str) -> TypeId {
         let t = self.get_apparent_type(t);
         let prop = if self
@@ -135,14 +135,14 @@ impl Checker {
         self.undefined_type
     }
 
-    // Go: checker/relater.go:2822 shouldCheckAsExcessProperty
+    // Go: checker/relater.go:2855 shouldCheckAsExcessProperty
     pub fn should_check_as_excess_property(&self, prop: SymbolId, container: SymbolId) -> bool {
         let prop_decl = self.sym(prop).value_declaration;
         let container_decl = self.sym(container).value_declaration;
         prop_decl.is_some() && container_decl.is_some() && prop_decl.parent() == container_decl
     }
 
-    // Go: checker/relater.go:2826 isIgnoredJsxProperty
+    // Go: checker/relater.go:2859 isIgnoredJsxProperty
     pub fn is_ignored_jsx_property(&self, source: TypeId, source_prop: SymbolId) -> bool {
         self.ty(source)
             .object_flags
@@ -150,7 +150,7 @@ impl Checker {
             && is_hyphenated_jsx_name(&self.sym(source_prop).name)
     }
 
-    // Go: checker/relater.go:2830 isTypeSubsetOf
+    // Go: checker/relater.go:2863 isTypeSubsetOf
     pub fn is_type_subset_of(&mut self, source: TypeId, target: TypeId) -> bool {
         source == target
             || self.ty(source).flags.intersects(TypeFlags::NEVER)
@@ -158,7 +158,7 @@ impl Checker {
                 && self.is_type_subset_of_union(source, target)
     }
 
-    // Go: checker/relater.go:2834 isTypeSubsetOfUnion
+    // Go: checker/relater.go:2867 isTypeSubsetOfUnion
     pub fn is_type_subset_of_union(&mut self, source: TypeId, target: TypeId) -> bool {
         if self.ty(source).flags.intersects(TypeFlags::UNION) {
             for i in 0..self.ty(source).types().len() {
@@ -177,7 +177,7 @@ impl Checker {
         self.contains_type(self.ty(target).types(), source)
     }
 
-    // Go: checker/relater.go:2849 unionOrIntersectionRelatedTo
+    // Go: checker/relater.go:2882 unionOrIntersectionRelatedTo
     pub fn union_or_intersection_related_to(
         &mut self,
         r: &Rc<RefCell<Relater>>,
@@ -322,7 +322,7 @@ impl Checker {
         )
     }
 
-    // Go: checker/relater.go:2918 someTypeRelatedToType
+    // Go: checker/relater.go:2951 someTypeRelatedToType
     pub fn some_type_related_to_type(
         &mut self,
         r: &Rc<RefCell<Relater>>,
@@ -355,7 +355,7 @@ impl Checker {
         Ternary::FALSE
     }
 
-    // Go: checker/relater.go:2932 eachTypeRelatedToType
+    // Go: checker/relater.go:2965 eachTypeRelatedToType
     pub fn each_type_related_to_type(
         &mut self,
         r: &Rc<RefCell<Relater>>,
@@ -419,7 +419,7 @@ impl Checker {
         result
     }
 
-    // Go: checker/relater.go:2964 getUndefinedStrippedTargetIfNeeded
+    // Go: checker/relater.go:2997 getUndefinedStrippedTargetIfNeeded
     pub fn get_undefined_stripped_target_if_needed(
         &mut self,
         r: &Rc<RefCell<Relater>>,
@@ -442,7 +442,7 @@ impl Checker {
         target
     }
 
-    // Go: checker/relater.go:2971 typeRelatedToSomeType
+    // Go: checker/relater.go:3004 typeRelatedToSomeType
     pub fn type_related_to_some_type(
         &mut self,
         r: &Rc<RefCell<Relater>>,
@@ -554,7 +554,7 @@ impl Checker {
         Ternary::FALSE
     }
 
-    // Go: checker/relater.go:3030 typeRelatedToEachType
+    // Go: checker/relater.go:3063 typeRelatedToEachType
     pub fn type_related_to_each_type(
         &mut self,
         r: &Rc<RefCell<Relater>>,
@@ -583,7 +583,7 @@ impl Checker {
         result
     }
 
-    // Go: checker/relater.go:3043 eachTypeRelatedToSomeType
+    // Go: checker/relater.go:3076 eachTypeRelatedToSomeType
     pub fn each_type_related_to_some_type(
         &mut self,
         r: &Rc<RefCell<Relater>>,
@@ -613,7 +613,7 @@ impl Checker {
     // Third, check if both types are part of deeply nested chains of generic type instantiations and if so assume the types are
     // equal and infinitely expanding. Fourth, if we have reached a depth of 100 nested comparisons, assume we have runaway recursion
     // and issue an error. Otherwise, actually compare the structure of the two types.
-    // Go: checker/relater.go:3061 recursiveTypeRelatedTo
+    // Go: checker/relater.go:3094 recursiveTypeRelatedTo
     pub fn recursive_type_related_to(
         &mut self,
         r: &Rc<RefCell<Relater>>,
@@ -819,7 +819,7 @@ impl Checker {
         result
     }
 
-    // Go: checker/relater.go:3169 resetMaybeStack
+    // Go: checker/relater.go:3201 resetMaybeStack
     pub fn reset_maybe_stack(
         &mut self,
         r: &Rc<RefCell<Relater>>,
@@ -846,7 +846,7 @@ impl Checker {
         rb.truncate_maybe_keys(maybe_start);
     }
 
-    // Go: checker/relater.go:3180 getErrorState
+    // Go: checker/relater.go:3212 getErrorState
     // PORT: perf. `related_info` is almost always empty; `Vec::new()` then
     // skips the out-of-line `Vec::clone` call.
     #[inline]
@@ -862,7 +862,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/relater.go:3187 restoreErrorState
+    // Go: checker/relater.go:3219 restoreErrorState
     // PORT: Go passes `errorState` by value. Callers that reuse a saved state
     // pass a clone.
     pub fn restore_error_state(&mut self, r: &Rc<RefCell<Relater>>, e: ErrorState) {
@@ -871,7 +871,7 @@ impl Checker {
         rb.related_info = e.related_info;
     }
 
-    // Go: checker/relater.go:3192 structuredTypeRelatedTo
+    // Go: checker/relater.go:3224 structuredTypeRelatedTo
     pub fn structured_type_related_to(
         &mut self,
         r: &Rc<RefCell<Relater>>,
@@ -1003,7 +1003,7 @@ impl Checker {
         result
     }
 
-    // Go: checker/relater.go:3254 isSourceIntersectionNeedingExtraCheck
+    // Go: checker/relater.go:3286 isSourceIntersectionNeedingExtraCheck
     pub fn is_source_intersection_needing_extra_check(
         &mut self,
         r: &Rc<RefCell<Relater>>,
@@ -1026,7 +1026,7 @@ impl Checker {
             })
     }
 
-    // Go: checker/relater.go:3261 structuredTypeRelatedToWorker
+    // Go: checker/relater.go:3293 structuredTypeRelatedToWorker
     pub fn structured_type_related_to_worker(
         &mut self,
         r: &Rc<RefCell<Relater>>,

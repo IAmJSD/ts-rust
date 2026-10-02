@@ -1,4 +1,4 @@
-//! Go: checker/checker.go:16704-17613 (checkDeclarationInitializer ..
+//! Go: checker/checker.go:17116-18041 (checkDeclarationInitializer ..
 //! getTypeForBindingElementParent), including the cache key builder
 //! (`CacheHashKey`, `keyBuilder` and the `get*Key` functions).
 
@@ -7,7 +7,7 @@ use crate::prelude::*;
 use std::hash::Hasher as _;
 
 impl Checker {
-    // Go: checker/checker.go:16704 checkDeclarationInitializer
+    // Go: checker/checker.go:17116 checkDeclarationInitializer
     pub fn check_declaration_initializer(
         &mut self,
         declaration: Node,
@@ -47,7 +47,7 @@ impl Checker {
         t
     }
 
-    // Go: checker/checker.go:16728 padObjectLiteralType
+    // Go: checker/checker.go:17142 padObjectLiteralType
     pub fn pad_object_literal_type(&mut self, t: TypeId, pattern: Node) -> TypeId {
         let mut missing_elements: Vec<Node> = Vec::new();
         for e in pattern.elements().iter() {
@@ -88,7 +88,7 @@ impl Checker {
         result
     }
 
-    // Go: checker/checker.go:16752 getPropertyNameFromBindingElement
+    // Go: checker/checker.go:17170 getPropertyNameFromBindingElement
     pub fn get_property_name_from_binding_element(&mut self, e: Node) -> String {
         let expr_type = self.get_literal_type_from_property_name(e.property_name_or_name());
         if self.is_type_usable_as_property_name(expr_type) {
@@ -97,7 +97,7 @@ impl Checker {
         INTERNAL_SYMBOL_NAME_MISSING.to_string()
     }
 
-    // Go: checker/checker.go:16760 padTupleType
+    // Go: checker/checker.go:17178 padTupleType
     pub fn pad_tuple_type(&mut self, t: TypeId, pattern: Node) -> TypeId {
         let pattern_elements = pattern.elements();
         if self
@@ -140,7 +140,7 @@ impl Checker {
         self.create_tuple_type_ex(&element_types, &element_infos, readonly)
     }
 
-    // Go: checker/checker.go:16784 widenTypeInferredFromInitializer
+    // Go: checker/checker.go:17202 widenTypeInferredFromInitializer
     pub fn widen_type_inferred_from_initializer(&mut self, declaration: Node, t: TypeId) -> TypeId {
         let widened = self.get_widened_literal_type_for_initializer(declaration, t);
         if is_in_js_file(declaration) {
@@ -158,7 +158,7 @@ impl Checker {
         widened
     }
 
-    // Go: checker/checker.go:16799 getWidenedLiteralTypeForInitializer
+    // Go: checker/checker.go:17217 getWidenedLiteralTypeForInitializer
     pub fn get_widened_literal_type_for_initializer(
         &mut self,
         declaration: Node,
@@ -174,7 +174,7 @@ impl Checker {
         self.get_widened_literal_type(t)
     }
 
-    // Go: checker/checker.go:16806 getTypeOfFuncClassEnumModule
+    // Go: checker/checker.go:17224 getTypeOfFuncClassEnumModule
     pub fn get_type_of_func_class_enum_module(&mut self, symbol: SymbolId) -> TypeId {
         if self.value_symbol_links.get(symbol).resolved_type.is_nil() {
             let t = self.get_type_of_func_class_enum_module_worker(symbol);
@@ -185,7 +185,7 @@ impl Checker {
         self.value_symbol_links.get(symbol).resolved_type
     }
 
-    // Go: checker/checker.go:16814 getTypeOfFuncClassEnumModuleWorker
+    // Go: checker/checker.go:17232 getTypeOfFuncClassEnumModuleWorker
     pub fn get_type_of_func_class_enum_module_worker(&mut self, symbol: SymbolId) -> TypeId {
         let flags = self.sym(symbol).flags;
         let value_declaration = self.sym(symbol).value_declaration;
@@ -218,7 +218,7 @@ impl Checker {
         t
     }
 
-    // Go: checker/checker.go:16838 getBaseTypeVariableOfClass
+    // Go: checker/checker.go:17256 getBaseTypeVariableOfClass
     pub fn get_base_type_variable_of_class(&mut self, symbol: SymbolId) -> TypeId {
         let declared = self.get_declared_type_of_class_or_interface(symbol);
         let base_constructor_type = self.get_base_constructor_type_of_class(declared);
@@ -245,7 +245,7 @@ impl Checker {
      * * anyType if the extends expression has type any, or
      * * an object type with at least one construct signature.
      */
-    // Go: checker/checker.go:16858 getBaseConstructorTypeOfClass
+    // Go: checker/checker.go:17277 getBaseConstructorTypeOfClass
     pub fn get_base_constructor_type_of_class(&mut self, t: TypeId) -> TypeId {
         let resolved = self
             .ty(t)
@@ -382,7 +382,7 @@ impl Checker {
             .resolved_base_constructor_type
     }
 
-    // Go: checker/checker.go:16917 isFunctionType
+    // Go: checker/checker.go:17329 isFunctionType
     pub fn is_function_type(&mut self, t: TypeId) -> bool {
         self.ty(t).flags.intersects(TypeFlags::OBJECT)
             && !self
@@ -390,7 +390,7 @@ impl Checker {
                 .is_empty()
     }
 
-    // Go: checker/checker.go:16921 isConstructorType
+    // Go: checker/checker.go:17333 isConstructorType
     pub fn is_constructor_type(&mut self, t: TypeId) -> bool {
         if !self
             .get_signatures_of_type(t, SignatureKind::CONSTRUCT)
@@ -407,7 +407,7 @@ impl Checker {
 
     // A type is a mixin constructor if it has a single construct signature taking no type parameters and a single
     // rest parameter of type any[].
-    // Go: checker/checker.go:16934 isMixinConstructorType
+    // Go: checker/checker.go:17346 isMixinConstructorType
     pub fn is_mixin_constructor_type(&mut self, t: TypeId) -> bool {
         let signatures = self
             .get_signatures_of_type(t, SignatureKind::CONSTRUCT)
@@ -427,7 +427,7 @@ impl Checker {
         false
     }
 
-    // Go: checker/checker.go:16946 signatureHasRestParameter
+    // Go: checker/checker.go:17358 signatureHasRestParameter
     // PORT: Go package function on `*Signature`; it reads signature data, so
     // it is a `Checker` method taking the handle.
     pub fn signature_has_rest_parameter(&self, sig: SignatureId) -> bool {
@@ -436,7 +436,7 @@ impl Checker {
             .intersects(SignatureFlags::HAS_REST_PARAMETER)
     }
 
-    // Go: checker/checker.go:16950 getTypeOfParameter
+    // Go: checker/checker.go:17362 getTypeOfParameter
     pub fn get_type_of_parameter(&mut self, symbol: SymbolId) -> TypeId {
         let declaration = self.sym(symbol).value_declaration;
         let t = self.get_type_of_symbol(symbol);
@@ -474,7 +474,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:16955 getConstraintOfType
+    // Go: checker/checker.go:17367 getConstraintOfType
     pub fn get_constraint_of_type(&mut self, t: TypeId) -> TypeId {
         let flags = self.ty(t).flags;
         if flags.intersects(TypeFlags::TYPE_PARAMETER) {
@@ -487,7 +487,7 @@ impl Checker {
         self.get_base_constraint_of_type(t)
     }
 
-    // Go: checker/checker.go:16967 getConstraintOfTypeParameter
+    // Go: checker/checker.go:17379 getConstraintOfTypeParameter
     pub fn get_constraint_of_type_parameter(&mut self, type_parameter: TypeId) -> TypeId {
         if self.has_non_circular_base_constraint(type_parameter) {
             return self.get_constraint_from_type_parameter(type_parameter);
@@ -495,13 +495,13 @@ impl Checker {
         TypeId::NIL
     }
 
-    // Go: checker/checker.go:16974 hasNonCircularBaseConstraint
+    // Go: checker/checker.go:17386 hasNonCircularBaseConstraint
     pub fn has_non_circular_base_constraint(&mut self, t: TypeId) -> bool {
         self.get_resolved_base_constraint(t, &[]) != self.circular_constraint_type
     }
 
     // This is a worker function. Use getConstraintOfTypeParameter which guards against circular constraints
-    // Go: checker/checker.go:16979 getConstraintFromTypeParameter
+    // Go: checker/checker.go:17391 getConstraintFromTypeParameter
     pub fn get_constraint_from_type_parameter(&mut self, t: TypeId) -> TypeId {
         if !self.ty(t).flags.intersects(TypeFlags::TYPE_PARAMETER) {
             return TypeId::NIL;
@@ -545,7 +545,7 @@ impl Checker {
         TypeId::NIL
     }
 
-    // Go: checker/checker.go:17016 getConstraintOrUnknownFromTypeParameter
+    // Go: checker/checker.go:17429 getConstraintOrUnknownFromTypeParameter
     pub fn get_constraint_or_unknown_from_type_parameter(&mut self, t: TypeId) -> TypeId {
         let result = self.get_constraint_from_type_parameter(t);
         if result.is_some() {
@@ -555,7 +555,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:17021 getInferredTypeParameterConstraint
+    // Go: checker/checker.go:17434 getInferredTypeParameterConstraint
     pub fn get_inferred_type_parameter_constraint(
         &mut self,
         t: TypeId,
@@ -667,7 +667,7 @@ impl Checker {
         TypeId::NIL
     }
 
-    // Go: checker/checker.go:17094 getTypeParametersForTypeReferenceOrImport
+    // Go: checker/checker.go:17507 getTypeParametersForTypeReferenceOrImport
     pub fn get_type_parameters_for_type_reference_or_import(&mut self, node: Node) -> Vec<TypeId> {
         let t = self.get_type_from_type_node(node);
         if !self.is_error_type(t) {
@@ -679,7 +679,7 @@ impl Checker {
         Vec::new()
     }
 
-    // Go: checker/checker.go:17105 getTypeParametersForTypeAndSymbol
+    // Go: checker/checker.go:17518 getTypeParametersForTypeAndSymbol
     pub fn get_type_parameters_for_type_and_symbol(
         &mut self,
         t: TypeId,
@@ -704,7 +704,7 @@ impl Checker {
         Vec::new()
     }
 
-    // Go: checker/checker.go:17119 getEffectiveTypeArgumentAtIndex
+    // Go: checker/checker.go:17532 getEffectiveTypeArgumentAtIndex
     pub fn get_effective_type_argument_at_index(
         &mut self,
         node: Node,
@@ -718,7 +718,7 @@ impl Checker {
         self.get_effective_type_arguments(node, type_parameters)[index as usize]
     }
 
-    // Go: checker/checker.go:17127 getConstraintOfIndexedAccess
+    // Go: checker/checker.go:17540 getConstraintOfIndexedAccess
     pub fn get_constraint_of_indexed_access(&mut self, t: TypeId) -> TypeId {
         if self.has_non_circular_base_constraint(t) {
             return self.get_constraint_from_indexed_access(t);
@@ -726,7 +726,7 @@ impl Checker {
         TypeId::NIL
     }
 
-    // Go: checker/checker.go:17134 getConstraintFromIndexedAccess
+    // Go: checker/checker.go:17547 getConstraintFromIndexedAccess
     pub fn get_constraint_from_indexed_access(&mut self, t: TypeId) -> TypeId {
         let (object_type, index_type, access_flags) = {
             let d = self.ty(t).as_indexed_access_type();
@@ -763,7 +763,7 @@ impl Checker {
         TypeId::NIL
     }
 
-    // Go: checker/checker.go:17155 getConstraintOfConditionalType
+    // Go: checker/checker.go:17568 getConstraintOfConditionalType
     pub fn get_constraint_of_conditional_type(&mut self, t: TypeId) -> TypeId {
         if self.has_non_circular_base_constraint(t) {
             return self.get_constraint_from_conditional_type(t);
@@ -771,7 +771,7 @@ impl Checker {
         TypeId::NIL
     }
 
-    // Go: checker/checker.go:17162 getConstraintFromConditionalType
+    // Go: checker/checker.go:17575 getConstraintFromConditionalType
     pub fn get_constraint_from_conditional_type(&mut self, t: TypeId) -> TypeId {
         let constraint = self.get_constraint_of_distributive_conditional_type(t);
         if constraint.is_some() {
@@ -780,7 +780,7 @@ impl Checker {
         self.get_default_constraint_of_conditional_type(t)
     }
 
-    // Go: checker/checker.go:17170 getDefaultConstraintOfConditionalType
+    // Go: checker/checker.go:17583 getDefaultConstraintOfConditionalType
     pub fn get_default_constraint_of_conditional_type(&mut self, t: TypeId) -> TypeId {
         if self
             .ty(t)
@@ -808,7 +808,7 @@ impl Checker {
         self.ty(t).as_conditional_type().resolved_default_constraint
     }
 
-    // Go: checker/checker.go:17191 getConstraintOfDistributiveConditionalType
+    // Go: checker/checker.go:17604 getConstraintOfDistributiveConditionalType
     pub fn get_constraint_of_distributive_conditional_type(&mut self, t: TypeId) -> TypeId {
         if self
             .ty(t)
@@ -880,7 +880,7 @@ impl Checker {
         TypeId::NIL
     }
 
-    // Go: checker/checker.go:17227 getDeclaredTypeOfClassOrInterface
+    // Go: checker/checker.go:17639 getDeclaredTypeOfClassOrInterface
     pub fn get_declared_type_of_class_or_interface(&mut self, symbol: SymbolId) -> TypeId {
         if self.declared_type_links.get(symbol).declared_type.is_nil() {
             let kind = if self.sym(symbol).flags.intersects(SymbolFlags::CLASS) {
@@ -937,7 +937,7 @@ impl Checker {
      * to "this" in its body, if all base types are interfaces,
      * and if none of the base interfaces have a "this" type.
      */
-    // Go: checker/checker.go:17263 isThislessInterface
+    // Go: checker/checker.go:17676 isThislessInterface
     pub fn is_thisless_interface(&mut self, symbol: SymbolId) -> bool {
         let declarations = self.sym(symbol).declarations.clone();
         for &declaration in declarations.iter() {
@@ -976,7 +976,7 @@ impl Checker {
     }
 }
 
-// Go: checker/checker.go:17307 CacheHashKey
+// Go: checker/checker.go:17697 CacheHashKey
 // PORT: Go `CacheHashKey` is an `xxh3.Uint128` (`{Hi, Lo uint64}`). It is
 // 4-byte aligned so cache entries with a 4-byte value take 20 bytes, not 24.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
@@ -997,7 +997,7 @@ impl std::hash::Hash for CacheHashKey {
 }
 
 impl CacheHashKey {
-    // Go: checker/checker.go:17309 CacheHashKey.IsZero
+    // Go: checker/checker.go:17699 CacheHashKey.IsZero
     pub fn is_zero(&self) -> bool {
         self.hi == 0 && self.lo == 0
     }
@@ -1271,7 +1271,7 @@ fn xxh3_hash128(p: &[u8]) -> (u64, u64) {
     (xxh3_avalanche(hi), xxh3_avalanche(lo))
 }
 
-// Go: checker/checker.go:17438 keyBuilder
+// Go: checker/checker.go:17703 keyBuilder
 // PORT: Go hashes with `xxh3.Hash128`. The crate has no xxh3 dependency and
 // the contract forbids new ones, so `xxh3_hash128` in this file is a hand
 // port of `zeebo/xxh3` `Hash128` (seed 0). A Go nil `overflowBuffer` is an
@@ -1307,7 +1307,7 @@ impl std::fmt::Debug for KeyBuilder {
 }
 
 impl KeyBuilder {
-    // Go: checker/checker.go:17444 keyBuilder.hash
+    // Go: checker/checker.go:17709 keyBuilder.hash
     pub fn hash(&self) -> CacheHashKey {
         let (hi, lo) = if self.overflow_buffer.is_empty() {
             xxh3_hash128(&self.inline_buffer[..self.inline_length])
@@ -1319,7 +1319,7 @@ impl KeyBuilder {
         CacheHashKey { hi, lo }
     }
 
-    // Go: checker/checker.go:17451 keyBuilder.spill
+    // Go: checker/checker.go:17718 keyBuilder.spill
     // spill moves the buffered bytes onto the end of overflowBuffer, so the key's byte
     // stream stays overflowBuffer followed by inlineBuffer.
     #[cold]
@@ -1330,7 +1330,7 @@ impl KeyBuilder {
         self.inline_length = 0;
     }
 
-    // Go: checker/checker.go:17458 keyBuilder.writeByte
+    // Go: checker/checker.go:17723 keyBuilder.writeByte
     #[inline]
     pub fn write_byte(&mut self, c: u8) {
         if self.inline_length == self.inline_buffer.len() {
@@ -1340,7 +1340,7 @@ impl KeyBuilder {
         self.inline_length += 1;
     }
 
-    // Go: checker/checker.go:17466 keyBuilder.writeString
+    // Go: checker/checker.go:17731 keyBuilder.writeString
     pub fn write_string(&mut self, s: &str) {
         if self.inline_length + s.len() > self.inline_buffer.len() {
             self.spill();
@@ -1354,7 +1354,7 @@ impl KeyBuilder {
         self.inline_length += s.len();
     }
 
-    // Go: checker/checker.go:17477 keyBuilder.writeUint32
+    // Go: checker/checker.go:17742 keyBuilder.writeUint32
     #[inline]
     pub fn write_uint32(&mut self, v: u32) {
         if self.inline_length + 4 > self.inline_buffer.len() {
@@ -1365,7 +1365,7 @@ impl KeyBuilder {
         self.inline_length += 4;
     }
 
-    // Go: checker/checker.go:17485 keyBuilder.writeUint64
+    // Go: checker/checker.go:17750 keyBuilder.writeUint64
     #[inline]
     pub fn write_uint64(&mut self, v: u64) {
         if self.inline_length + 8 > self.inline_buffer.len() {
@@ -1376,25 +1376,25 @@ impl KeyBuilder {
         self.inline_length += 8;
     }
 
-    // Go: checker/checker.go:17493 keyBuilder.writeInt
+    // Go: checker/checker.go:17758 keyBuilder.writeInt
     pub fn write_int(&mut self, value: i32) {
         self.write_uint64(value as i64 as u64);
     }
 
-    // Go: checker/checker.go:17497 keyBuilder.writeSymbol
+    // Go: checker/checker.go:17762 keyBuilder.writeSymbol
     // PORT: `ast.GetSymbolId` takes the symbol arena per the contract.
     pub fn write_symbol(&mut self, symbols: &SymbolArena, s: SymbolId) {
         self.write_uint64(get_symbol_id(symbols, s));
     }
 
-    // Go: checker/checker.go:17501 keyBuilder.writeType
+    // Go: checker/checker.go:17766 keyBuilder.writeType
     // PORT: Go writes `t.id`; the handle value is the type id.
     #[inline]
     pub fn write_type(&mut self, t: TypeId) {
         self.write_uint32(t.0);
     }
 
-    // Go: checker/checker.go:17505 keyBuilder.writeTypes
+    // Go: checker/checker.go:17770 keyBuilder.writeTypes
     // PERF: when the whole list fits in the inline buffer, it is written with
     // one room test. The bytes are the same as `write_int(len)` and then
     // `write_type` for each type.
@@ -1421,7 +1421,7 @@ impl KeyBuilder {
         self.inline_length = len + size;
     }
 
-    // Go: checker/checker.go:17348 keyBuilder.writeAlias
+    // Go: checker/checker.go:17777 keyBuilder.writeAlias
     pub fn write_alias(&mut self, symbols: &SymbolArena, alias: Option<&TypeAlias>) {
         if let Some(alias) = alias {
             self.write_byte(1);
@@ -1432,7 +1432,7 @@ impl KeyBuilder {
         }
     }
 
-    // Go: checker/checker.go:17358 keyBuilder.writeGenericTypeReferences
+    // Go: checker/checker.go:17787 keyBuilder.writeGenericTypeReferences
     // PORT: Go reaches the checker through `t.checker`; it is passed in.
     pub fn write_generic_type_references(
         &mut self,
@@ -1514,13 +1514,13 @@ impl KeyBuilder {
         }
     }
 
-    // Go: checker/checker.go:17393 keyBuilder.writeNodeId
+    // Go: checker/checker.go:17822 keyBuilder.writeNodeId
     // PORT: Go `ast.NodeId` is a `uint64` (`get_node_id` returns `u64`).
     pub fn write_node_id(&mut self, id: u64) {
         self.write_uint64(id);
     }
 
-    // Go: checker/checker.go:17397 keyBuilder.writeNode
+    // Go: checker/checker.go:17826 keyBuilder.writeNode
     pub fn write_node(&mut self, node: Node) {
         if node.is_some() {
             self.write_node_id(get_node_id(node));
@@ -1638,7 +1638,7 @@ impl ShortKey {
 // Each also has a `Checker` method with the same name and Go parameters
 // (supplying `&self.symbols`), so callers can use either form.
 
-// Go: checker/checker.go:17403 getTypeListKey
+// Go: checker/checker.go:17832 getTypeListKey
 // PERF: a list of 1 or 2 types is a 12 or 16 byte key (the count as 8 bytes,
 // then 4 bytes for each type). It is built in a stack array and hashed with
 // no `KeyBuilder`. Same bytes, so the same key.
@@ -1670,14 +1670,14 @@ fn type_list_key_with_builder(types: &[TypeId]) -> CacheHashKey {
     b.hash()
 }
 
-// Go: checker/checker.go:17409 getAliasKey
+// Go: checker/checker.go:17838 getAliasKey
 pub fn get_alias_key(symbols: &SymbolArena, alias: Option<&TypeAlias>) -> CacheHashKey {
     let mut b = KeyBuilder::default();
     b.write_alias(symbols, alias);
     b.hash()
 }
 
-// Go: checker/checker.go:17439 getIntersectionKey
+// Go: checker/checker.go:17868 getIntersectionKey
 // PERF: built in a `ShortKey` when the whole key fits in it, else through
 // `keyBuilder`. Same bytes, so the same key.
 pub fn get_intersection_key(
@@ -1728,7 +1728,7 @@ fn intersection_key_with_builder(
     b.hash()
 }
 
-// Go: checker/checker.go:17450 getTupleKey
+// Go: checker/checker.go:17879 getTupleKey
 pub fn get_tuple_key(element_infos: &[TupleElementInfo], readonly: bool) -> CacheHashKey {
     let mut b = KeyBuilder::default();
     for e in element_infos {
@@ -1751,7 +1751,7 @@ pub fn get_tuple_key(element_infos: &[TupleElementInfo], readonly: bool) -> Cach
     b.hash()
 }
 
-// Go: checker/checker.go:17473 getTypeAliasInstantiationKey
+// Go: checker/checker.go:17902 getTypeAliasInstantiationKey
 pub fn get_type_alias_instantiation_key(
     symbols: &SymbolArena,
     type_arguments: &[TypeId],
@@ -1760,7 +1760,7 @@ pub fn get_type_alias_instantiation_key(
     get_type_instantiation_key(symbols, type_arguments, alias, false)
 }
 
-// Go: checker/checker.go:17477 getTypeInstantiationKey
+// Go: checker/checker.go:17906 getTypeInstantiationKey
 pub fn get_type_instantiation_key(
     symbols: &SymbolArena,
     type_arguments: &[TypeId],
@@ -1828,7 +1828,7 @@ fn type_instantiation_key_with_builder(
     b.hash()
 }
 
-// Go: checker/checker.go:17487 getIndexedAccessKey
+// Go: checker/checker.go:17916 getIndexedAccessKey
 pub fn get_indexed_access_key(
     symbols: &SymbolArena,
     object_type: TypeId,
@@ -1844,7 +1844,7 @@ pub fn get_indexed_access_key(
     b.hash()
 }
 
-// Go: checker/checker.go:17496 getTemplateTypeKey
+// Go: checker/checker.go:17925 getTemplateTypeKey
 pub fn get_template_type_key(texts: &[String], types: &[TypeId]) -> CacheHashKey {
     let mut b = KeyBuilder::default();
     b.write_types(types);
@@ -1859,7 +1859,7 @@ pub fn get_template_type_key(texts: &[String], types: &[TypeId]) -> CacheHashKey
     b.hash()
 }
 
-// Go: checker/checker.go:17510 getConditionalTypeKey
+// Go: checker/checker.go:17939 getConditionalTypeKey
 pub fn get_conditional_type_key(
     symbols: &SymbolArena,
     type_arguments: &[TypeId],
@@ -1874,7 +1874,7 @@ pub fn get_conditional_type_key(
     )
 }
 
-// Go: checker/checker.go:17538 getNodeListKey
+// Go: checker/checker.go:17967 getNodeListKey
 pub fn get_node_list_key(nodes: &[Node]) -> CacheHashKey {
     let mut b = KeyBuilder::default();
     b.write_int(nodes.len() as i32);
@@ -1885,17 +1885,17 @@ pub fn get_node_list_key(nodes: &[Node]) -> CacheHashKey {
 }
 
 impl Checker {
-    // Go: checker/checker.go:17403 getTypeListKey
+    // Go: checker/checker.go:17832 getTypeListKey
     pub fn get_type_list_key(&self, types: &[TypeId]) -> CacheHashKey {
         get_type_list_key(types)
     }
 
-    // Go: checker/checker.go:17409 getAliasKey
+    // Go: checker/checker.go:17838 getAliasKey
     pub fn get_alias_key(&self, alias: Option<&TypeAlias>) -> CacheHashKey {
         get_alias_key(&self.symbols, alias)
     }
 
-    // Go: checker/checker.go:17415 getUnionKey
+    // Go: checker/checker.go:17844 getUnionKey
     pub fn get_union_key(
         &self,
         types: &[TypeId],
@@ -1927,7 +1927,7 @@ impl Checker {
         b.hash()
     }
 
-    // Go: checker/checker.go:17439 getIntersectionKey
+    // Go: checker/checker.go:17868 getIntersectionKey
     pub fn get_intersection_key(
         &self,
         types: &[TypeId],
@@ -1937,7 +1937,7 @@ impl Checker {
         get_intersection_key(&self.symbols, types, flags, alias)
     }
 
-    // Go: checker/checker.go:17450 getTupleKey
+    // Go: checker/checker.go:17879 getTupleKey
     pub fn get_tuple_key(
         &self,
         element_infos: &[TupleElementInfo],
@@ -1946,7 +1946,7 @@ impl Checker {
         get_tuple_key(element_infos, readonly)
     }
 
-    // Go: checker/checker.go:17473 getTypeAliasInstantiationKey
+    // Go: checker/checker.go:17902 getTypeAliasInstantiationKey
     pub fn get_type_alias_instantiation_key(
         &self,
         type_arguments: &[TypeId],
@@ -1955,7 +1955,7 @@ impl Checker {
         get_type_alias_instantiation_key(&self.symbols, type_arguments, alias)
     }
 
-    // Go: checker/checker.go:17477 getTypeInstantiationKey
+    // Go: checker/checker.go:17906 getTypeInstantiationKey
     pub fn get_type_instantiation_key(
         &self,
         type_arguments: &[TypeId],
@@ -1965,7 +1965,7 @@ impl Checker {
         get_type_instantiation_key(&self.symbols, type_arguments, alias, single_signature)
     }
 
-    // Go: checker/checker.go:17487 getIndexedAccessKey
+    // Go: checker/checker.go:17916 getIndexedAccessKey
     pub fn get_indexed_access_key(
         &self,
         object_type: TypeId,
@@ -1976,12 +1976,12 @@ impl Checker {
         get_indexed_access_key(&self.symbols, object_type, index_type, access_flags, alias)
     }
 
-    // Go: checker/checker.go:17496 getTemplateTypeKey
+    // Go: checker/checker.go:17925 getTemplateTypeKey
     pub fn get_template_type_key(&self, texts: &[String], types: &[TypeId]) -> CacheHashKey {
         get_template_type_key(texts, types)
     }
 
-    // Go: checker/checker.go:17510 getConditionalTypeKey
+    // Go: checker/checker.go:17939 getConditionalTypeKey
     pub fn get_conditional_type_key(
         &self,
         type_arguments: &[TypeId],
@@ -1991,7 +1991,7 @@ impl Checker {
         get_conditional_type_key(&self.symbols, type_arguments, alias, for_constraint)
     }
 
-    // Go: checker/checker.go:17520 getRelationKey
+    // Go: checker/checker.go:17949 getRelationKey
     // PORT: perf. A plain key is returned as its key bytes, not hashed (see
     // `RelationKey`).
     #[inline]
@@ -2043,12 +2043,12 @@ impl Checker {
         (RelationKey::Generic(b.hash()), constrained)
     }
 
-    // Go: checker/checker.go:17538 getNodeListKey
+    // Go: checker/checker.go:17967 getNodeListKey
     pub fn get_node_list_key(&self, nodes: &[Node]) -> CacheHashKey {
         get_node_list_key(nodes)
     }
 
-    // Go: checker/checker.go:17547 isTypeReferenceWithGenericArguments
+    // Go: checker/checker.go:17976 isTypeReferenceWithGenericArguments
     pub fn is_type_reference_with_generic_arguments(&mut self, t: TypeId) -> bool {
         if !self.is_non_deferred_type_reference(t) {
             return false;
@@ -2107,14 +2107,14 @@ impl Checker {
         false
     }
 
-    // Go: checker/checker.go:17553 isNonDeferredTypeReference
+    // Go: checker/checker.go:17982 isNonDeferredTypeReference
     pub fn is_non_deferred_type_reference(&self, t: TypeId) -> bool {
         self.ty(t).object_flags.intersects(ObjectFlags::REFERENCE)
             && self.ty(t).as_type_reference().node.is_nil()
     }
 
     // Return true if type parameter originates in an unconstrained declaration in a type parameter list
-    // Go: checker/checker.go:17558 isUnconstrainedTypeParameter
+    // Go: checker/checker.go:17987 isUnconstrainedTypeParameter
     pub fn is_unconstrained_type_parameter(&self, tp: TypeId) -> bool {
         let mut target = self.ty(tp).target();
         if target.is_nil() {
@@ -2136,7 +2136,7 @@ impl Checker {
         true
     }
 
-    // Go: checker/checker.go:17574 isNullOrUndefined
+    // Go: checker/checker.go:18003 isNullOrUndefined
     pub fn is_null_or_undefined(&mut self, node: Node) -> bool {
         let expr = skip_parentheses(node);
         match expr.kind() {
@@ -2146,7 +2146,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:17585 checkRightHandSideOfForOf
+    // Go: checker/checker.go:18014 checkRightHandSideOfForOf
     pub fn check_right_hand_side_of_for_of(&mut self, statement: Node) -> TypeId {
         let use_ = if statement.await_modifier().is_some() {
             IterationUse::FOR_AWAIT_OF
@@ -2164,7 +2164,7 @@ impl Checker {
     }
 
     // Return the inferred type for a binding element
-    // Go: checker/checker.go:17591 getTypeForBindingElement
+    // Go: checker/checker.go:18020 getTypeForBindingElement
     pub fn get_type_for_binding_element(&mut self, declaration: Node) -> TypeId {
         let check_mode = if has_dot_dot_dot_token(declaration) {
             CheckMode::REST_BINDING_ELEMENT
@@ -2185,7 +2185,7 @@ impl Checker {
 
     // Return the type of a binding element parent. We check SymbolLinks first to see if a type has been
     // assigned by contextual typing.
-    // Go: checker/checker.go:17602 getTypeForBindingElementParent
+    // Go: checker/checker.go:18031 getTypeForBindingElementParent
     pub fn get_type_for_binding_element_parent(
         &mut self,
         node: Node,

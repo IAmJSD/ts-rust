@@ -17,6 +17,7 @@
 //! checker pool of each version, by program id.
 
 use crate::execute::tsc::compile::CompileTimes;
+use crate::frontend::parser::ExternalModuleIndicatorOptions;
 use crate::frontend::tspath;
 use crate::gostd::{Context, context};
 use crate::prelude::*;
@@ -182,6 +183,10 @@ pub struct SourceFileInfo {
     pub jsdoc_diagnostics: KeptData<[Diagnostic]>,
     /// True when a JSDoc cache miss means "not parsed" (Go parses lazily).
     pub has_lazy_js_doc: bool,
+    /// Go `ParseOptions().ExternalModuleIndicatorOptions`. With the name,
+    /// path and script kind, the parse options that a lazy JSDoc parse
+    /// reads (`resolve_lazy_js_doc`).
+    external_module_indicator_options: ExternalModuleIndicatorOptions,
     late: OnceLock<LateSourceFileInfo>,
 }
 
@@ -2128,17 +2133,13 @@ fn get_emit_syntax_for_usage_location_worker(
 // case here.
 // ---------------------------------------------------------------------------
 
-/// Lazy JSDoc of `node` in `file` (Go `SourceFile.resolveJSDoc`).
-// PORT: the files of an alias resolver program are in no program, or in
-// another program version; `go_frontend` keeps their parser inputs. So
-// does a read with no current program: the api encodes a leased source
-// file (api/session.go encodeLeasedSourceFile, ts#64434) outside any
-// program, and Go's `SourceFile` resolves its JSDoc by itself.
-pub fn resolve_lazy_js_doc(file: Node, node: Node) -> Option<&'static [Node]> {
-    if crate::core::try_prog().is_none() || state().alias_resolver {
-        return go_frontend::resolve_js_doc_outside_program(file, node);
-    }
-    Some(with_go(|go| go.resolve_js_doc(file, node)))
+/// Lazy JSDoc of `node` in `file`, whose info is `info` (Go
+/// `SourceFile.resolveJSDoc`). It needs no program: like Go's
+/// `SourceFile`, the file has its parser inputs. The api, for example,
+/// encodes a leased source file (api/session.go encodeLeasedSourceFile,
+/// ts#64434) outside any program.
+pub fn resolve_lazy_js_doc(file: Node, info: &SourceFileInfo, node: Node) -> &'static [Node] {
+    go_frontend::resolve_lazy_js_doc(file, info, node)
 }
 
 // Go: compiler/program.go:122 FileExists

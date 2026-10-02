@@ -8,27 +8,27 @@ use crate::prelude::*;
 
 // PORT: the Go flag types `SignatureCheckMode`, `MinArgumentCountFlags`,
 // `IntersectionState`, `RecursionFlags`, `ExpandingFlags` and
-// `RelationComparisonResult` (relater.go:18-76) live in `crate::flags`.
+// `RelationComparisonResult` (relater.go:18-75) live in `crate::flags`.
 // PORT: Go `*Relation` is `Rc<RefCell<Relation>>`; a `*Relation` param is
 // `&Rc<RefCell<Relation>>`. Go pointer equality on relations is `Rc::ptr_eq`.
 // PORT: Go `diagnosticOutput *[]*ast.Diagnostic` is `Option<&mut Vec<Diagnostic>>`.
 // PORT: a nullable Go `*diagnostics.Message` is `Option<&'static Message>`.
 
-// Go: checker/relater.go:78 DiagnosticAndArguments
+// Go: checker/relater.go:77 DiagnosticAndArguments
 #[derive(Clone, Debug)]
 pub struct DiagnosticAndArguments {
     pub message: &'static Message,
     pub arguments: Vec<String>,
 }
 
-// Go: checker/relater.go:83 ErrorOutputContainer
+// Go: checker/relater.go:82 ErrorOutputContainer
 #[derive(Clone, Debug, Default)]
 pub struct ErrorOutputContainer {
     pub errors: Vec<Diagnostic>,
     pub skip_logging: bool,
 }
 
-// Go: checker/relater.go:88 ErrorReporter
+// Go: checker/relater.go:87 ErrorReporter
 // PORT: Go `ErrorReporter func(message *diagnostics.Message, args ...any)`.
 // A nil-able `ErrorReporter` param is `Option<ErrorReporter<'_>>`. The
 // callback gets the checker as its first argument (Go closures capture it).
@@ -50,7 +50,7 @@ pub fn reborrow_error_reporter<'s>(
     }
 }
 
-// Go: checker/relater.go:90 RecursionId
+// Go: checker/relater.go:89 RecursionId
 // PORT: Go `RecursionId{value any}` holds one of `*ast.Node`, `*ast.Symbol`
 // or `*Type`. Go interface equality compares the dynamic type and pointer,
 // which this enum reproduces.
@@ -85,7 +85,7 @@ impl From<TypeId> for RecursionId {
     }
 }
 
-// Go: checker/relater.go:95 asRecursionId
+// Go: checker/relater.go:94 asRecursionId
 // This function exists to constrain the types of values that can be used as recursion IDs.
 pub fn as_recursion_id<T: Into<RecursionId>>(value: T) -> RecursionId {
     value.into()
@@ -309,7 +309,7 @@ impl PlainResultTable {
     }
 }
 
-// Go: checker/relater.go:99 Relation
+// Go: checker/relater.go:98 Relation
 // PORT: Go has one map of xxh3 keys. Here plain keys are in `plain` (or in
 // `plain_wide` when they do not pack) and generic keys in `generic` (see
 // `RelationKey`). There is no iteration, so this cannot change any output.
@@ -322,7 +322,7 @@ pub struct Relation {
 }
 
 impl Relation {
-    // Go: checker/relater.go:103 Relation.get
+    // Go: checker/relater.go:102 Relation.get
     #[inline]
     pub fn get(&self, key: RelationKey) -> RelationComparisonResult {
         match key {
@@ -334,7 +334,7 @@ impl Relation {
         }
     }
 
-    // Go: checker/relater.go:107 Relation.set
+    // Go: checker/relater.go:106 Relation.set
     #[inline]
     pub fn set(&mut self, key: RelationKey, result: RelationComparisonResult) {
         match key {
@@ -350,7 +350,7 @@ impl Relation {
         }
     }
 
-    // Go: checker/relater.go:114 Relation.size
+    // Go: checker/relater.go:113 Relation.size
     pub fn size(&self) -> i32 {
         (self.plain.used + self.plain_wide.len() + self.generic.len()) as i32
     }
@@ -402,12 +402,12 @@ impl Checker {
 }
 
 impl Checker {
-    // Go: checker/relater.go:118 isTypeIdenticalTo
+    // Go: checker/relater.go:117 isTypeIdenticalTo
     pub fn is_type_identical_to(&mut self, source: TypeId, target: TypeId) -> bool {
         self.is_type_related_to_kind(source, target, RelationKind::Identity)
     }
 
-    // Go: checker/relater.go:122 compareTypesIdentical
+    // Go: checker/relater.go:121 compareTypesIdentical
     pub fn compare_types_identical(&mut self, source: TypeId, target: TypeId) -> Ternary {
         if self.is_type_related_to_kind(source, target, RelationKind::Identity) {
             return Ternary::TRUE;
@@ -415,7 +415,7 @@ impl Checker {
         Ternary::FALSE
     }
 
-    // Go: checker/relater.go:129 compareTypesAssignableSimple
+    // Go: checker/relater.go:128 compareTypesAssignableSimple
     pub fn compare_types_assignable_simple(&mut self, source: TypeId, target: TypeId) -> Ternary {
         if self.is_type_related_to_kind(source, target, RelationKind::Assignable) {
             return Ternary::TRUE;
@@ -423,7 +423,7 @@ impl Checker {
         Ternary::FALSE
     }
 
-    // Go: checker/relater.go:136 compareTypesAssignableWorker
+    // Go: checker/relater.go:135 compareTypesAssignableWorker
     pub fn compare_types_assignable_worker(
         &mut self,
         source: TypeId,
@@ -436,7 +436,7 @@ impl Checker {
         Ternary::FALSE
     }
 
-    // Go: checker/relater.go:143 compareTypesSubtypeOf
+    // Go: checker/relater.go:142 compareTypesSubtypeOf
     pub fn compare_types_subtype_of(&mut self, source: TypeId, target: TypeId) -> Ternary {
         if self.is_type_related_to_kind(source, target, RelationKind::Subtype) {
             return Ternary::TRUE;
@@ -444,32 +444,32 @@ impl Checker {
         Ternary::FALSE
     }
 
-    // Go: checker/relater.go:150 isTypeAssignableTo
+    // Go: checker/relater.go:149 isTypeAssignableTo
     pub fn is_type_assignable_to(&mut self, source: TypeId, target: TypeId) -> bool {
         self.is_type_related_to_kind(source, target, RelationKind::Assignable)
     }
 
-    // Go: checker/relater.go:154 isTypeSubtypeOf
+    // Go: checker/relater.go:153 isTypeSubtypeOf
     pub fn is_type_subtype_of(&mut self, source: TypeId, target: TypeId) -> bool {
         self.is_type_related_to_kind(source, target, RelationKind::Subtype)
     }
 
-    // Go: checker/relater.go:158 isTypeStrictSubtypeOf
+    // Go: checker/relater.go:157 isTypeStrictSubtypeOf
     pub fn is_type_strict_subtype_of(&mut self, source: TypeId, target: TypeId) -> bool {
         self.is_type_related_to_kind(source, target, RelationKind::StrictSubtype)
     }
 
-    // Go: checker/relater.go:162 isTypeComparableTo
+    // Go: checker/relater.go:161 isTypeComparableTo
     pub fn is_type_comparable_to(&mut self, source: TypeId, target: TypeId) -> bool {
         self.is_type_related_to_kind(source, target, RelationKind::Comparable)
     }
 
-    // Go: checker/relater.go:166 areTypesComparable
+    // Go: checker/relater.go:165 areTypesComparable
     pub fn are_types_comparable(&mut self, type1: TypeId, type2: TypeId) -> bool {
         self.is_type_comparable_to(type1, type2) || self.is_type_comparable_to(type2, type1)
     }
 
-    // Go: checker/relater.go:170 isTypeRelatedTo
+    // Go: checker/relater.go:169 isTypeRelatedTo
     #[inline]
     pub fn is_type_related_to(
         &mut self,
@@ -732,7 +732,7 @@ impl Checker {
         false
     }
 
-    // Go: checker/relater.go:274 isEnumTypeRelatedTo
+    // Go: checker/relater.go:281 isEnumTypeRelatedTo
     pub fn is_enum_type_related_to(
         &mut self,
         source: SymbolId,
@@ -877,7 +877,7 @@ impl Checker {
         true
     }
 
-    // Go: checker/relater.go:333 checkTypeAssignableTo
+    // Go: checker/relater.go:339 checkTypeAssignableTo
     pub fn check_type_assignable_to(
         &mut self,
         source: TypeId,
@@ -889,7 +889,7 @@ impl Checker {
         self.check_type_related_to_ex(source, target, &relation, error_node, head_message, None)
     }
 
-    // Go: checker/relater.go:337 checkTypeAssignableToEx
+    // Go: checker/relater.go:343 checkTypeAssignableToEx
     pub fn check_type_assignable_to_ex(
         &mut self,
         source: TypeId,
@@ -909,7 +909,7 @@ impl Checker {
         )
     }
 
-    // Go: checker/relater.go:341 checkTypeComparableTo
+    // Go: checker/relater.go:347 checkTypeComparableTo
     pub fn check_type_comparable_to(
         &mut self,
         source: TypeId,
@@ -921,7 +921,7 @@ impl Checker {
         self.check_type_related_to_ex(source, target, &relation, error_node, head_message, None)
     }
 
-    // Go: checker/relater.go:345 checkTypeRelatedTo
+    // Go: checker/relater.go:351 checkTypeRelatedTo
     pub fn check_type_related_to(
         &mut self,
         source: TypeId,
@@ -932,7 +932,7 @@ impl Checker {
         self.check_type_related_to_ex(source, target, relation, error_node, None, None)
     }
 
-    // Go: checker/relater.go:352 checkTypeRelatedToEx
+    // Go: checker/relater.go:358 checkTypeRelatedToEx
     // Check that source is related to target according to the given relation. When errorNode is non-nil, errors are
     // reported to the checker's diagnostic collection or through diagnosticOutput when non-nil. Callers can assume that
     // this function only reports zero or one error to diagnosticOutput (unlike checkTypeRelatedToAndOptionallyElaborate).
@@ -1061,7 +1061,7 @@ impl Checker {
     }
 }
 
-// Go: checker/relater.go:402 createDiagnosticChainFromErrorChain
+// Go: checker/relater.go:400 createDiagnosticChainFromErrorChain
 // PORT: Go `*ErrorChain` is read through `Option<&ErrorChain>`; callers pass
 // `relater.error_chain.as_deref()`. A nil result is `None`.
 pub fn create_diagnostic_chain_from_error_chain(
@@ -1095,7 +1095,7 @@ pub fn create_diagnostic_chain_from_error_chain(
 }
 
 impl Checker {
-    // Go: checker/relater.go:416 reportDiagnostic
+    // Go: checker/relater.go:414 reportDiagnostic
     // PORT: Go takes a nil-able `*ast.Diagnostic`; every Go caller except
     // `checkTypeRelatedToEx` passes a non-nil value, so this takes an owned
     // `Diagnostic` and that caller checks for nil itself.
@@ -1111,7 +1111,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/relater.go:426 checkTypeAssignableToAndOptionallyElaborate
+    // Go: checker/relater.go:424 checkTypeAssignableToAndOptionallyElaborate
     pub fn check_type_assignable_to_and_optionally_elaborate(
         &mut self,
         source: TypeId,
@@ -1133,7 +1133,7 @@ impl Checker {
         )
     }
 
-    // Go: checker/relater.go:430 checkTypeRelatedToAndOptionallyElaborate
+    // Go: checker/relater.go:428 checkTypeRelatedToAndOptionallyElaborate
     pub fn check_type_related_to_and_optionally_elaborate(
         &mut self,
         source: TypeId,
@@ -1169,7 +1169,7 @@ impl Checker {
         false
     }
 
-    // Go: checker/relater.go:440 elaborateError
+    // Go: checker/relater.go:438 elaborateError
     pub fn elaborate_error(
         &mut self,
         node: Node,
@@ -1274,7 +1274,7 @@ impl Checker {
         false
     }
 
-    // Go: checker/relater.go:475 isOrHasGenericConditional
+    // Go: checker/relater.go:474 isOrHasGenericConditional
     pub fn is_or_has_generic_conditional(&self, t: TypeId) -> bool {
         self.ty(t).flags.intersects(TypeFlags::CONDITIONAL)
             || (self.ty(t).flags.intersects(TypeFlags::INTERSECTION)
@@ -1285,7 +1285,7 @@ impl Checker {
                     .any(|&t| self.is_or_has_generic_conditional(t)))
     }
 
-    // Go: checker/relater.go:479 elaborateDidYouMeanToCallOrConstruct
+    // Go: checker/relater.go:478 elaborateDidYouMeanToCallOrConstruct
     pub fn elaborate_did_you_mean_to_call_or_construct(
         &mut self,
         node: Node,
@@ -1342,7 +1342,7 @@ impl Checker {
         false
     }
 
-    // Go: checker/relater.go:497 elaborateObjectLiteral
+    // Go: checker/relater.go:496 elaborateObjectLiteral
     pub fn elaborate_object_literal(
         &mut self,
         node: Node,
@@ -1650,7 +1650,7 @@ impl Checker {
         true
     }
 
-    // Go: checker/relater.go:620 getBestMatchIndexedAccessTypeOrUndefined
+    // Go: checker/relater.go:618 getBestMatchIndexedAccessTypeOrUndefined
     pub fn get_best_match_indexed_access_type_or_undefined(
         &mut self,
         source: TypeId,
@@ -1688,7 +1688,7 @@ impl Checker {
         TypeId::NIL
     }
 
-    // Go: checker/relater.go:634 checkExpressionForMutableLocationWithContextualType
+    // Go: checker/relater.go:632 checkExpressionForMutableLocationWithContextualType
     pub fn check_expression_for_mutable_location_with_contextual_type(
         &mut self,
         next: Node,
@@ -1700,7 +1700,7 @@ impl Checker {
         result
     }
 
-    // Go: checker/relater.go:641 elaborateArrowFunction
+    // Go: checker/relater.go:639 elaborateArrowFunction
     pub fn elaborate_arrow_function(
         &mut self,
         node: Node,
@@ -1793,7 +1793,7 @@ impl Checker {
         false
     }
 
-    // Go: checker/relater.go:682 isWeakType
+    // Go: checker/relater.go:679 isWeakType
     // A type is 'weak' if it is an object type with at least one optional property
     // and no required properties, call/construct signatures or index signatures
     pub fn is_weak_type(&mut self, t: TypeId) -> bool {
@@ -1824,7 +1824,7 @@ impl Checker {
         false
     }
 
-    // Go: checker/relater.go:698 hasCommonProperties
+    // Go: checker/relater.go:695 hasCommonProperties
     pub fn has_common_properties(
         &mut self,
         source: TypeId,
@@ -1840,7 +1840,7 @@ impl Checker {
         false
     }
 
-    // Go: checker/relater.go:720 isKnownProperty
+    // Go: checker/relater.go:717 isKnownProperty
     /**
      * Check if a property with the given name is known anywhere in the given type. In an object type, a property
      * is considered known if
@@ -1905,7 +1905,7 @@ impl Checker {
         false
     }
 
-    // Go: checker/relater.go:754 isExcessPropertyCheckTarget
+    // Go: checker/relater.go:747 isExcessPropertyCheckTarget
     pub fn is_excess_property_check_target(&self, t: TypeId) -> bool {
         let ty = self.ty(t);
         ty.flags.intersects(TypeFlags::OBJECT)
@@ -1927,7 +1927,7 @@ impl Checker {
                     .all(|&t| self.is_excess_property_check_target(t))
     }
 
-    // Go: checker/relater.go:773 isDeeplyNestedType
+    // Go: checker/relater.go:766 isDeeplyNestedType
     // Return true if the given type is deeply nested. We consider this to be the case when the given stack contains
     // maxDepth or more occurrences of types with the same recursion identity as the given type. The recursion identity
     // provides a shared identity for type instantiations that repeat in some (possibly infinite) pattern. For example,
@@ -2003,7 +2003,7 @@ impl Checker {
     // `get_recursion_identity_target` runs for the same types in Go order.
     // `ids` holds `Option<RecursionId>` (relater stacks) or `RecursionKey`
     // (inference stacks, which convert to the same `Option<RecursionId>`).
-    // Go: checker/relater.go:773 isDeeplyNestedType
+    // Go: checker/relater.go:766 isDeeplyNestedType
     pub fn is_deeply_nested_type_with_ids<I: Copy + Into<Option<RecursionId>>>(
         &mut self,
         t: TypeId,
@@ -2066,7 +2066,7 @@ impl Checker {
     // the full stack only when the check reaches the scan, and the caller
     // truncates it when the stack pops. The ids read only type data fixed
     // at type creation, so a late fill gives the same ids.
-    // Go: checker/relater.go:773 isDeeplyNestedType
+    // Go: checker/relater.go:766 isDeeplyNestedType
     pub fn is_deeply_nested_relater_type(
         &mut self,
         t: TypeId,
@@ -2089,7 +2089,7 @@ impl Checker {
         self.is_deeply_nested_type_with_ids(t, probe_id, stack, ids, max_depth)
     }
 
-    // Go: checker/relater.go:800 hasMatchingRecursionIdentity
+    // Go: checker/relater.go:797 hasMatchingRecursionIdentity
     // PORT: Go package functions `hasMatchingRecursionIdentity`,
     // `getRecursionIdentity` and `getRecursionIdentityTarget` reach the
     // checker through `t.checker`, so they are Checker methods here.
@@ -2106,13 +2106,13 @@ impl Checker {
         self.get_recursion_identity_from_target(target) == identity
     }
 
-    // Go: checker/relater.go:813 getRecursionIdentity
+    // Go: checker/relater.go:810 getRecursionIdentity
     pub fn get_recursion_identity(&mut self, t: TypeId) -> RecursionId {
         let target = self.get_recursion_identity_target(t);
         self.get_recursion_identity_from_target(target)
     }
 
-    // Go: checker/relater.go:823 getRecursionIdentityTarget
+    // Go: checker/relater.go:820 getRecursionIdentityTarget
     // Get the recursion identity target type from a type. Recursively (a) obtain the target object type of an
     // indexed access (i.e. the T in T[K]), and (b) unwrap nested homomorphic mapped types and return the deepest
     // target type that has a symbol. The unwrapping better preserves unique type identities for mapped types applied
@@ -2194,7 +2194,7 @@ impl Checker {
         as_recursion_id(t)
     }
 
-    // Go: checker/relater.go:882 getBestMatchingType
+    // Go: checker/relater.go:872 getBestMatchingType
     pub fn get_best_matching_type(
         &mut self,
         source: TypeId,
@@ -2224,7 +2224,7 @@ impl Checker {
         self.find_most_overlappy_type(source, target)
     }
 
-    // Go: checker/relater.go:901 findMatchingTypeReferenceOrTypeAliasReference
+    // Go: checker/relater.go:891 findMatchingTypeReferenceOrTypeAliasReference
     pub fn find_matching_type_reference_or_type_alias_reference(
         &self,
         source: TypeId,
@@ -2258,7 +2258,7 @@ impl Checker {
     }
 }
 
-// Go: checker/relater.go:750 isHyphenatedJsxName
+// Go: checker/relater.go:743 isHyphenatedJsxName
 pub fn is_hyphenated_jsx_name(name: &str) -> bool {
     name.contains('-')
 }

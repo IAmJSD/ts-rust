@@ -314,7 +314,12 @@ mod tests {
     // unbuffered `os.Stdout`. strace of the pin N oracle with
     // `--diagnostics` on a one-file project: these 14 writes of fd 1. The
     // system writer writes each write of the table at once
-    // (`stdio::CliStdout`), so the table must give one write per row.
+    // (`stdio::CliStdout`), so `report` must give one write per row.
+    // The input is the raw statistics, not the expected text: the test
+    // also checks the rows that `report` picks, `Memory used` in KiB
+    // (bytes / 1024, truncated), the rounding of each duration to ms, and
+    // that a duration under 0.5 ms that is not zero (`Emit time`) keeps
+    // its row.
     #[test]
     fn table_print_writes_go_pieces() {
         let go_writes = [
@@ -333,11 +338,26 @@ mod tests {
             "Emit time:      0.000s\n",
             "Total time:     0.514s\n",
         ];
-        let mut table = Table::default();
-        for write in go_writes {
-            let (name, value) = write.trim_end().split_once(':').unwrap();
-            table.add(name, value.trim_start());
-        }
+        let statistics = Statistics {
+            files: 91,
+            lines: 58774,
+            identifiers: 49870,
+            symbols: 59387,
+            types: 34675,
+            instantiations: 33953,
+            memory_used: 59443 * 1024 + 1000,
+            memory_allocs: 271_214,
+            compile_times: Some(CompileTimes {
+                config_time: Duration::from_micros(4_400),
+                parse_time: Duration::from_micros(76_600),
+                bind_time: Duration::from_micros(41_200),
+                check_time: Duration::from_micros(386_700),
+                emit_time: Duration::from_micros(200),
+                total_time: Duration::from_micros(514_300),
+                ..CompileTimes::default()
+            }),
+            ..Statistics::default()
+        };
         /// Keeps each write as one piece, an empty one too, as the system
         /// writer writes each one (`GoOutput`).
         #[derive(Default)]
@@ -356,7 +376,7 @@ mod tests {
             }
         }
         let writes = Rc::new(RefCell::new(Writes::default()));
-        table.print(&(writes.clone() as Writer));
+        statistics.report(&(writes.clone() as Writer));
         assert_eq!(writes.take().0, go_writes);
     }
 

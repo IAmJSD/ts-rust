@@ -15,6 +15,7 @@ use crate::ls::prelude::*;
 // - Go `slices.SortFunc` is `gostd::slices::sort_func` (Go pdqsort);
 //   `slices.SortStableFunc` is `gostd::slices::sort_stable_func`.
 
+use crate::astdata::NodeData;
 use crate::frontend::scanner::{Scanner, new_scanner};
 use crate::frontend::stringutil_ls;
 
@@ -531,7 +532,7 @@ fn get_import_attributes_key(attributes: Node) -> String {
             key.push_str(attr.value().text());
             key.push('"');
         } else {
-            key.push_str(attr.value().text());
+            key.push_str(go_node_text(attr.value()));
         }
         key.push(' ');
     }
@@ -1107,7 +1108,7 @@ fn coalesce_exports_worker(
         let export = export_decl;
         let mut module_specifier = String::new();
         if export.module_specifier().is_some() {
-            module_specifier = export.module_specifier().text().to_string();
+            module_specifier = go_node_text(export.module_specifier()).to_string();
         }
         if !exports_by_module_specifier.contains_key(&module_specifier) {
             module_specifier_order.push(module_specifier.clone());
@@ -1231,4 +1232,36 @@ fn get_categorized_exports(export_group: &[Node]) -> CategorizedExports {
         named_exports,
         type_only_exports,
     }
+}
+
+// Go: ast/ast.go:273 (*Node).Text
+/// Go `node.Text()` of an import attribute value or an export module
+/// specifier. The parser allows any expression there, and Go panics for a
+/// kind with no text, so the request answers Go's InternalError.
+// PORT: `Node::text` gives "" for such a kind (node.rs PORT rule). Go's
+// text is `%T` of the node data, whose type name is the data schema name.
+fn go_node_text(node: Node) -> &'static str {
+    let unhandled = crate::ast::synthetic::with_ast_data(node, |d| match d {
+        NodeData::Identifier(_)
+        | NodeData::PrivateIdentifier(_)
+        | NodeData::StringLiteral(_)
+        | NodeData::NumericLiteral(_)
+        | NodeData::BigIntLiteral(_)
+        | NodeData::MetaProperty(_)
+        | NodeData::NoSubstitutionTemplateLiteral(_)
+        | NodeData::TemplateHead(_)
+        | NodeData::TemplateMiddle(_)
+        | NodeData::TemplateTail(_)
+        | NodeData::JsxNamespacedName(_)
+        | NodeData::RegularExpressionLiteral(_)
+        | NodeData::JsDocText(_)
+        | NodeData::JsDocLink(_)
+        | NodeData::JsDocLinkCode(_)
+        | NodeData::JsDocLinkPlain(_) => None,
+        other => Some(other.schema_name()),
+    });
+    if let Some(data) = unhandled {
+        crate::core::go_panic(format!("Unhandled case in Node.Text: *ast.{data}"));
+    }
+    node.text()
 }

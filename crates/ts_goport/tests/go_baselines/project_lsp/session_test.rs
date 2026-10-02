@@ -1758,3 +1758,142 @@ child_test! {
         session.close();
     }
 }
+
+child_test! {
+    // PORT: no Go counterpart (editfuzz2 P2-1). Only a released program
+    // version loaded the node_modules entrypoint pk/node.d.ts; the parse
+    // cache keeps its parse. The warm's auto-import extraction of package pk
+    // reads the JSDoc of its export (the `@deprecated` tag). Go's
+    // `SourceFile` parses lazy JSDoc from its own text (ast.go:2745
+    // resolveJSDoc), so it needs no program. Before the fix the port found
+    // no parser inputs for the file and exited with `unported!`.
+    fn auto_import_warm_reads_jsdoc_of_a_file_that_only_a_released_program_loaded() {
+        const A_URI: &str = "file:///home/projects/app/a.ts";
+        const B_URI: &str = "file:///home/projects/app/b.ts";
+        const NODE_DTS: &str = "/home/projects/app/node_modules/pk/node.d.ts";
+        let session = bare_session(files(&[
+            (
+                "/home/projects/app/package.json",
+                r#"{ "name": "r", "devDependencies": { "cov": "1.0.0", "pk": "1.0.0" } }"#,
+            ),
+            (
+                "/home/projects/app/tsconfig.json",
+                r#"{ "compilerOptions": { "module": "esnext", "moduleResolution": "bundler", "strict": true }, "include": ["*.ts"] }"#,
+            ),
+            ("/home/projects/app/a.ts", "export const a = 1;\n"),
+            ("/home/projects/app/b.ts", "export const b = 1;\n"),
+            (
+                "/home/projects/app/node_modules/pk/package.json",
+                r#"{ "name": "pk", "version": "1.0.0", "exports": { ".": { "types": "./index.d.ts" }, "./node": { "types": "./node.d.ts" } } }"#,
+            ),
+            (
+                "/home/projects/app/node_modules/pk/index.d.ts",
+                "/** The main value. */\nexport declare const pkMain: number;\n",
+            ),
+            (
+                NODE_DTS,
+                "/** @deprecated Use pkMain. */\nexport declare function pkNode(): void;\n",
+            ),
+            (
+                "/home/projects/app/node_modules/cov/package.json",
+                r#"{ "name": "cov", "version": "1.0.0", "types": "./index.d.ts" }"#,
+            ),
+            (
+                "/home/projects/app/node_modules/cov/index.d.ts",
+                "import { pkNode } from \"pk/node\";\nexport declare const cov: typeof pkNode;\n",
+            ),
+        ]));
+        open(&session, A_URI, "export const a = 1;\n");
+        open(&session, B_URI, "export const b = 1;\n");
+        // A program version with cov and pk/node.d.ts, and a registry with cov.
+        edit(&session, A_URI, 2, (0, 0), (0, 0), "import * as c from \"cov\";\n");
+        session
+            .get_current_language_service_with_auto_imports(&bg(), &uri(A_URI))
+            .unwrap_or_else(|err| panic!("{}", err.error()));
+        let with_node_dts = Rc::downgrade(&program(&session, A_URI));
+        assert!(with_node_dts.upgrade().is_some_and(|p| has_file(&p, NODE_DTS)));
+
+        // The disk text of a.ts has no import, so pk/node.d.ts leaves the
+        // program, and the old version is released.
+        close(&session, A_URI);
+        // A change of one open file queues a warm.
+        edit(&session, B_URI, 2, (0, 0), (0, 0), "import { pkMain } from \"pk\";\n");
+        assert!(!has_file(&program(&session, B_URI), NODE_DTS));
+        session.wait_for_background_tasks();
+        assert!(
+            with_node_dts.upgrade().is_none(),
+            "the version that loaded {NODE_DTS} is alive"
+        );
+
+        // The warm extracted package pk with both entrypoints, and read the
+        // JSDoc of pkNode.
+        let registry = session
+            .snapshot()
+            .auto_import_registry()
+            .expect("auto import registry");
+        let pk_node = registry
+            .node_modules
+            .values()
+            .filter_map(|bucket| bucket.index.as_ref())
+            .flat_map(|index| index.borrow().entries.clone())
+            .find(|export| export.name() == "pkNode")
+            .expect("an export pkNode in the node_modules buckets");
+        assert!(
+            pk_node
+                .script_element_kind_modifiers
+                .contains(lsutil::ScriptElementKindModifier::DEPRECATED),
+            "{:?}",
+            pk_node.script_element_kind_modifiers
+        );
+        session.close();
+    }
+}
+
+child_test! {
+    // PORT: no Go counterpart (editfuzz2 P1). The parser allows any
+    // expression as a module specifier or an import attribute value. Go's
+    // `Node.Text` panics for a kind with no text (ast.go:308): in
+    // coalesceExportsWorker (organizeimports.go:851) and in
+    // getImportAttributesKey (:380). The server answers that panic as Go's
+    // InternalError, so the port panics with Go's text.
+    fn organize_imports_panics_like_go_on_an_expression_with_no_text() {
+        const B_URI: &str = "file:///home/projects/app/b.ts";
+        let cases = [
+            ("export * as a.b from './a';\n", "PropertyAccessExpression"),
+            ("export * from this;\n", "KeywordExpression"),
+            (
+                "import { A } from './a' with { type: f() };\nexport const c = A;\n",
+                "CallExpression",
+            ),
+        ];
+        for (text, data) in cases {
+            let session = bare_session(files(&[
+                ("/home/projects/app/a.ts", "export class A {}\n"),
+                ("/home/projects/app/b.ts", text),
+            ]));
+            open(&session, B_URI, text);
+            let ls = language_service(&session, B_URI);
+            let params = lsproto::CodeActionParams {
+                text_document: lsproto::TextDocumentIdentifier { uri: uri(B_URI) },
+                context: Some(lsproto::CodeActionContext {
+                    only: Some(vec![lsproto::CodeActionKind::SOURCE_ORGANIZE_IMPORTS]),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                ls.provide_code_actions(&bg(), &params)
+            }))
+            .expect_err("organize imports must panic as Go does");
+            let message = payload
+                .downcast_ref::<ts_goport::core::GoPanic>()
+                .map(|panic| panic.message.clone());
+            assert_eq!(
+                message.as_deref(),
+                Some(format!("Unhandled case in Node.Text: *ast.{data}").as_str()),
+                "{text:?}"
+            );
+            session.close();
+        }
+    }
+}

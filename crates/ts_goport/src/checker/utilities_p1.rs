@@ -1183,12 +1183,9 @@ pub fn get_sort_order_flags(t: &Type) -> i64 {
 }
 
 impl Checker {
-    // Go: checker/utilities.go:565 compareTypeNames
-    pub fn compare_type_names(&self, t1: TypeId, t2: TypeId) -> i32 {
-        self.compare_type_names_of(self.ty(t1), self.ty(t2))
-    }
-
-    /// `compare_type_names` of two types already read from the arena.
+    // Go: checker/utilities.go:632 compareTypeNames
+    // PERF: chkA. It takes the two types as `compare_types` read them from
+    // the arena.
     pub fn compare_type_names_of(&self, ty1: &Type, ty2: &Type) -> i32 {
         let s1 = type_name_symbol(ty1);
         let s2 = type_name_symbol(ty2);

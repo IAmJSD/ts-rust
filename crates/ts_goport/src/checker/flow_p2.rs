@@ -1124,7 +1124,7 @@ impl Checker {
         target_kind: SyntaxKind,
     ) -> bool {
         let memo = &self.matching_reference_memo;
-        matches!(
+        let says_no = matches!(
             target_kind,
             SyntaxKind::VariableDeclaration | SyntaxKind::BindingElement
         ) && memo.node == source
@@ -1132,7 +1132,22 @@ impl Checker {
             && !memo.this_in_type_query
             && memo.export.is_some()
             && memo.export_merge_version == self.merge_version
-            && !self.sym(memo.export).declarations.contains(&target)
+            && !self.sym(memo.export).declarations.contains(&target);
+        debug_assert!(!says_no || self.merge_rule_holds(memo.export, target));
+        says_no
+    }
+
+    /// The merge rule that the chkA early returns depend on (the declaration
+    /// test in `is_matching_reference_kind` and
+    /// `matching_reference_memo_says_no`): when `export_symbol` is the merged
+    /// symbol of `target` (Go `getMergedSymbol(target.Symbol())`), `target`
+    /// is one of the declarations of `export_symbol`. Only `debug_assert!`
+    /// calls it.
+    fn merge_rule_holds(&self, export_symbol: SymbolId, target: Node) -> bool {
+        let symbol = target.symbol();
+        symbol.is_nil()
+            || self.get_merged_symbol(symbol) != export_symbol
+            || self.sym(export_symbol).declarations.contains(&target)
     }
 
     /// `is_matching_reference` for a caller that has read `target_kind`
@@ -1207,9 +1222,11 @@ impl Checker {
                     // So the two are equal only when `target` is one of the
                     // declarations of `export_symbol`. Any other target gives
                     // false with no read of its symbol and no merge lookup.
+                    // Debug builds check the rule (`merge_rule_holds`).
                     if export_symbol.is_some()
                         && !self.sym(export_symbol).declarations.contains(&target)
                     {
+                        debug_assert!(self.merge_rule_holds(export_symbol, target));
                         return false;
                     }
                     // PERF: Go `getSymbolOfDeclaration(target)` without its

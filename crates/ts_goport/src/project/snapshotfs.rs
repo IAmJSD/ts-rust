@@ -181,7 +181,7 @@ pub struct SnapshotFS {
     pub to_path: Rc<dyn Fn(&str) -> tspath::Path>,
     pub fs: Rc<dyn LayeredFileSystem>,
     pub cache_files: Rc<FxHashMap<tspath::Path, Rc<RefCell<CachedFile>>>>,
-    pub cache_directories: Rc<FxHashMap<tspath::Path, dirty::CloneableMap<tspath::Path, String>>>,
+    pub cache_directories: Rc<FxHashMap<tspath::Path, CachedDirectory>>,
     pub read_files: RefCell<FxHashMap<tspath::Path, MemoizedCachedFile>>,
     // nodeModulesRealpathAliases maps realpath-based keys to sets of symlink-based keys,
     // for files inside node_modules that are accessed through directory symlinks.
@@ -299,12 +299,30 @@ impl FileSource for SnapshotFS {
     }
 }
 
+/// Go `dirty.CloneableMap[tspath.Path, string]` of `cacheDirectories`: the
+/// cached children of one directory, by path, with their base names.
+// PORT: Go ranges over it (`mergeCachedDirectoryEntries`), and a small Go
+// map gives a rotation of its insertion order. It is an `IndexMap`
+// (insertion order), one of Go's answers. The FxHashMap of
+// `dirty::CloneableMap` gives the order of the path hashes, which Go can
+// miss (editfuzz2 R1, as for `OverlayDirectories`). A delete keeps the
+// order of the other children (`shift_remove`), as a Go map delete keeps
+// their slots.
+pub type CachedDirectory = Rc<RefCell<IndexMap<tspath::Path, String>>>;
+
+impl dirty::Cloneable for CachedDirectory {
+    // Go: project/dirty/cloneablemap.go:7 Clone
+    fn clone_(&self) -> Self {
+        Rc::new(RefCell::new(self.borrow().clone()))
+    }
+}
+
 // Go: project/snapshotfs.go:143 mergeCachedDirectoryEntries (ts#64291)
-// PORT: Go ranges over the cached entries map (random order); FxHashMap
-// order here.
+// PORT: Go ranges over the cached entries map (random order); insertion
+// order here (`CachedDirectory`).
 pub fn merge_cached_directory_entries(
     directory_entries: vfs::Entries,
-    cached_entries: &FxHashMap<tspath::Path, String>,
+    cached_entries: &IndexMap<tspath::Path, String>,
     is_cached_file: &dyn Fn(&tspath::Path) -> bool,
     use_case_sensitive_file_names: bool,
 ) -> vfs::Entries {
@@ -348,7 +366,7 @@ pub fn merge_cached_directory_entries(
 pub struct SnapshotFSBuilder {
     pub fs: Rc<dyn LayeredFileSystem>,
     pub cache_files: Rc<dirty::SyncMap<tspath::Path, Rc<RefCell<CachedFile>>>>,
-    pub cache_directories: Rc<dirty::Map<tspath::Path, dirty::CloneableMap<tspath::Path, String>>>,
+    pub cache_directories: Rc<dirty::Map<tspath::Path, CachedDirectory>>,
     pub source_backed_replacements: RefCell<FxHashSet<tspath::Path>>,
     pub node_modules_realpath_aliases:
         Rc<dirty::SyncMap<tspath::Path, Rc<RefCell<RealpathAliasSet>>>>,
@@ -361,7 +379,7 @@ pub struct SnapshotFSBuilder {
 pub fn new_snapshot_fs_builder_from_source(
     fs: Rc<dyn LayeredFileSystem>,
     cache_files: Rc<FxHashMap<tspath::Path, Rc<RefCell<CachedFile>>>>,
-    cache_directories: Rc<FxHashMap<tspath::Path, dirty::CloneableMap<tspath::Path, String>>>,
+    cache_directories: Rc<FxHashMap<tspath::Path, CachedDirectory>>,
     node_modules_realpath_aliases: Rc<FxHashMap<tspath::Path, Rc<RefCell<RealpathAliasSet>>>>,
     to_path: Rc<dyn Fn(&str) -> tspath::Path>,
 ) -> Rc<SnapshotFSBuilder> {
@@ -380,7 +398,7 @@ pub fn new_snapshot_fs_builder_from_source(
 // Go: project/snapshotfs.go:227 onDeletedFileOrDirectory (a closure in Finalize)
 // PORT: the recursive Go closure is a nested function over the map it reads.
 fn on_deleted_file_or_directory(
-    cache_directories: &dirty::Map<tspath::Path, dirty::CloneableMap<tspath::Path, String>>,
+    cache_directories: &dirty::Map<tspath::Path, CachedDirectory>,
     path: &tspath::Path,
 ) {
     let (dir_entry, ok) = cache_directories.get(&path.get_directory_path());
@@ -389,8 +407,8 @@ fn on_deleted_file_or_directory(
     }
     let dir_entry = dir_entry.expect("dirty.Map.Get: ok implies an entry");
     let entry = dir_entry.clone();
-    dir_entry.change(&mut |dir: &dirty::CloneableMap<tspath::Path, String>| {
-        dir.borrow_mut().remove(path);
+    dir_entry.change(&mut |dir: &CachedDirectory| {
+        dir.borrow_mut().shift_remove(path);
         if dir.borrow().is_empty() {
             entry.delete();
             on_deleted_file_or_directory(cache_directories, &entry.key());
@@ -415,14 +433,13 @@ impl SnapshotFSBuilder {
                 }
                 let base_name = tspath::get_base_file_name(&child);
                 if let (Some(dir_entry), true) = self.cache_directories.get(&parent_path) {
-                    dir_entry.change(&mut |dir: &dirty::CloneableMap<tspath::Path, String>| {
+                    dir_entry.change(&mut |dir: &CachedDirectory| {
                         dir.borrow_mut()
                             .insert(child_path.clone(), base_name.clone());
                     });
                     break;
                 } else {
-                    let dir: dirty::CloneableMap<tspath::Path, String> =
-                        dirty::CloneableMap::default();
+                    let dir = CachedDirectory::default();
                     dir.borrow_mut().insert(child_path.clone(), base_name);
                     self.cache_directories.add(parent_path.clone(), dir);
                 }

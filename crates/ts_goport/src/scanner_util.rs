@@ -636,6 +636,9 @@ fn get_spelling_suggestion_unexported<T: Clone + Default, S: AsRef<str>>(
 }
 
 // Go: core/core.go:635 GetSpellingSuggestionForStrings
+// PORT: Go `strings.Compare` compares the Go bytes (`compare_go_strings`).
+// The port form of an invalid byte sorts by its marker bytes, so `str`
+// order can break a tie the other way.
 pub fn get_spelling_suggestion_for_strings(
     name: &str,
     candidates: impl IntoIterator<Item = String>,
@@ -644,11 +647,7 @@ pub fn get_spelling_suggestion_for_strings(
         name,
         candidates,
         |s| s.clone(),
-        |a, b| match a.cmp(b) {
-            std::cmp::Ordering::Less => -1,
-            std::cmp::Ordering::Equal => 0,
-            std::cmp::Ordering::Greater => 1,
-        },
+        |a, b| compare_go_strings(a, b) as i32,
     )
 }
 
@@ -24103,5 +24102,70 @@ mod tests {
         // Every call with no limit or a limit of 20 finds a candidate, so the
         // distances decide the answers.
         assert_eq!(found, 60);
+    }
+
+    /// A candidate with a Go string marker (an invalid byte, a lone
+    /// surrogate's bytes or a real U+FDD0) is measured on its Go runes
+    /// (`go_runes`: one U+FFFD per invalid byte), not on the chars of its
+    /// port form, and ties sort by Go bytes. The answers come from Go
+    /// core.go:590 getSpellingSuggestion at pin N, run on the same Go
+    /// strings (`GetSpellingSuggestion` with `strings.Compare`, from the Go
+    /// test `target/continuation-r97-goport/followups10/go/
+    /// spelling_marker_test.go` run with `go test -overlay`).
+    #[test]
+    fn spelling_suggestion_reads_go_runes_of_marked_candidates() {
+        let port = |bytes: &[u8]| go_string_from_bytes(bytes.to_vec());
+        // (name, candidates, Go answer), all as Go bytes.
+        let cases: [(&[u8], &[&[u8]], &[u8]); 9] = [
+            // ab U+FFFD cd: equal runes, distance 0. On the port chars
+            // (marker, unit char) the distance is 3, over the limit 2.9.
+            ("ab\u{FFFD}cd".as_bytes(), &[b"ab\xffcd"], b"ab\xffcd"),
+            // A real U+FDD0 is one rune (M + M in the port form).
+            (
+                "ab\u{FDD0}cd".as_bytes(),
+                &["ab\u{FDD0}ce".as_bytes()],
+                "ab\u{FDD0}ce".as_bytes(),
+            ),
+            // The 3 bytes of a lone surrogate are 3 runes U+FFFD.
+            (
+                "ab\u{FFFD}\u{FFFD}\u{FFFD}cd".as_bytes(),
+                &[b"ab\xed\xa0\x80cd"],
+                b"ab\xed\xa0\x80cd",
+            ),
+            // A tie (distance 1): Go bytes "X" < 0xFF.
+            (b"abcd", &[b"ab\xffcd", b"abXcd"], b"abXcd"),
+            // A marked name and a marked candidate.
+            (b"ab\xffc", &[b"ab\xfec", b"abzc"], b"ab\xfec"),
+            // Go `len` counts the 3 bytes of U+FFFD: 7 - 4 is over the
+            // length limit 2, so only the invalid byte is a candidate.
+            (
+                b"abcd",
+                &[b"ab\xffcd", "ab\u{FFFD}cd".as_bytes()],
+                b"ab\xffcd",
+            ),
+            // A tie (distance 2) between U+FFFD (EF BF BD) and the byte FF:
+            // Go bytes put U+FFFD first, in both orders. The port form of
+            // FF starts with the marker (EF B7 90), which `str` order puts
+            // first.
+            (
+                b"abcdZefg",
+                &[b"abcd\xffefg", "abcd\u{FFFD}efg".as_bytes()],
+                "abcd\u{FFFD}efg".as_bytes(),
+            ),
+            (
+                b"abcdZefg",
+                &["abcd\u{FFFD}efg".as_bytes(), b"abcd\xffefg"],
+                "abcd\u{FFFD}efg".as_bytes(),
+            ),
+            // No candidate is close enough: the Go zero value.
+            (b"abcdZefg", &[b"\xff\xfe\xfd\xfc\xfb\xfa\xf9"], b""),
+        ];
+        for (name, candidates, go) in cases {
+            let answer = get_spelling_suggestion_for_strings(
+                &port(name),
+                candidates.iter().map(|candidate| port(candidate)),
+            );
+            assert_eq!(answer, port(go), "{name:?} {candidates:?}");
+        }
     }
 }

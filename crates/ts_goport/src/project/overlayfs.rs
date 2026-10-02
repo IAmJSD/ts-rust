@@ -344,7 +344,11 @@ pub struct OverlayFS {
 }
 
 /// Go `map[tspath.Path]map[tspath.Path]string` of `overlayFS.overlayDirectories`.
-pub type OverlayDirectories = FxHashMap<tspath::Path, FxHashMap<tspath::Path, String>>;
+// PORT: Go ranges over a directory map (`GetAccessibleEntries`), and a
+// small Go map gives a rotation of its insertion order. The inner map is an
+// `IndexMap` (insertion order), Go's most common answer; an FxHashMap gave
+// orders that Go never gives (editfuzz2 R1).
+pub type OverlayDirectories = FxHashMap<tspath::Path, IndexMap<tspath::Path, String>>;
 
 // Go: project/overlayfs.go:198 LayeredFileSystem (ts#64291)
 pub trait LayeredFileSystem: vfs::Fs + FileHandleSource {
@@ -593,8 +597,8 @@ impl vfs::Fs for OverlayFS {
     }
 
     // Go: project/overlayfs.go:311 overlayFS.GetAccessibleEntries
-    // PORT: Go ranges over the directory map (random order); FxHashMap order
-    // here.
+    // PORT: Go ranges over the directory map (random order); insertion order
+    // here (`OverlayDirectories`).
     fn get_accessible_entries(&self, directory_name: &str) -> vfs::Entries {
         let path = (self.to_path)(directory_name);
         let file = self.overlays.borrow().contains_key(&path);
@@ -684,7 +688,9 @@ pub fn overlay_directory_info(name: String) -> vfs::FileInfo {
 
 // Go: project/overlayfs.go:385 createOverlayDirectories (ts#64291)
 // PORT: Go ranges over the overlay map (random order); the IndexMap order
-// here. The result is a map, so the order does not matter.
+// here. It is the insertion order of each directory map
+// (`OverlayDirectories`), so a directory lists its open files in the order
+// they were opened.
 pub fn create_overlay_directories(
     overlays: &IndexMap<tspath::Path, Rc<Overlay>>,
 ) -> OverlayDirectories {
@@ -701,7 +707,7 @@ pub fn create_overlay_directories(
             if let Some(directory) = overlay_directories.get_mut(&parent_path) {
                 directory.insert(child_path.clone(), tspath::get_base_file_name(&child));
             } else {
-                let mut directory: FxHashMap<tspath::Path, String> = FxHashMap::default();
+                let mut directory: IndexMap<tspath::Path, String> = IndexMap::new();
                 directory.insert(child_path.clone(), tspath::get_base_file_name(&child));
                 overlay_directories.insert(parent_path.clone(), directory);
             }

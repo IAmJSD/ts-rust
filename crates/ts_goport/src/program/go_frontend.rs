@@ -43,10 +43,6 @@ pub(super) struct GoSharedState {
     import_helpers_import_specifiers: FxHashMap<String, Node>,
     /// Go include processor diagnostics of each program file, by file index.
     include_diagnostics: FxHashMap<usize, Vec<Diagnostic>>,
-    /// Parser inputs of each program file, by file index, for lazy JSDoc.
-    /// A file id is one file version, so versions share the inputs of the
-    /// files they share.
-    parse_inputs: FxHashMap<usize, Arc<LazyJsDocInput>>,
     /// Go `GetParseFileRedirect` of each resolved module file name that is
     /// not a program file and has a redirect. Shared like `resolved_modules`.
     parse_file_redirects: Arc<FxHashMap<String, String>>,
@@ -132,15 +128,6 @@ impl ProjectReferenceCopies {
     }
 }
 
-/// What `parse_js_doc_for_node` needs from a parsed file. It shares the
-/// file text (`FileText`), so it keeps the text of a freeable file version
-/// while it lives.
-struct LazyJsDocInput {
-    parse_options: SourceFileParseOptions,
-    text: FileText,
-    script_kind: ScriptKind,
-}
-
 thread_local! {
     /// Go `SourceFile.jsdocCache` entries added by lazy JSDoc parses on this
     /// thread. PORT: the parsed file is shared and read only, so the lazy
@@ -148,7 +135,7 @@ thread_local! {
     /// borrow. The parsed nodes are synthetic nodes of this thread, so each
     /// thread keeps its own entries (see `WorkerSeed`). The entries of a
     /// dead file version go, and so do its JSDoc nodes (a file scope,
-    /// `parse_lazy_js_doc`).
+    /// `resolve_lazy_js_doc`).
     static LAZY_JSDOC: RefCell<PerFileMap<&'static [Node]>> = const { RefCell::new(PerFileMap::new()) };
     /// The file system of a checker worker thread (Go `host.FS()`, without the cache).
     static WORKER_FS: Rc<dyn Fs> = bundled::wrap_fs(osvfs_fs());
@@ -303,12 +290,6 @@ thread_local! {
     static PARSED_UNPUBLISHED: RefCell<FxHashMap<usize, Rc<ParsedSourceFile>>> =
         RefCell::new(FxHashMap::default());
 
-    /// Parser inputs of the files of `PARSED_UNPUBLISHED` that a publish
-    /// gave no program, by store id, for lazy JSDoc
-    /// (`resolve_js_doc_outside_program`).
-    static OUTSIDE_PARSE_INPUTS: RefCell<FxHashMap<usize, Arc<LazyJsDocInput>>> =
-        RefCell::new(FxHashMap::default());
-
     /// The parses of `PARSED_UNPUBLISHED` that a publish kept for good
     /// (`go_files_of_unpublished_stores`), by store id. A store here is
     /// published, so `unpublished_parsed_source_file` no longer finds it.
@@ -348,52 +329,45 @@ pub(super) fn publish_parsed_files(cwd: &str) {
     publish_file_stores(files);
 }
 
-/// Go `parseJSDocForNode` for a lazy JSDoc read of `node` (ast/ast.go:2614
-/// `resolveJSDoc`). The result is cached in `LAZY_JSDOC`.
-fn parse_lazy_js_doc(input: &LazyJsDocInput, node: Node) -> &'static [Node] {
+// Go: ast/ast.go:2745 (*SourceFile).resolveJSDoc (slow path; the caller
+// has checked the parser cache) and parser/jsdoc.go:19 parseJSDocForNode
+/// The lazy JSDoc of `node` in published file `file`, whose info is
+/// `info`. The result is cached in `LAZY_JSDOC`.
+// PORT: as in Go, the parser inputs come from the file itself: Go
+// `ParseOptions()` (the name, path and module indicator options of
+// `info`), `ScriptKind` and `Text()` (the store text). So every file that
+// a node handle can read parses its JSDoc, with or without a program: a
+// file of the current program, of an alias resolver program, or of a
+// released program version that only the parse cache keeps (editfuzz2
+// P2-1, which reached `unported!` when no live program had the file).
+pub(super) fn resolve_lazy_js_doc(
+    file: Node,
+    info: &SourceFileInfo,
+    node: Node,
+) -> &'static [Node] {
+    if let Some(jsdocs) = LAZY_JSDOC.with(|cache| cache.borrow().get(&node).copied()) {
+        return jsdocs;
+    }
+    let parse_options = SourceFileParseOptions {
+        file_name: info.file_name.clone(),
+        path: GoPath(info.path.clone()),
+        external_module_indicator_options: info.external_module_indicator_options,
+    };
+    let text = crate::ast::file_store_text(file.file_index());
     // The cache outlives program versions and keeps the nodes as long as
     // `node` lives: they belong to its file version, or to the thread.
     let _file = crate::ast::enter_file_synthetic_owner(node);
     let jsdocs: &'static [Node] = Box::leak(
         crate::frontend::parser::parse_js_doc_for_node(
-            &input.parse_options,
-            &input.text,
-            input.script_kind,
+            &parse_options,
+            &text,
+            info.script_kind,
             node,
         )
         .into_boxed_slice(),
     );
     LAZY_JSDOC.with(|cache| cache.borrow_mut().write().insert(node, jsdocs));
     jsdocs
-}
-
-/// Go ast/ast.go:2614 `(*SourceFile).resolveJSDoc` (slow path) for a file
-/// of an alias resolver program. Such a file is in no program
-/// (`OUTSIDE_PARSE_INPUTS`) or in a program version loaded on this thread.
-/// None when this thread has no parser inputs for `file`.
-pub(super) fn resolve_js_doc_outside_program(file: Node, node: Node) -> Option<&'static [Node]> {
-    if let Some(jsdocs) = LAZY_JSDOC.with(|cache| cache.borrow().get(&node).copied()) {
-        return Some(jsdocs);
-    }
-    let store = file.file_index();
-    let input = OUTSIDE_PARSE_INPUTS
-        .with(|inputs| inputs.borrow().get(&store).cloned())
-        .or_else(|| {
-            let path = GoPath(source_file_info(file).path.clone());
-            let programs: Vec<Rc<NewProgram>> =
-                FRONTENDS.with(|frontends| frontends.borrow().values().cloned().collect());
-            programs.into_iter().find_map(|program| {
-                let parsed = program
-                    .get_source_file_by_path(&path)
-                    .filter(|parsed| parsed.store == store)?;
-                Some(Arc::new(LazyJsDocInput {
-                    parse_options: parsed.parse_options.clone(),
-                    text: parsed.text.clone(),
-                    script_kind: parsed.script_kind,
-                }))
-            })
-        })?;
-    Some(parse_lazy_js_doc(&input, node))
 }
 
 // Go: compiler/program.go:122 FileExists (the Go frontend program)
@@ -423,16 +397,6 @@ fn go_files_of_unpublished_stores(
     let stores = unpublished_file_ids();
     let mut files = Vec::with_capacity(stores.len());
     for store in stores {
-        if !parsed.contains_key(&store)
-            && let Some(file) = outside.get(&store)
-        {
-            let input = Arc::new(LazyJsDocInput {
-                parse_options: file.parse_options.clone(),
-                text: file.text.clone(),
-                script_kind: file.script_kind,
-            });
-            OUTSIDE_PARSE_INPUTS.with(|inputs| inputs.borrow_mut().insert(store, input));
-        }
         // PERF: the `SourceFileInfo` of a static file borrows lists of the
         // parse. A static published file is never freed, so its parse is
         // kept for good, whether a program or the parse cache made it. The
@@ -1132,6 +1096,7 @@ fn program_file_info(store: usize, file: &ParsedSourceFile, lists: KeptLists) ->
         js_diagnostics: lists.js_diagnostics,
         jsdoc_diagnostics: lists.jsdoc_diagnostics,
         has_lazy_js_doc: file.has_lazy_js_doc,
+        external_module_indicator_options: file.parse_options.external_module_indicator_options,
         late: OnceLock::new(),
     };
     let late = LateSourceFileInfo {
@@ -1174,6 +1139,7 @@ fn other_store_info(
         js_diagnostics: KeptData::Borrowed(&[]),
         jsdoc_diagnostics: KeptData::Borrowed(&[]),
         has_lazy_js_doc: false,
+        external_module_indicator_options: Default::default(),
         late: OnceLock::new(),
     };
     let late = LateSourceFileInfo {
@@ -1256,39 +1222,6 @@ impl GoSharedState {
             .map(|(path, &specifier)| (path.0.clone(), specifier))
             .collect();
         let include_diagnostics = include_diagnostics_of(p, file_by_path);
-        // A file id is one parse, so a version shares the input of each
-        // file that `previous` has.
-        let parse_input = |file: &ParsedSourceFile| {
-            let shared = previous.and_then(|(_, old)| old.parse_inputs.get(&file.store));
-            shared.map_or_else(
-                || {
-                    Arc::new(LazyJsDocInput {
-                        parse_options: file.parse_options.clone(),
-                        text: file.text.clone(),
-                        script_kind: file.script_kind,
-                    })
-                },
-                Arc::clone,
-            )
-        };
-        let parse_inputs = match reused {
-            Some((_, old)) => {
-                let added: Vec<_> = replaced
-                    .iter()
-                    .map(|r| (r.file.store, parse_input(r.file)))
-                    .collect();
-                let mut inputs = old.parse_inputs.clone();
-                for r in replaced {
-                    inputs.remove(&r.old.store);
-                }
-                inputs.extend(added);
-                inputs
-            }
-            None => program_files
-                .iter()
-                .map(|file| (file.store, parse_input(file)))
-                .collect(),
-        };
         // Go reads these lazily from the program. The only file names the
         // checker asks about are resolved module names.
         let parse_file_redirects = match same_resolutions {
@@ -1427,7 +1360,6 @@ impl GoSharedState {
             jsx_runtime_import_specifiers,
             import_helpers_import_specifiers,
             include_diagnostics,
-            parse_inputs,
             parse_file_redirects,
             redirect_targets,
             references,
@@ -1525,19 +1457,6 @@ impl GoSharedState {
             .expect("not a preserved reference of a program file")
     }
 
-    // Go: ast/ast.go:2614 (*SourceFile).resolveJSDoc (slow path; the caller
-    // has checked the parser cache).
-    pub(super) fn resolve_js_doc(&self, file: Node, node: Node) -> &'static [Node] {
-        if let Some(jsdocs) = LAZY_JSDOC.with(|cache| cache.borrow().get(&node).copied()) {
-            return jsdocs;
-        }
-        let input = self
-            .parse_inputs
-            .get(&file.file_index())
-            .expect("not a Go frontend program file");
-        parse_lazy_js_doc(input, node)
-    }
-
     // Go: compiler/program.go:494 GetResolvedModule
     // PERF: returns a borrow, and looks the name up as `&str`. A name has at
     // most one entry per mode, so the mode scan finds the Go map entry.
@@ -1613,21 +1532,6 @@ impl GoSharedState {
     /// for both.
     fn assert_same(&self, full: &GoSharedState) {
         assert_same_include_diagnostics(&self.include_diagnostics, &full.include_diagnostics);
-        let mut inputs: Vec<_> = self.parse_inputs.keys().collect();
-        let mut full_inputs: Vec<_> = full.parse_inputs.keys().collect();
-        inputs.sort_unstable();
-        full_inputs.sort_unstable();
-        assert_eq!(inputs, full_inputs, "files with parse inputs");
-        for (store, input) in &self.parse_inputs {
-            let full = &full.parse_inputs[store];
-            assert!(
-                Arc::ptr_eq(input, full)
-                    || (input.parse_options == full.parse_options
-                        && input.script_kind == full.script_kind
-                        && *input.text == *full.text),
-                "parse inputs of file {store}"
-            );
-        }
         assert_eq!(self.references, full.references, "preserved references");
         let mut redirects: Vec<_> = self.redirects_for_resolution.keys().collect();
         let mut full_redirects: Vec<_> = full.redirects_for_resolution.keys().collect();

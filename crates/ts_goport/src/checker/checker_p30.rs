@@ -676,7 +676,10 @@ impl Checker {
         false
     }
 
-    // Go: checker/checker.go:27188 isThisPropertyAccessInConstructor
+    // Go: checker/checker.go:27793 isThisPropertyAccessInConstructor
+    // PERF: chkA. Go compares `GetThisContainer(node)`, which is never nil,
+    // with the constructor. With no constructor the answer is false, so the
+    // walk (it only reads the tree) is not made.
     pub fn is_this_property_access_in_constructor(&mut self, node: Node, prop: SymbolId) -> bool {
         let mut constructor = Node::NIL;
         let (kind, location) = self.is_constructor_declared_this_property(prop);
@@ -685,10 +688,11 @@ impl Checker {
         } else if is_this_property(node) && self.is_auto_typed_property(prop) {
             constructor = self.get_declaring_constructor(prop);
         }
-        get_this_container(
-            node, true,  /*includeArrowFunctions*/
-            false, /*includeClassComputedPropertyName*/
-        ) == constructor
+        constructor.is_some()
+            && get_this_container(
+                node, true,  /*includeArrowFunctions*/
+                false, /*includeClassComputedPropertyName*/
+            ) == constructor
     }
 
     // Go: checker/checker.go:27198 isAutoTypedProperty
