@@ -464,7 +464,7 @@ impl FilesParser {
         self.run_queue(loader);
     }
 
-    // Go: core/workgroup.go:78 singleThreadedWorkGroup.RunAndWait (--singleThreaded)
+    // Go: core/workgroup.go:67 singleThreadedWorkGroup.RunAndWait (--singleThreaded)
     // Go: core/workgroup.go:34 parallelWorkGroup.Queue (otherwise)
     // PORT: the loader runs the queued funcs here, one at a time. With
     // `go_work_group_task`, a Go panic in a queued func ends the run as it
