@@ -551,20 +551,25 @@ process (bin/tsgo.rs `start_signal_mask`, `go_signal_handlers`,
   was ignored at start (the `SigIgn` line of /proc/self/status; Go then
   keeps it ignored, so a process that tsgo starts gets it ignored too).
   Before `notify_context` (Go `NotifyContext` in `runMain`), SIGINT and
-  SIGTERM end the process in the same way (Go `_SigKill`); an ignored
-  SIGINT stays ignored there, as in Go. Go decides in its signal handler,
-  when the signal comes; tsgo acts on the `go-signals` thread, which can
-  read a signal only after `notify_context` has started. So a flag action
-  records each SIGINT and SIGTERM when it comes (bin/tsgo.rs
-  `CAME_BEFORE`), and the thread ends the run only at a signal that came
-  before `notify_context`. One that comes while `notify_context` runs is
-  sent again once it has returned, so it goes to `notify_context` (in Go
-  such a signal can go either way). Before, the thread read
-  `notify_context`'s state when it read the signal, so a signal that came
-  before `notify_context` and that the thread read after it was lost:
-  under CPU load on cup2, 81 of 300 SIGINT 1 to 10 ms after the start of
-  `tsgo -w` (followups9 round b skeptic). PORT: SIGABRT and SIGTRAP keep
-  their default actions. Other systems keep the default actions.
+  SIGTERM end the process by the signal (Go `_SigKill`); an ignored SIGINT
+  stays ignored there, as in Go. Go decides in its signal handler, when
+  the signal comes, and so does tsgo: in a process that runs the work,
+  `notify_defaults` gives them an action that sets the default action and
+  raises the signal (signal-hook's conditional default; a pid 1 exits
+  128 + N), and `notify_starts` turns that action off just before
+  `notify_context`. A signal that comes while `notify_context` runs is
+  recorded and sent again once it has returned, so it goes to
+  `notify_context` (in Go such a signal can go either way). Followups9
+  rounds b and c acted on the `go-signals` thread instead. A signal that
+  this thread read late was lost (round b: under CPU load on cup2, 81 of
+  300 SIGINT 1 to 10 ms after the start of `tsgo -w`), and a short run
+  (`--version`, a config error, an up-to-date build) often exited before
+  the thread acted (round c skeptic: under CPU load on cup2, 172 of 2000
+  SIGINT and 200 of 2000 SIGTERM). R158 kept the kernel's default action
+  until `notify_context` and lost a signal that came while
+  `notify_context` set its handler (a `tsgo -w` that such a SIGINT did
+  not end). PORT: SIGABRT and SIGTRAP keep their default actions. Other
+  systems keep the default actions.
 - The start window: Go sets these handlers once, before `main`, in its
   last image. tsgo sets them once too (bin/tsgo.rs `main`), after
   `thp_guard` (which runs before the first heap allocation), the launcher
@@ -585,15 +590,19 @@ process (bin/tsgo.rs `start_signal_mask`, `go_signal_handlers`,
   CPU load (R157 too; followups9 round b). In Go, a signal that comes
   before its handlers has its default action; in tsgo it waits for them.
   A launcher unblocks them once the thread of `forward_signals` has taken
-  SIGHUP too; a worker starts with them blocked and sets its own. A worker
-  sets no SIGINT and SIGTERM handlers before `notify_context`: its
-  launcher holds every signal until the worker catches it, SIGINT and
-  SIGTERM until the thread of `notify_context` runs. PORT: the `thp_guard`
-  watcher thread starts before the handlers and keeps them blocked. PORT:
-  with `--lsp` and `--api`, SIGINT and SIGTERM keep their default actions
-  until their own `notify_context` (in cmd/tsgo/lsp.rs and api.rs), which
-  `go_signal_handlers` cannot see; a signal that comes while that sets its
-  handler can be lost there.
+  SIGHUP too; a worker starts with them blocked and sets its own. A
+  process that runs the work (a worker too) keeps SIGINT and SIGTERM
+  blocked only until `launch` has chosen, with no handler and no exit in
+  between: `notify_defaults` then sets their default actions while they
+  are still blocked, so a signal never finds a handler without its
+  action, and unblocks them. A launcher holds every signal until its
+  worker catches it, SIGINT and SIGTERM until the thread of
+  `notify_context` runs. PORT: the `thp_guard` watcher thread starts
+  before the handlers and keeps them blocked. PORT: with `--lsp` and
+  `--api`, SIGINT and SIGTERM keep the kernel's default action until their
+  own `notify_context` (in cmd/tsgo/lsp.rs and api.rs), which `run_main`
+  cannot see; a signal that comes while that sets its handler can be lost
+  there.
 - A failed exec of `set_malloc_tunables` (a binary that is gone, for
   example) leaves SIGPIPE with its default action (std `Command` sets it
   for the new image). tsgo then gives SIGPIPE a handler that does nothing,
