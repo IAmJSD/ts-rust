@@ -223,12 +223,15 @@ fn set_malloc_tunables(budget: &ThreadBudget) {
 /// signal kills the worker, the launcher ends by the same signal
 /// (`end_by_signal`; a pid 1 exits 128 + N, as Go does there), so the
 /// caller sees what a run without a worker would give. When a SIGQUIT,
-/// SIGSTKFLT, SIGSYS or SIGHUP came to the launcher and the worker ends
-/// with a code, the launcher acts on that signal itself (`act_on`), as Go
+/// SIGSTKFLT, SIGSYS or SIGHUP came to the launcher and the worker sends
+/// its code, the launcher acts on that signal itself (`act_on`), as Go
 /// would have acted when it came: the worker did not act on it (it came
 /// too late, or the launcher still held it). A worker that acted on a
 /// signal sends `THROWN` or ends by the signal, and then the launcher only
-/// ends as it did.
+/// ends as it did. Without the code on the pipe (no own /proc, or the
+/// `worker-exit` thread could not start), the launcher cannot tell a
+/// worker that threw from one that ended with exit 2, so it does not act
+/// there: the worker's own handlers act.
 #[cfg(target_os = "linux")]
 fn launch(huge_pages: bool) -> Option<i32> {
     use std::io::Read;
@@ -315,8 +318,6 @@ fn launch(huge_pages: bool) -> Option<i32> {
         // End by the same signal. Where that returns (a pid 1, or a
         // signal that the launcher catches), exit 128 + N below.
         end_by_signal(signal);
-    } else if let Some(came) = &came {
-        act_on(came);
     }
     Some(match status {
         Ok(status) => status

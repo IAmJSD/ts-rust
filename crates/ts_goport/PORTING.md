@@ -612,9 +612,13 @@ process (bin/tsgo.rs `start_signal_mask`, `go_signal_handlers`,
   work (`exit`, before a worker sends its code) first acts on a recorded
   signal on the exiting thread, with the same text and exit code
   (`act_on_recorded`, `act`; only one thread acts, `take_the_end`). A
-  launcher records them too, and when its worker ends with a code, it acts
+  launcher records them too, and when its worker sends its code, it acts
   on one that came to it (`act_on`): the worker did not act on it, as it
-  came too late or the launcher still held it. A worker takes the end
+  came too late or the launcher still held it. Without the code on the
+  pipe (no own /proc, or a launcher thread that could not start), the
+  launcher cannot tell a worker that threw from one that ended with exit
+  2, so it does not act there (followups9 round d first did, and printed
+  `SIGQUIT: quit` twice). A worker takes the end
   before it sends its code, so it acts on no signal after that; one that
   acted sends `THROWN` (it printed the name) or ends by the signal, and
   the launcher then only ends as it did. Before, the round c skeptic

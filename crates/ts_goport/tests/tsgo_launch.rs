@@ -316,7 +316,7 @@ fn a_tsgo_whose_caller_blocks_signals() {
             let (status, stderr, ended) = signal_run(command, launch, &[(depth, signal)], &case);
             if signal == Signal::QUIT {
                 assert_eq!(status.code(), Some(2), "{case}: {status} {stderr}");
-                assert!(stderr.starts_with("SIGQUIT: quit"), "{case}: {stderr}");
+                assert!(quit_once(&stderr), "{case}: {stderr}");
             } else {
                 assert_eq!(status.signal(), Some(1), "{case}: {status} {stderr}");
             }
@@ -383,7 +383,7 @@ fn a_tsgo_whose_caller_ignores_sighup() {
         command.args(["--ignore-signal=HUP", env!("CARGO_BIN_EXE_tsgo")]);
         let (status, stderr, _) = signal_run(command, launch, signals, &case);
         assert_eq!(status.code(), Some(2), "{case}: {status} {stderr}");
-        assert!(stderr.starts_with("SIGQUIT: quit"), "{case}: {stderr}");
+        assert!(quit_once(&stderr), "{case}: {stderr}");
     }
 }
 
@@ -473,7 +473,7 @@ fn a_launcher_holds_a_signal_until_its_worker_catches_it() {
         rustix::process::kill_process(launcher, Signal::QUIT).unwrap();
         let (status, stderr) = end_of(child, "hold");
         assert_eq!(status.code(), Some(2), "{status} {stderr}");
-        assert!(stderr.starts_with("SIGQUIT: quit"), "{stderr}");
+        assert!(quit_once(&stderr), "{stderr}");
         return;
     }
     eprintln!("skipped: no worker was stopped before it caught SIGTERM");
@@ -506,7 +506,7 @@ fn a_launcher_does_not_hold_a_signal_behind_another() {
         let (status, stderr, ended) = signal_run(command, "1", &signals, &case);
         if signal == Signal::QUIT {
             assert_eq!(status.code(), Some(2), "{case}: {status} {stderr}");
-            assert!(stderr.starts_with("SIGQUIT: quit"), "{case}: {stderr}");
+            assert!(quit_once(&stderr), "{case}: {stderr}");
         } else {
             assert_eq!(status.signal(), Some(1), "{case}: {status} {stderr}");
         }
@@ -685,7 +685,7 @@ fn tsgo_catches_sigurg_and_sigwinch() {
         };
         let (status, stderr, _) = signal_run_with(command, launch, signals, &case, check);
         assert_eq!(status.code(), Some(2), "{case}: {status} {stderr}");
-        assert!(stderr.starts_with("SIGQUIT: quit"), "{case}: {stderr}");
+        assert!(quit_once(&stderr), "{case}: {stderr}");
     }
 }
 
@@ -755,7 +755,7 @@ fn a_signal_while_tsgo_sets_its_handler() {
         // strace exits as tsgo does.
         let (status, stderr) = end_of(child, &case);
         assert_eq!(status.code(), Some(2), "{case}: {status} {stderr}");
-        assert!(stderr.starts_with("SIGQUIT: quit"), "{case}: {stderr}");
+        assert!(quit_once(&stderr), "{case}: {stderr}");
     }
 }
 
@@ -991,7 +991,7 @@ fn a_launcher_whose_worker_cannot_start() {
         assert_eq!(child_of(pid), None, "{case}: a worker started");
     });
     assert_eq!(status.code(), Some(2), "{case}: {status} {stderr}");
-    assert!(stderr.starts_with("SIGQUIT: quit"), "{case}: {stderr}");
+    assert!(quit_once(&stderr), "{case}: {stderr}");
 }
 
 /// A worker opens the launcher's end of the pipe only after it has checked
@@ -1055,7 +1055,7 @@ fn a_worker_opens_only_the_launchers_pipe() {
 fn quit_launcher(command: Command, depth: usize, case: &str) {
     let (status, stderr, ended) = signal_run(command, "1", &[(depth, Signal::QUIT)], case);
     assert_eq!(status.code(), Some(2), "{case}: {status} {stderr}");
-    assert!(stderr.starts_with("SIGQUIT: quit"), "{case}: {stderr}");
+    assert!(quit_once(&stderr), "{case}: {stderr}");
     assert!(
         ended < Duration::from_secs(1),
         "{case}: ended {ended:?} after SIGQUIT"
@@ -1132,6 +1132,18 @@ fn signal_run_with(
     let sent = Instant::now();
     let (status, stderr) = end_of(child, case);
     (status, stderr, sent.elapsed())
+}
+
+/// Whether `stderr` starts with Go's text for SIGQUIT and has it once: a
+/// launcher must not print it again after its worker did (bin/tsgo.rs
+/// `THROWN`).
+fn quit_once(stderr: &str) -> bool {
+    stderr.starts_with("SIGQUIT: quit")
+        && stderr
+            .lines()
+            .filter(|line| *line == "SIGQUIT: quit")
+            .count()
+            == 1
 }
 
 /// How the run `child` ended and its stderr. A run that has not ended
