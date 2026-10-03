@@ -855,9 +855,16 @@ fn an_exit_acts_on_a_signal_that_came_before_it() {
         // strace exits as tsgo does.
         let (status, stderr) = end_of(child, &case);
         let _ = drain.join();
+        // strace writes its own notes to the same stderr.
+        let text: Vec<&str> = stderr
+            .lines()
+            .filter(|line| !line.starts_with("strace: "))
+            .collect();
         if signal == Signal::QUIT {
             assert_eq!(status.code(), Some(2), "{case}: {status} {stderr}");
-            assert!(stderr.starts_with("SIGQUIT: quit"), "{case}: {stderr}");
+            // Once: a launcher does not act on a signal that its worker
+            // threw.
+            assert_eq!(text, ["SIGQUIT: quit"], "{case}: {stderr}");
         } else {
             assert_eq!(status.signal(), Some(1), "{case}: {status} {stderr}");
         }
