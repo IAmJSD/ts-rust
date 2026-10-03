@@ -287,6 +287,16 @@ pub(crate) struct QueuedParseTask {
     depth: i32,
 }
 
+/// Moves the funcs that one parent queued (`queued`) to the end of
+/// `level`: the last one first (Go `runnext`), then the others in queue
+/// order (the FIFO run queue of the P). See `FilesParser::run_queue`.
+fn append_in_runnext_order(queued: &mut Vec<QueuedParseTask>, level: &mut Vec<QueuedParseTask>) {
+    if let Some(last) = queued.pop() {
+        level.push(last);
+        level.append(queued);
+    }
+}
+
 // Go: filesparser.go:205 filesParser
 // PORT: Go `core.WorkGroup` is single threaded here (contract 10): the
 // loader runs the queued functions one at a time, in the order of
@@ -465,7 +475,7 @@ impl FilesParser {
     }
 
     // Go: core/workgroup.go:67 singleThreadedWorkGroup.RunAndWait (--singleThreaded)
-    // Go: core/workgroup.go:34 parallelWorkGroup.Queue (otherwise)
+    // Go: core/workgroup.go:34-42 parallelWorkGroup.Queue (otherwise)
     // PORT: the loader runs the queued funcs here, one at a time. With
     // `go_work_group_task`, a Go panic in a queued func ends the run as it
     // does in Go. The order decides which path reaches a file first, and so
@@ -483,14 +493,29 @@ impl FilesParser {
     //   file. So a task that is N queue steps from a root usually runs after
     //   every task that is fewer steps away. The port runs the queue level
     //   by level: the roots are level 0, and the subtasks that a level L
-    //   func queues are level L + 1. Inside a level, the last queued func
-    //   runs first: the Go `go` statement puts the new goroutine in the
-    //   `runnext` slot of its P (runtime/proc.go `newproc`, `runqput` with
-    //   next true), so the last subtask that a func queues runs next there.
-    //   Go stays random in two places. A large file can take longer to load
-    //   than a chain of small files, so a path with more steps can arrive
-    //   first. Inside a level, the other goroutines wait in the FIFO run
-    //   queue of the P or idle Ps steal them, so their order is not fixed.
+    //   func queues are level L + 1. The port builds the next level per
+    //   parent (the func that queued the subtasks, or `parse` for the
+    //   roots), in the order the parents ran. For each parent, its last
+    //   queued subtask goes first, then its other subtasks in queue order.
+    //   This follows the Go scheduler (runtime/proc.go `newproc`, `runqput`
+    //   with next true, checked in go1.27.1): the `go` statement puts the new
+    //   goroutine in the `runnext` slot of its P, and moves the goroutine
+    //   that was there to the tail of the P's FIFO run queue. So the last
+    //   subtask that a func queues runs next on that P, and the func's other
+    //   subtasks wait in the FIFO queue, in queue order, behind the subtasks
+    //   that earlier funcs queued.
+    //   Go stays random in three places. Idle Ps steal goroutines from the
+    //   head of the FIFO queue, so the other subtasks of a level can run
+    //   before or with the ones that this order puts first. The last
+    //   subtask runs at once on the P of its parent, while the others wait
+    //   for that P or a steal, so a chain of tiny files (each the last
+    //   subtask of its parent) can arrive before a path of fewer steps. An
+    //   example: `main.ts` imports `./a` and `./b`, which both import `./s`,
+    //   which imports a package, and then `./r1`, a relative chain of 3
+    //   files to the package source. With 1-line files Go N takes the
+    //   4-parse chain in 105 of 105 runs, and this order takes the 3-parse
+    //   package route; with 300-line files Go takes the package route too.
+    //   And a large file can load slower than a chain of small files.
     //   For a file that two such paths reach, parallel Go can give a
     //   different answer in each run, and this order gives one of them.
     fn run_queue(&mut self, loader: &FileLoader) {
@@ -500,16 +525,17 @@ impl FilesParser {
             }
             return;
         }
-        // `queue` collects the next level while `level` runs.
+        // `queue` holds the funcs of one parent: the roots, then the
+        // subtasks of each func of `level` after it ran.
         let mut level = Vec::new();
-        loop {
-            std::mem::swap(&mut level, &mut self.queue);
-            if level.is_empty() {
-                return;
-            }
-            while let Some(queued) = level.pop() {
+        append_in_runnext_order(&mut self.queue, &mut level);
+        while !level.is_empty() {
+            let mut next = Vec::with_capacity(level.len());
+            for queued in level {
                 crate::core::go_work_group_task(|| self.run_queued(loader, queued));
+                append_in_runnext_order(&mut self.queue, &mut next);
             }
+            level = next;
         }
     }
 
@@ -1380,10 +1406,10 @@ enum PrefetchRequest {
 
 #[derive(Default)]
 struct PrefetchQueue {
-    /// Jobs no worker has taken yet. Workers take the newest first, as the
-    /// loader does inside a level (`run_queue`), but take `lib.dom.d.ts`
-    /// before all others. A job can be in the list twice (`rank_largest`,
-    /// `queue_batch`); a worker skips a job that is no longer queued.
+    /// Jobs no worker has taken yet. Workers take the newest first, but take
+    /// `lib.dom.d.ts` before all others. A job can be in the list twice
+    /// (`rank_largest`, `queue_batch`); a worker skips a job that is no
+    /// longer queued.
     pending: Vec<Arc<PrefetchJob>>,
     /// The queued `lib.dom.d.ts` job. It is the largest file of most
     /// programs, so its parse starts first to end before the loader needs it.
@@ -1775,17 +1801,19 @@ impl PrefetchShared {
     /// the jobs of files that the loader has not reached yet (`Known`),
     /// which move up. Jobs that a worker started or that the loader took
     /// stay where they are.
-    // PERF: effect R3-E2. The loader loads the batch newest first, and each
-    // file's imports before the next file of the batch, so it needs the
-    // newest file at once. It gets there before a worker wakes, so it
-    // parses that file itself anyway, and a worker that takes it only
-    // makes the loader wait. So the newest job goes below the others and
-    // wakes no worker; the workers take the file the loader needs next
-    // first. The jobs of files that an earlier batch or a worker queued
-    // move up too, so the loader does not reach them while they are deep
-    // in the list. Before, the loader parsed 117 to 182 effect files itself
-    // (`GOPORT_PREFETCH_STATS` "claimed"), among them root files such as
-    // `Layer.ts` and `@types/node` files that were queued long before.
+    // PERF: effect R3-E2, measured when the loader's queue was one stack.
+    // The loader loaded the batch newest first, and each file's imports
+    // before the next file of the batch, so it needed the newest file at
+    // once. It got there before a worker woke, so it parsed that file itself
+    // anyway, and a worker that took it only made the loader wait. So the
+    // newest job goes below the others and wakes no worker; the workers take
+    // the other files first. The jobs of files that an earlier batch or a
+    // worker queued move up too, so the loader does not reach them while
+    // they are deep in the list. Before, the loader parsed 117 to 182 effect
+    // files itself (`GOPORT_PREFETCH_STATS` "claimed"), among them root
+    // files such as `Layer.ts` and `@types/node` files that were queued long
+    // before. The loader now runs level by level (`run_queue`); this order
+    // was kept (loaderorder1: no clear change in `GOPORT_PREFETCH_STATS`).
     fn queue_batch(&self, requests: Vec<PrefetchRequest>) {
         if requests.is_empty() {
             return;
@@ -2118,8 +2146,8 @@ impl FileRefs {
     }
 }
 
-/// A parse worker: parses queued files, newest first (as the loader does
-/// inside a level), until the queue closes. After each parse it queues the
+/// A parse worker: parses queued files, newest first
+/// (`PrefetchQueue::pending`), until the queue closes. After each parse it queues the
 /// files that the parse references. The first free worker after the root
 /// tasks are queued ranks them (`PrefetchShared::rank_roots`).
 fn run_prefetch_worker(shared: &PrefetchShared) {
@@ -2881,14 +2909,30 @@ mod tests {
         }
     }
 
-    /// Writes `app` (path, text) to a temp dir, next to a workspace package
-    /// `lib/` (`index.ts` imports `child.ts`) that `app/node_modules/@x/lib`
-    /// links to, and a tsconfig.json with the root `app/main.ts`. Loads the
-    /// program and returns the files that it found searching node_modules
-    /// (lowest depth above 0: no emit, no TS6059), relative to the dir.
+    /// A workspace package: `index.ts` imports `child.ts`.
+    const LIB: [(&str, &str); 3] = [
+        (
+            "lib/package.json",
+            r#"{ "name": "@x/lib", "version": "1.0.0", "exports": { ".": "./index.ts" } }"#,
+        ),
+        (
+            "lib/index.ts",
+            "export { c } from \"./child\";\nexport const a = 1;\n",
+        ),
+        ("lib/child.ts", "export const c = 2;\n"),
+    ];
+    /// `app/node_modules/@x/lib` links to `lib/`.
+    const LIB_LINK: (&str, &str) = ("app/node_modules/@x/lib", "../../../lib");
+
+    /// Writes `files` (path, text) and the symlinks `links` (path, target)
+    /// to a temp dir, with a tsconfig.json with the root `app/main.ts`.
+    /// Loads the program and returns the files that it found searching
+    /// node_modules (lowest depth above 0: no emit, no TS6059), relative to
+    /// the dir.
     fn found_searching_node_modules(
         label: &str,
-        app: &[(&str, &str)],
+        files: &[(&str, &str)],
+        links: &[(&str, &str)],
         single_threaded: bool,
     ) -> Vec<String> {
         let dir = std::env::temp_dir().join(format!(
@@ -2896,30 +2940,22 @@ mod tests {
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&dir);
-        let lib = [
-            (
-                "lib/package.json",
-                r#"{ "name": "@x/lib", "version": "1.0.0", "exports": { ".": "./index.ts" } }"#,
-            ),
-            (
-                "lib/index.ts",
-                "export { c } from \"./child\";\nexport const a = 1;\n",
-            ),
-            ("lib/child.ts", "export const c = 2;\n"),
-            (
-                "tsconfig.json",
-                r#"{ "compilerOptions": { "module": "esnext", "moduleResolution": "bundler",
-                     "target": "es2022", "outDir": "out", "rootDir": ".", "types": [] },
-                     "files": ["app/main.ts"] }"#,
-            ),
-        ];
-        for (path, text) in lib.iter().chain(app) {
+        let tsconfig = (
+            "tsconfig.json",
+            r#"{ "compilerOptions": { "module": "esnext", "moduleResolution": "bundler",
+                 "target": "es2022", "outDir": "out", "rootDir": ".", "types": [] },
+                 "files": ["app/main.ts"] }"#,
+        );
+        for (path, text) in files.iter().chain([&tsconfig]) {
             let path = dir.join(path);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(path, text).unwrap();
         }
-        std::fs::create_dir_all(dir.join("app/node_modules/@x")).unwrap();
-        std::os::unix::fs::symlink("../../../lib", dir.join("app/node_modules/@x/lib")).unwrap();
+        for (path, target) in links {
+            let path = dir.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::os::unix::fs::symlink(target, path).unwrap();
+        }
         let cwd = dir.to_string_lossy().replace('\\', "/");
         let fs = bundled::wrap_fs(osvfs_fs());
         let sys = System {
@@ -2963,6 +2999,22 @@ mod tests {
         found
     }
 
+    /// Both modes give `expected` (sorted).
+    fn assert_found_in_both_modes(
+        label: &str,
+        files: &[(&str, &str)],
+        links: &[(&str, &str)],
+        expected: &[&str],
+    ) {
+        for single_threaded in [false, true] {
+            assert_eq!(
+                found_searching_node_modules(label, files, links, single_threaded),
+                expected,
+                "{label}, single threaded: {single_threaded}"
+            );
+        }
+    }
+
     // `lib/index.ts` is reached through the package at depth 1 and through
     // relative imports at depth 0. Go N does not start the subtasks of a file
     // again when it arrives at a lower depth, so the first arrival decides
@@ -2995,16 +3047,112 @@ mod tests {
                 "import { a } from \"@x/lib\";\nexport const c = a;\n",
             ),
         ];
+        let deep = [&LIB[..], &deep].concat();
+        let shallow = [&LIB[..], &shallow].concat();
         let child = vec!["lib/child.ts".to_string()];
-        assert_eq!(found_searching_node_modules("deep", &deep, false), child);
-        assert_eq!(found_searching_node_modules("deep", &deep, true), child);
         assert_eq!(
-            found_searching_node_modules("shallow", &shallow, false),
+            found_searching_node_modules("deep", &deep, &[LIB_LINK], false),
+            child
+        );
+        assert_eq!(
+            found_searching_node_modules("deep", &deep, &[LIB_LINK], true),
+            child
+        );
+        assert_eq!(
+            found_searching_node_modules("shallow", &shallow, &[LIB_LINK], false),
             Vec::<String>::new()
         );
         assert_eq!(
-            found_searching_node_modules("shallow", &shallow, true),
+            found_searching_node_modules("shallow", &shallow, &[LIB_LINK], true),
             child
+        );
+    }
+
+    // A tie at level 2: `main.ts` imports the package `@x/wrap` (which
+    // imports `@x/lib`) and then `./r1` (which imports `../lib/index`). Both
+    // routes reach `lib/index.ts` in 2 parses. `./r1` was queued last, so it
+    // runs first in level 1 (Go `runnext`), and its subtask runs first in
+    // level 2: `lib/index.ts` loads at depth 0. Go N (673a5f17d713), 1-line
+    // files: 105 of 105 multi-threaded runs on 3 hosts, and
+    // --singleThreaded.
+    #[test]
+    fn level_two_tie_follows_runnext() {
+        let files = [
+            (
+                "lib/package.json",
+                r#"{ "name": "@x/lib", "version": "1.0.0", "exports": { ".": "./index.ts" } }"#,
+            ),
+            (
+                "lib/index.ts",
+                "export { c } from \"./child\";\nexport const a = 1;\n",
+            ),
+            (
+                "lib/child.ts",
+                "export { g } from \"./grand\";\nexport const c = 2;\n",
+            ),
+            ("lib/grand.ts", "export const g = 3;\n"),
+            (
+                "wrap/package.json",
+                r#"{ "name": "@x/wrap", "version": "1.0.0", "exports": { ".": "./index.ts" } }"#,
+            ),
+            ("wrap/index.ts", "export { a as w } from \"@x/lib\";\n"),
+            (
+                "app/main.ts",
+                "import { w } from \"@x/wrap\";\nimport { r } from \"./r1\";\nexport const m = w + r;\n",
+            ),
+            ("app/r1.ts", "export { a as r } from \"../lib/index\";\n"),
+        ];
+        let links = [
+            LIB_LINK,
+            ("app/node_modules/@x/wrap", "../../../wrap"),
+            ("wrap/node_modules/@x/lib", "../../../lib"),
+        ];
+        assert_found_in_both_modes("nm-two-routes-ts", &files, &links, &["wrap/index.ts"]);
+    }
+
+    // A diamond in the package (`index.ts` imports `x.ts` and `y.ts`, which
+    // both import `z.ts`, which imports `leaf.ts`), and `main.ts` imports
+    // the package and then `./a`, which imports `../lib/y`. Level 1 runs
+    // `./a` first, so level 2 runs `y.ts` from `./a` (depth 0) before the
+    // subtasks of `index.ts`, and level 3 runs `z.ts` from `y.ts` (depth 0)
+    // before `z.ts` from `x.ts`. Go N (673a5f17d713), 1-line files: 99 of
+    // 105 multi-threaded runs on 3 hosts (the other 6: `leaf.ts` found
+    // searching node_modules too), and --singleThreaded.
+    #[test]
+    fn diamond_in_package_follows_runnext() {
+        let files = [
+            (
+                "lib/package.json",
+                r#"{ "name": "@x/lib", "version": "1.0.0", "exports": { ".": "./index.ts" } }"#,
+            ),
+            (
+                "lib/index.ts",
+                "export { x } from \"./x\";\nexport { y } from \"./y\";\n",
+            ),
+            (
+                "lib/x.ts",
+                "import { z } from \"./z\";\nexport const x = z;\n",
+            ),
+            (
+                "lib/y.ts",
+                "import { z } from \"./z\";\nexport const y = z;\n",
+            ),
+            (
+                "lib/z.ts",
+                "import { leaf } from \"./leaf\";\nexport const z = leaf;\n",
+            ),
+            ("lib/leaf.ts", "export const leaf = 1;\n"),
+            (
+                "app/main.ts",
+                "import { x } from \"@x/lib\";\nimport { y } from \"./a\";\nexport const m = x + y;\n",
+            ),
+            ("app/a.ts", "export { y } from \"../lib/y\";\n"),
+        ];
+        assert_found_in_both_modes(
+            "diamond-pkg",
+            &files,
+            &[LIB_LINK],
+            &["lib/index.ts", "lib/x.ts"],
         );
     }
 }
