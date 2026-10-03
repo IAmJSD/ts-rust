@@ -1273,12 +1273,12 @@ pub(crate) fn new_unknown_reference_processing_diagnostic(
 // ──────────────────────────────────────────────────────────────────────
 //
 // PORT: Go runs `parseTask.load` (read, parse, resolve, queue the
-// subtasks) in one goroutine per task. The Rust loader keeps the Go
-// single-threaded order, because store ids follow the load order. Parse
-// workers do the rest of Go's parallel work ahead of it: they read and
-// parse queued files, resolve their imports with their own resolvers, and
-// queue the files they find. The loader checks every worker result
-// (`take_prefetched`) and reads the answers the workers resolved
+// subtasks) in one goroutine per task. The Rust loader runs the tasks one
+// at a time in a fixed order (`run_queue`), because store ids follow the
+// load order. Parse workers do the rest of Go's parallel work ahead of it:
+// they read and parse queued files, resolve their imports with their own
+// resolvers, and queue the files they find. The loader checks every worker
+// result (`take_prefetched`) and reads the answers the workers resolved
 // (`SharedResolutionCache`), so the output is the same.
 
 /// Number of parse workers next to the loading thread at the start of a
@@ -1380,10 +1380,10 @@ enum PrefetchRequest {
 
 #[derive(Default)]
 struct PrefetchQueue {
-    /// Jobs no worker has taken yet. Workers take the newest first, like
-    /// the loader's queue, but take `lib.dom.d.ts` before all others. A job
-    /// can be in the list twice (`rank_largest`, `queue_batch`); a worker
-    /// skips a job that is no longer queued.
+    /// Jobs no worker has taken yet. Workers take the newest first, as the
+    /// loader does inside a level (`run_queue`), but take `lib.dom.d.ts`
+    /// before all others. A job can be in the list twice (`rank_largest`,
+    /// `queue_batch`); a worker skips a job that is no longer queued.
     pending: Vec<Arc<PrefetchJob>>,
     /// The queued `lib.dom.d.ts` job. It is the largest file of most
     /// programs, so its parse starts first to end before the loader needs it.
@@ -2118,8 +2118,8 @@ impl FileRefs {
     }
 }
 
-/// A parse worker: parses queued files, newest first (the loader's queue
-/// is a stack too), until the queue closes. After each parse it queues the
+/// A parse worker: parses queued files, newest first (as the loader does
+/// inside a level), until the queue closes. After each parse it queues the
 /// files that the parse references. The first free worker after the root
 /// tasks are queued ranks them (`PrefetchShared::rank_roots`).
 fn run_prefetch_worker(shared: &PrefetchShared) {
