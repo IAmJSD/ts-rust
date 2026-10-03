@@ -611,12 +611,17 @@ process (bin/tsgo.rs `start_signal_mask`, `go_signal_handlers`,
   comes (bin/tsgo.rs `RECORDED`), and each exit of a process that runs the
   work (`exit`, before a worker sends its code) first acts on a recorded
   signal on the exiting thread, with the same text and exit code
-  (`act_on_recorded`, `act`; only one thread acts). A launcher does the
-  same for a signal that it still holds for its worker when the worker
-  ends (`act_on`), unless the worker has thrown a signal (`THROWN`: it
-  printed the name once already). Before, the round c skeptic measured
-  under CPU load on cup2 that R158 lost 2 of 1000 SIGQUIT and round c up
-  to 197 of 2000 SIGHUP. PORT: the end at EPIPE on fd 1 or 2
+  (`act_on_recorded`, `act`; only one thread acts, `take_the_end`). A
+  launcher records them too, and when its worker ends with a code, it acts
+  on one that came to it (`act_on`): the worker did not act on it, as it
+  came too late or the launcher still held it. A worker takes the end
+  before it sends its code, so it acts on no signal after that; one that
+  acted sends `THROWN` (it printed the name) or ends by the signal, and
+  the launcher then only ends as it did. Before, the round c skeptic
+  measured under CPU load on cup2 that R158 lost 2 of 1000 SIGQUIT and
+  round c up to 197 of 2000 SIGHUP, and a launcher whose worker ran
+  `--version` lost about 12% of the SIGQUIT and SIGHUP that came in its
+  first 20 ms (R158, quiet mini-abf9). PORT: the end at EPIPE on fd 1 or 2
   (execute/tsc/stdio.rs `sigpipe`) and the ends in `core` (a thread that
   cannot start, a Go panic in a goroutine) do not look; in Go the handler
   has acted before them.
