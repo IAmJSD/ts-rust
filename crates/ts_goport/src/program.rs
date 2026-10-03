@@ -1998,6 +1998,11 @@ fn bind_files_parallel(lineage: &mut Lineage) {
                             .wait(state)
                             .unwrap_or_else(std::sync::PoisonError::into_inner);
                     }
+                    // The scope ends when this closure returns, but
+                    // thread-locals drop only at thread exit. Let go of the
+                    // program tables now, so a release after the bind frees
+                    // them (`WorkerSeed`).
+                    drop(TABLES.with(|cache| cache.borrow_mut().take()));
                 });
         }
         drop(sender);
