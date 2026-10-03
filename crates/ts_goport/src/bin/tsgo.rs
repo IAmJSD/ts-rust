@@ -25,9 +25,10 @@
 //! Go must get (`GO_UNBLOCKED`; those with a handler thread, `HELD`, once
 //! their handlers are set), the signals that Go drops get a handler
 //! that does nothing, SIGQUIT prints its name and exits 2, SIGHUP ends the
-//! process by the signal (`go_signal_handlers`), SIGINT and SIGTERM do so
-//! until `notify_context` (`notify_defaults`), and the soft open-file limit
-//! goes up (`go_runtime_start`; PORTING.md "Process start").
+//! process by the signal (`go_signal_handlers`; each exit acts on such a
+//! signal that came, `act_on_recorded`), SIGINT and SIGTERM do so until
+//! `notify_context` (`notify_defaults`), and the soft open-file limit goes
+//! up (`go_runtime_start`; PORTING.md "Process start").
 //! PORT: Go `core.ApplyDebugStackLimit` (`TS_GO_DEBUG_STACK_LIMIT`) is a
 //! debug setting and is skipped. The work runs on a thread with the stack
 //! size of `gostd::stack::max_stack_size` (1 GiB with no address space or
@@ -146,6 +147,8 @@ fn main() {
         .spawn(move || exit(run_main(start)));
     // Reached only when `run_main` panics.
     let _ = work.join();
+    #[cfg(target_os = "linux")]
+    act_on_recorded();
     eprintln!("tsgo: work thread failed");
     std::process::exit(EXIT_UNPORTED);
 }
@@ -219,7 +222,11 @@ fn set_malloc_tunables(budget: &ThreadBudget) {
 /// (`drop_go_signals`: an ignored SIGCHLD would make `wait` fail). When a
 /// signal kills the worker, the launcher ends by the same signal
 /// (`end_by_signal`; a pid 1 exits 128 + N, as Go does there), so the
-/// caller sees what a run without a worker would give.
+/// caller sees what a run without a worker would give. When the worker
+/// ends while the launcher still holds a SIGQUIT, SIGSTKFLT, SIGSYS or
+/// SIGHUP for it, the launcher acts on that signal itself (`act_on`), as
+/// Go would have acted when it came, unless the worker has thrown a signal
+/// (`THROWN`), which printed its name once already.
 #[cfg(target_os = "linux")]
 fn launch(huge_pages: bool) -> Option<i32> {
     use std::io::Read;
@@ -266,9 +273,11 @@ fn launch(huge_pages: bool) -> Option<i32> {
         // handlers.
         return None;
     };
-    if let Some((forward, ready)) = forward {
+    let mut unsent = None;
+    if let Some((forward, ready, held)) = forward {
         let _ = forward.send(rustix::process::Pid::from_child(&worker));
         let _ = ready.recv();
+        unsent = Some(held);
     }
     unblock_held();
     // `write` stays open until the worker ends, so the read below ends when
@@ -289,7 +298,14 @@ fn launch(huge_pages: bool) -> Option<i32> {
         });
     let mut code = [0; 4];
     if std::fs::File::from(read).read_exact(&mut code).is_ok() {
-        return Some(i32::from_le_bytes(code));
+        let code = i32::from_le_bytes(code);
+        if code == THROWN {
+            return Some(EXIT_GO_PANIC);
+        }
+        if let Some(unsent) = &unsent {
+            act_on(unsent);
+        }
+        return Some(code);
     }
     // The worker ended without sending a code.
     let status = worker.wait();
@@ -297,6 +313,8 @@ fn launch(huge_pages: bool) -> Option<i32> {
         // End by the same signal. Where that returns (a pid 1, or a
         // signal that the launcher catches), exit 128 + N below.
         end_by_signal(signal);
+    } else if let Some(unsent) = &unsent {
+        act_on(unsent);
     }
     Some(match status {
         Ok(status) => status
@@ -465,6 +483,11 @@ struct OwnStatus {
 /// Ctrl-C), the worker's `notify_context` thread has ended at its own copy,
 /// so the launcher's copy waits until `HOLD_LIMIT`, and a SIGQUIT or SIGHUP
 /// that then comes to the launcher only goes on at once, as in Go.
+/// A SIGQUIT, SIGSTKFLT, SIGSYS or SIGHUP that waits when the worker ends
+/// stays in the returned `Arrivals` (the handler records each one when it
+/// comes, and the thread takes it when it sends it on), so `launch` acts
+/// on it (`act_on`). A SIGINT or SIGTERM that waits then is dropped, as
+/// before: the worker has passed its `notify_context`.
 /// The thread starts as a Go runtime thread does (`GoThread`): when the OS
 /// refuses it, the launcher ends with Go's text and exit 2, before there is
 /// a worker. Go has no launcher, so its process gets every signal; a
@@ -474,23 +497,37 @@ struct OwnStatus {
 fn forward_signals() -> Option<(
     std::sync::mpsc::Sender<rustix::process::Pid>,
     std::sync::mpsc::Receiver<()>,
+    std::sync::Arc<Arrivals>,
 )> {
-    use signal_hook::consts::{SIGINT, SIGTERM};
-    let thrown = GO_THROWN.iter().map(|(signal, _)| signal.as_raw());
+    use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
+    let thrown: Vec<i32> = GO_THROWN
+        .iter()
+        .map(|(signal, _)| signal.as_raw())
+        .collect();
+    let acted: Vec<i32> = thrown.iter().copied().chain([SIGHUP]).collect();
+    // Before the actions of `signals`, so a flag is set when the thread
+    // reads its signal. SIGHUP's comes with SIGHUP itself, below.
+    let unsent = std::sync::Arc::new(Arrivals::new(&acted));
+    for &signal in &thrown {
+        let _ = unsent.listen(signal);
+    }
     let mut signals =
         signal_hook::iterator::Signals::new([SIGINT, SIGTERM].into_iter().chain(thrown)).ok()?;
     let (send, receive) = std::sync::mpsc::channel();
     let (taken, ready) = std::sync::mpsc::channel();
+    let held_on = unsent.clone();
     ts_goport::core::GoThread::new()
         .name("forward-signals".to_string())
         .spawn(move || {
+            let unsent = held_on;
             let Ok(pid) = receive.recv() else {
                 return;
             };
             // The worker has started.
             let limit = own_proc().then(|| Instant::now() + HOLD_LIMIT);
-            if !ignored_at_start(signal_hook::consts::SIGHUP) {
-                let _ = signals.add_signal(signal_hook::consts::SIGHUP);
+            if !ignored_at_start(SIGHUP) {
+                let _ = unsent.listen(SIGHUP);
+                let _ = signals.add_signal(SIGHUP);
             }
             // Each signal of `HELD` has its action in the launcher now.
             let _ = taken.send(());
@@ -516,21 +553,26 @@ fn forward_signals() -> Option<(
                     }
                 }
                 held.retain(|&signal| {
-                    let bit = 1u64 << (signal.as_raw() - 1).unsigned_abs();
+                    let raw = signal.as_raw();
+                    let bit = 1u64 << (raw - 1).unsigned_abs();
                     let wait = match limit {
-                        Some(until) if caught_before & bit == 0 => {
-                            match caught(pid, signal, until) {
+                        Some(until) if caught_before & bit == 0 && Instant::now() < until => {
+                            match caught(pid, signal) {
                                 Some(true) => {
                                     caught_before |= bit;
                                     false
                                 }
                                 Some(false) => true,
+                                // The worker has ended: `launch` acts on
+                                // a signal that `unsent` records.
+                                None if unsent.has(raw) => return false,
                                 None => false,
                             }
                         }
                         _ => false,
                     };
-                    if !wait {
+                    // `launch` may have taken it at the worker's end.
+                    if !wait && (!unsent.has(raw) || unsent.took(raw)) {
                         let _ = rustix::process::kill_process(pid, signal);
                     }
                     wait
@@ -541,7 +583,7 @@ fn forward_signals() -> Option<(
                 }
             }
         });
-    Some((send, ready))
+    Some((send, ready, unsent))
 }
 
 /// Whether the worker `pid` catches `signal` now (`forward_signals`), so a
@@ -558,18 +600,21 @@ fn forward_signals() -> Option<(
 /// between does nothing. So it also needs the thread that the worker
 /// starts after it has registered the signal (`ready_thread`). The caller
 /// calls it only with this process's own /proc (`own_proc`).
-/// None when the signal must not wait any longer: the worker has ended,
-/// that file does not show a live child of this process, or it is `until`.
+/// None when the worker has ended: that file is gone, or it does not show a
+/// live child of this process. True when the file cannot be read for
+/// another reason: a wait for it would last until its limit.
 #[cfg(target_os = "linux")]
-fn caught(
-    pid: rustix::process::Pid,
-    signal: rustix::process::Signal,
-    until: Instant,
-) -> Option<bool> {
-    if Instant::now() >= until {
-        return None;
-    }
-    let status = std::fs::read_to_string(format!("/proc/{}/status", pid.as_raw_pid())).ok()?;
+fn caught(pid: rustix::process::Pid, signal: rustix::process::Signal) -> Option<bool> {
+    let status = match std::fs::read_to_string(format!("/proc/{}/status", pid.as_raw_pid())) {
+        Ok(status) => status,
+        Err(err)
+            if err.kind() == std::io::ErrorKind::NotFound
+                || err.raw_os_error() == Some(rustix::io::Errno::SRCH.raw_os_error()) =>
+        {
+            return None;
+        }
+        Err(_) => return Some(true),
+    };
     let field = |name: &str| {
         status
             .lines()
@@ -864,11 +909,14 @@ fn drop_go_signals() {
 /// unless it was ignored at start (`ignored_at_start`). SIGINT and SIGTERM
 /// have theirs from `notify_defaults`. `main` calls it once, after the exec
 /// of `set_malloc_tunables`, as Go sets its handlers in its last image, and
-/// then unblocks `HELD`. The thread waits on a pipe until a signal comes;
-/// Go acts in the signal handler, with no thread. The thread starts as a Go
-/// runtime thread does (`GoThread`): when the OS refuses it, the run ends
-/// with Go's text and exit 2. Going on without it would drop these signals
-/// (dropping `signals` removes their actions, not their handlers).
+/// then unblocks `HELD`. Go acts in the signal handler. tsgo acts on a
+/// thread, which waits on a pipe until a signal comes, and on each exit
+/// path: the handler records each signal when it comes (`RECORDED`), and an
+/// exit acts on a recorded signal first (`act_on_recorded`), so an exit
+/// that comes before the thread acts does not lose it. The thread starts as
+/// a Go runtime thread does (`GoThread`): when the OS refuses it, the run
+/// ends with Go's text and exit 2. Going on without it would drop these
+/// signals (dropping `signals` removes their actions, not their handlers).
 #[cfg(target_os = "linux")]
 fn go_signal_handlers() {
     use signal_hook::consts::SIGHUP;
@@ -880,18 +928,18 @@ fn go_signal_handlers() {
     if !ignored_at_start(SIGHUP) {
         ended.push(SIGHUP);
     }
+    // Before the thread's own actions, so each flag is set when the
+    // thread reads its signal.
+    let (recorded, _) = Arrivals::register(&ended);
+    let _ = RECORDED.set(recorded);
     if let Ok(mut signals) = signal_hook::iterator::Signals::new(ended) {
         ts_goport::core::GoThread::new()
             .name(GO_SIGNALS_THREAD.to_string())
             .spawn(move || {
                 // Started after the actions above (`HELD`).
                 unblock_held();
-                // Each one ends the process.
                 if let Some(signal) = signals.forever().next() {
-                    match GO_THROWN.iter().find(|(s, _)| s.as_raw() == signal) {
-                        Some((_, name)) => throw(name),
-                        None => die_from_signal(signal),
-                    }
+                    act(signal);
                 }
             });
     }
@@ -903,6 +951,54 @@ fn go_signal_handlers() {
 /// (`ready_thread`).
 #[cfg(target_os = "linux")]
 const GO_SIGNALS_THREAD: &str = "go-signals";
+
+/// The signals of `go_signal_handlers`, each with a flag that its handler
+/// sets when it comes.
+#[cfg(target_os = "linux")]
+static RECORDED: std::sync::OnceLock<Arrivals> = std::sync::OnceLock::new();
+
+/// Called on each exit path of a process that runs the work, before it
+/// exits: acts on a signal that came (`RECORDED`) and that the `go-signals`
+/// thread has not acted on yet, as Go would have acted when it came (a
+/// short run such as `--version` often exits before the thread runs). The
+/// output so far is written already, as Go's is.
+#[cfg(target_os = "linux")]
+fn act_on_recorded() {
+    if let Some(recorded) = RECORDED.get() {
+        act_on(recorded);
+    }
+}
+
+/// Acts on the first signal of `arrivals` whose flag it takes (`act`).
+/// Returns when no signal came.
+#[cfg(target_os = "linux")]
+fn act_on(arrivals: &Arrivals) {
+    for signal in arrivals.signals() {
+        if arrivals.took(signal) {
+            act(signal);
+        }
+    }
+}
+
+/// Ends the process after `signal`, as Go's handler ends it: it prints the
+/// name and exits 2 for a signal that Go throws (`throw`), and ends the
+/// process by the signal for SIGHUP (`die_from_signal`). It acts once: a
+/// thread that comes here after another (the `go-signals` thread and an
+/// exit path, at the same signal or at two) waits while that one ends the
+/// process.
+#[cfg(target_os = "linux")]
+fn act(signal: i32) -> ! {
+    static ACTING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if ACTING.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        loop {
+            std::thread::park();
+        }
+    }
+    match GO_THROWN.iter().find(|(s, _)| s.as_raw() == signal) {
+        Some((_, name)) => throw(name),
+        None => die_from_signal(signal),
+    }
+}
 
 /// A flag for each of some signals. A flag action (`listen`) sets it each
 /// time its signal comes, and `took` takes it. signal-hook runs the actions
@@ -936,6 +1032,11 @@ impl Arrivals {
     fn listen(&self, signal: i32) -> Option<signal_hook::SigId> {
         let (_, flag) = self.0.iter().find(|(s, _)| *s == signal)?;
         signal_hook::flag::register(signal, flag.clone()).ok()
+    }
+
+    /// Whether `signal` has a flag here.
+    fn has(&self, signal: i32) -> bool {
+        self.0.iter().any(|(s, _)| *s == signal)
     }
 
     /// The signals of the flags.
@@ -1009,7 +1110,7 @@ fn go_runtime_start() {
 }
 
 /// Ends the process after a signal that Go throws (`GO_THROWN`), as the Go
-/// runtime does: it writes `name` to fd 2 with a raw write, sends the code
+/// runtime does: it writes `name` to fd 2 with a raw write, sends `THROWN`
 /// to the launcher in a worker (`send_code`) and exits 2 (`EXIT_GO_PANIC`,
 /// the exit code of a Go fatal error). An error of the write (a closed or
 /// broken stderr) is ignored, as in Go.
@@ -1027,10 +1128,17 @@ fn throw(name: &str) -> ! {
     let line = format!("{name}\n");
     let _ = rustix::io::write(rustix::stdio::stderr(), line.as_bytes());
     if let Some(worker) = worker() {
-        send_code(worker, EXIT_GO_PANIC);
+        send_code(worker, THROWN);
     }
     signal_hook::low_level::exit(EXIT_GO_PANIC)
 }
+
+/// The code that a worker sends when it ends after a signal that Go throws
+/// (`throw`). Its launcher then exits 2 (`EXIT_GO_PANIC`) and does not act
+/// on such a signal that it still holds (`launch`): the worker has printed
+/// the name once already. No exit code is negative.
+#[cfg(target_os = "linux")]
+const THROWN: i32 = -EXIT_GO_PANIC;
 
 /// Ends the process after SIGHUP as the Go runtime ends it after a signal
 /// with `_SigKill` in its table when no `signal.Notify` asks for it
@@ -1071,12 +1179,21 @@ fn end_by_signal(signal: i32) {
 
 /// Ends the process with `code` once the work has written its output. A
 /// worker (see `launch`) flushes stdout and sends the code (`send_code`).
+/// First it acts on a signal that came before and that the `go-signals`
+/// thread has not acted on yet (`act_on_recorded`): Go acts on it when it
+/// comes, so its run ends there.
 fn exit(code: i32) -> ! {
     #[cfg(target_os = "linux")]
-    if let Some(worker) = worker() {
-        let _ = std::io::stdout().flush();
-        let _ = std::io::stderr().flush();
-        send_code(worker, code);
+    {
+        let worker = worker();
+        if worker.is_some() {
+            let _ = std::io::stdout().flush();
+            let _ = std::io::stderr().flush();
+        }
+        act_on_recorded();
+        if let Some(worker) = worker {
+            send_code(worker, code);
+        }
     }
     std::process::exit(code)
 }

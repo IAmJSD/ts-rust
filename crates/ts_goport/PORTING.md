@@ -603,6 +603,23 @@ process (bin/tsgo.rs `start_signal_mask`, `go_signal_handlers`,
   own `notify_context` (in cmd/tsgo/lsp.rs and api.rs), which `run_main`
   cannot see; a signal that comes while that sets its handler can be lost
   there.
+- Each exit acts on a signal that came before it. Go acts in its signal
+  handler, so a SIGQUIT, SIGSTKFLT, SIGSYS or SIGHUP that comes before
+  the exit ends the run. tsgo acts on the `go-signals` thread, and a short
+  run (`--version`, a config error, an up-to-date build) can exit before
+  that thread runs. So the handler records each of these signals when it
+  comes (bin/tsgo.rs `RECORDED`), and each exit of a process that runs the
+  work (`exit`, before a worker sends its code) first acts on a recorded
+  signal on the exiting thread, with the same text and exit code
+  (`act_on_recorded`, `act`; only one thread acts). A launcher does the
+  same for a signal that it still holds for its worker when the worker
+  ends (`act_on`), unless the worker has thrown a signal (`THROWN`: it
+  printed the name once already). Before, the round c skeptic measured
+  under CPU load on cup2 that R158 lost 2 of 1000 SIGQUIT and round c up
+  to 197 of 2000 SIGHUP. PORT: the end at EPIPE on fd 1 or 2
+  (execute/tsc/stdio.rs `sigpipe`) and the ends in `core` (a thread that
+  cannot start, a Go panic in a goroutine) do not look; in Go the handler
+  has acted before them.
 - A failed exec of `set_malloc_tunables` (a binary that is gone, for
   example) leaves SIGPIPE with its default action (std `Command` sets it
   for the new image). tsgo then gives SIGPIPE a handler that does nothing,
