@@ -288,11 +288,10 @@ pub(crate) struct QueuedParseTask {
 }
 
 // Go: filesparser.go:205 filesParser
-// PORT: Go `core.WorkGroup` is single threaded here (contract 10). Go
-// `singleThreadedWorkGroup` keeps queued functions in a slice and
-// `RunAndWait` pops the last one first, so `queue` is a stack with the same
-// order. The Go `sync.Pool` of `parseTaskData` values is not ported: a new
-// value is made only when the path is new, which is the same result.
+// PORT: Go `core.WorkGroup` is single threaded here (contract 10): the
+// loader runs the queued functions one at a time, in the order of
+// `run_queue`. The Go `sync.Pool` of `parseTaskData` values is not ported:
+// a new value is made only when the path is new, which is the same result.
 // PORT: the parses run in parallel, like the Go work group: parse workers
 // parse queued files ahead of the loader (`run_prefetch_worker`), and the
 // loader takes their results (`take_prefetched`). The loader still
@@ -465,16 +464,50 @@ impl FilesParser {
         self.run_queue(loader);
     }
 
-    // Go: core/workgroup.go singleThreadedWorkGroup.RunAndWait
-    // PORT: Go runs each queued func through `core.WorkGroup.Queue`, on its
-    // own goroutine unless single threaded. The port runs them here in
-    // queue order. With `go_work_group_task`, a Go panic in a queued func
-    // ends the run as it does in Go.
+    // Go: core/workgroup.go:78 singleThreadedWorkGroup.RunAndWait (--singleThreaded)
+    // Go: core/workgroup.go:34 parallelWorkGroup.Queue (otherwise)
+    // PORT: the loader runs the queued funcs here, one at a time. With
+    // `go_work_group_task`, a Go panic in a queued func ends the run as it
+    // does in Go. The order decides which path reaches a file first, and so
+    // the depth of the files it imports: when a later task reaches the file
+    // at a lower depth, Go lowers `lowestDepth` but does not start the
+    // subtasks that already started (filesparser.go:298-325). Those files
+    // keep a depth above 0 ("found searching node_modules": no emit, no
+    // TS6059 or TS6307).
+    // - `--singleThreaded`: Go `singleThreadedWorkGroup` keeps the queued
+    //   funcs in a slice and pops the last one first. `queue` is that stack,
+    //   so the order is exactly Go's.
+    // - Otherwise: Go `parallelWorkGroup.Queue` starts one goroutine per
+    //   func (`wg.Go`), and they run at the same time. A func queues the
+    //   subtasks of its file only after it read, parsed and resolved that
+    //   file. So a task that is N queue steps from a root usually runs after
+    //   every task that is fewer steps away. The port runs the queue level
+    //   by level: the roots are level 0, and the subtasks that a level L
+    //   func queues are level L + 1. Inside a level, the last queued func
+    //   runs first: the Go `go` statement puts the new goroutine in the
+    //   `runnext` slot of its P (runtime/proc.go `newproc`, `runqput` with
+    //   next true), so the last subtask that a func queues runs next there.
+    //   Go stays random in two places. A large file can take longer to load
+    //   than a chain of small files, so a path with more steps can arrive
+    //   first. Inside a level, the other goroutines wait in the FIFO run
+    //   queue of the P or idle Ps steal them, so their order is not fixed.
+    //   For a file that two such paths reach, parallel Go can give a
+    //   different answer in each run, and this order gives one of them.
     fn run_queue(&mut self, loader: &FileLoader) {
-        while let Some(queued) = self.queue.pop() {
-            if self.single_threaded {
+        if self.single_threaded {
+            while let Some(queued) = self.queue.pop() {
                 self.run_queued(loader, queued);
-            } else {
+            }
+            return;
+        }
+        // `queue` collects the next level while `level` runs.
+        let mut level = Vec::new();
+        loop {
+            std::mem::swap(&mut level, &mut self.queue);
+            if level.is_empty() {
+                return;
+            }
+            while let Some(queued) = level.pop() {
                 crate::core::go_work_group_task(|| self.run_queued(loader, queued));
             }
         }
@@ -616,13 +649,7 @@ impl FilesParser {
             let existing_task = data.borrow().tasks.get(&name).cloned();
             if let Some(existing_task) = existing_task {
                 // Go: tasks[i].loadedTask = existingTask (tasks[i] is task)
-                // PORT: a restart of started subtasks (see below) queues the
-                // same task again, so `existing_task` can be `task`. Go then
-                // sets `task.loadedTask = task`, which `collectFiles` resolves
-                // to the same task. Skip it here so no `Rc` cycle forms.
-                if !Rc::ptr_eq(&existing_task, &task) {
-                    task.borrow_mut().loaded_task = Some(existing_task);
-                }
+                task.borrow_mut().loaded_task = Some(existing_task);
             } else {
                 let mut d = data.borrow_mut();
                 d.tasks.insert(name, task.clone());
@@ -645,11 +672,9 @@ impl FilesParser {
         } else {
             depth
         };
-        let mut relower = false;
         {
             let mut d = data.borrow_mut();
             if current_depth < d.lowest_depth {
-                relower = d.lowest_depth != i32::MAX;
                 // If we're seeing this task at a lower depth than before,
                 // reprocess its subtasks to ensure they are loaded.
                 d.lowest_depth = current_depth;
@@ -677,24 +702,6 @@ impl FilesParser {
             }
             if !task_by_file_name.borrow().started_sub_tasks && load_sub_tasks {
                 task_by_file_name.borrow_mut().started_sub_tasks = true;
-                let sub_tasks = task_by_file_name.borrow().sub_tasks.clone();
-                let lowest_depth = data.borrow().lowest_depth;
-                self.start(loader, &sub_tasks, lowest_depth);
-            } else if relower
-                && !self.single_threaded
-                && task_by_file_name.borrow().started_sub_tasks
-            {
-                // PORT: parallel tsgo runs each queued task in its own
-                // goroutine, so the shallowest path to a file usually arrives
-                // first and its subtasks start at that depth. This queue pops
-                // LIFO (Go singleThreadedWorkGroup order) and can reach a file
-                // first through a deeper path. Go then lowers `lowestDepth`
-                // but does not restart subtasks that already started, so the
-                // children keep a depth > 0 (node_modules files: no TS6059, no
-                // emit). Start them again at the new depth to give the result
-                // of parallel tsgo. This is also the Strada rule. Tested in
-                // pinned Go: all project configs match parallel tsgo.
-                // `--singleThreaded` keeps the exact Go order.
                 let sub_tasks = task_by_file_name.borrow().sub_tasks.clone();
                 let lowest_depth = data.borrow().lowest_depth;
                 self.start(loader, &sub_tasks, lowest_depth);
@@ -2850,5 +2857,154 @@ pub fn take_prefetched(
     } else {
         unusable();
         Prefetched::Text(worker_text)
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use crate::frontend::bundled;
+    use crate::frontend::tsoptions::{ParseConfigHost, get_parsed_command_line_of_config_file};
+    use crate::frontend::vfs::osvfs_fs;
+
+    struct System {
+        fs: Rc<dyn Fs>,
+        current_directory: String,
+    }
+
+    impl ParseConfigHost for System {
+        fn fs(&self) -> Rc<dyn Fs> {
+            self.fs.clone()
+        }
+        fn get_current_directory(&self) -> String {
+            self.current_directory.clone()
+        }
+    }
+
+    /// Writes `app` (path, text) to a temp dir, next to a workspace package
+    /// `lib/` (`index.ts` imports `child.ts`) that `app/node_modules/@x/lib`
+    /// links to, and a tsconfig.json with the root `app/main.ts`. Loads the
+    /// program and returns the files that it found searching node_modules
+    /// (lowest depth above 0: no emit, no TS6059), relative to the dir.
+    fn found_searching_node_modules(
+        label: &str,
+        app: &[(&str, &str)],
+        single_threaded: bool,
+    ) -> Vec<String> {
+        let dir = std::env::temp_dir().join(format!(
+            "ts_goport_files_parser_{label}_{single_threaded}_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let lib = [
+            (
+                "lib/package.json",
+                r#"{ "name": "@x/lib", "version": "1.0.0", "exports": { ".": "./index.ts" } }"#,
+            ),
+            (
+                "lib/index.ts",
+                "export { c } from \"./child\";\nexport const a = 1;\n",
+            ),
+            ("lib/child.ts", "export const c = 2;\n"),
+            (
+                "tsconfig.json",
+                r#"{ "compilerOptions": { "module": "esnext", "moduleResolution": "bundler",
+                     "target": "es2022", "outDir": "out", "rootDir": ".", "types": [] },
+                     "files": ["app/main.ts"] }"#,
+            ),
+        ];
+        for (path, text) in lib.iter().chain(app) {
+            let path = dir.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        }
+        std::fs::create_dir_all(dir.join("app/node_modules/@x")).unwrap();
+        std::os::unix::fs::symlink("../../../lib", dir.join("app/node_modules/@x/lib")).unwrap();
+        let cwd = dir.to_string_lossy().replace('\\', "/");
+        let fs = bundled::wrap_fs(osvfs_fs());
+        let sys = System {
+            fs: fs.clone(),
+            current_directory: cwd.clone(),
+        };
+        let (config, errors) = get_parsed_command_line_of_config_file(
+            &format!("{cwd}/tsconfig.json"),
+            None,
+            None,
+            &sys,
+            None,
+        );
+        assert!(errors.is_empty());
+        let host = new_cached_fs_compiler_host(&cwd, fs, &bundled::lib_path(), None, None, None);
+        let processed = process_all_program_files(
+            ProgramOptions {
+                host,
+                config: Rc::new(config.unwrap()),
+                use_source_of_project_reference: false,
+                single_threaded: if single_threaded {
+                    Tristate::True
+                } else {
+                    Tristate::False
+                },
+                typings_location: String::new(),
+                project_name: String::new(),
+                create_module_resolver: None,
+                skip_module_resolution: false,
+            },
+            single_threaded,
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let prefix = format!("{cwd}/");
+        let mut found: Vec<String> = processed
+            .source_files_found_searching_node_modules
+            .iter()
+            .map(|path| path.as_str().strip_prefix(&prefix).unwrap().to_string())
+            .collect();
+        found.sort();
+        found
+    }
+
+    // `lib/index.ts` is reached through the package at depth 1 and through
+    // relative imports at depth 0. Go N does not start the subtasks of a file
+    // again when it arrives at a lower depth, so the first arrival decides
+    // the depth of `lib/child.ts` (`run_queue`). The expected answers are
+    // those of Go N (673a5f17d713) in 20 runs each, multi-threaded, and of Go
+    // --singleThreaded.
+    #[test]
+    fn first_arrival_decides_depth() {
+        // The package and the relative chain both take 2 parses from the
+        // root. Go: child found searching node_modules in 20 of 20 runs.
+        let deep = [
+            (
+                "app/main.ts",
+                "import { b } from \"./b1\";\nimport { a } from \"@x/lib\";\nexport const m = a + b;\n",
+            ),
+            (
+                "app/b1.ts",
+                "import { a } from \"../lib/index\";\nexport const b = a;\n",
+            ),
+        ];
+        // The relative import takes 1 parse, the package 2. Go: child at
+        // depth 0 in 16 of 20 runs. --singleThreaded runs `./c1` first.
+        let shallow = [
+            (
+                "app/main.ts",
+                "import { a } from \"../lib/index\";\nimport { c } from \"./c1\";\nexport const m = a + c;\n",
+            ),
+            (
+                "app/c1.ts",
+                "import { a } from \"@x/lib\";\nexport const c = a;\n",
+            ),
+        ];
+        let child = vec!["lib/child.ts".to_string()];
+        assert_eq!(found_searching_node_modules("deep", &deep, false), child);
+        assert_eq!(found_searching_node_modules("deep", &deep, true), child);
+        assert_eq!(
+            found_searching_node_modules("shallow", &shallow, false),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            found_searching_node_modules("shallow", &shallow, true),
+            child
+        );
     }
 }
