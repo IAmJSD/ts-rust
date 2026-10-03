@@ -25,7 +25,8 @@
 //!
 //! The holds: a launcher holds each signal until its worker catches it,
 //! each on its own (`caught`), and tsgo blocks the signals it handles until
-//! their handlers are set (`HELD`).
+//! their handlers are set (`HELD`). Each exit acts on a signal that came
+//! before it (`act_on_recorded`, `act_on`).
 #![cfg(target_os = "linux")]
 
 use std::io::{Read, Seek, Write};
@@ -756,6 +757,199 @@ fn a_signal_while_tsgo_sets_its_handler() {
         assert_eq!(status.code(), Some(2), "{case}: {status} {stderr}");
         assert!(stderr.starts_with("SIGQUIT: quit"), "{case}: {stderr}");
     }
+}
+
+/// A signal that comes before tsgo exits ends the run as in Go, also when
+/// the thread that acts on it has not run yet: each exit acts on a
+/// recorded signal first (bin/tsgo.rs `act_on_recorded`), and a launcher
+/// on a signal that it still holds when its worker ends (`act_on`). Go acts
+/// in the signal handler, so a short run (`--version`, a config error)
+/// never exits before it. The test makes that thread late: tsgo runs under
+/// `strace -e inject=recvfrom:delay_exit=...`, so the `go-signals` thread
+/// (in a launcher, `forward-signals`) leaves its wait on the signal pipe
+/// 5 s after the signal. The output is more than the stdout pipe holds
+/// (`small_pipe`), so the run waits in a write. The test sends the signal,
+/// waits until that thread has it (strace holds the thread: its state is
+/// `t`), and then reads the output, so the run exits before that thread
+/// acts. SIGQUIT must end the run with Go's text and exit 2, and SIGHUP by
+/// SIGHUP: without a worker, and sent to a launcher whose worker ends
+/// first. Before, the run ended with exit 0 (R158 and followups9 round c):
+/// the first `exit_group` sets the exit code, and the late thread dies at
+/// it. strace keeps the ended process until the delay is over, so the test
+/// checks the outcome, not the time. Where strace cannot run, the test says
+/// so and passes.
+#[test]
+fn an_exit_acts_on_a_signal_that_came_before_it() {
+    const STRACE: [&str; 7] = [
+        "-f",
+        "-o",
+        "/dev/null",
+        "-e",
+        "trace=recvfrom",
+        "-e",
+        "inject=recvfrom:delay_exit=5000000",
+    ];
+    let probe = Command::new("strace")
+        .args(STRACE)
+        .arg("true")
+        .stderr(Stdio::null())
+        .status();
+    if !probe.is_ok_and(|status| status.success()) {
+        eprintln!("skipped: strace cannot run here");
+        return;
+    }
+    let tsgo = env!("CARGO_BIN_EXE_tsgo");
+    let runs = [
+        ("0", Signal::QUIT, "go-signals"),
+        ("0", Signal::HUP, "go-signals"),
+        ("1", Signal::QUIT, "forward-signals"),
+        ("1", Signal::HUP, "forward-signals"),
+    ];
+    for (launch, signal, thread) in runs {
+        let case = format!("{signal:?}, GOPORT_LAUNCH={launch}");
+        let (read, write, filled) = small_pipe();
+        // `env` gives strace and tsgo the default action of SIGHUP.
+        let child = Command::new(DEFAULT_HUP[0])
+            .args(&DEFAULT_HUP[1..])
+            .arg("strace")
+            .args(STRACE)
+            .args([tsgo, "--all"])
+            .env("GOPORT_LAUNCH", launch)
+            .stdout(Stdio::from(write))
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let start = Instant::now();
+        // tsgo sets its handlers before it writes.
+        while rustix::io::ioctl_fionread(&read).unwrap() == filled {
+            assert!(start.elapsed() < LIMIT, "{case}: no output in {LIMIT:?}");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // strace's child, the tsgo that the signal goes to.
+        let traced = child_of(child.id())
+            .filter(|pid| {
+                std::fs::read_link(format!("/proc/{pid}/exe"))
+                    .is_ok_and(|exe| exe == Path::new(tsgo))
+            })
+            .unwrap_or_else(|| panic!("{case}: no tsgo under strace"));
+        let pid = Pid::from_raw(traced.cast_signed()).unwrap();
+        rustix::process::kill_process(pid, signal).unwrap();
+        // Twice, 100 ms apart: a thread that gets the signal itself stops
+        // in strace a moment too.
+        let held = || thread_state(traced, thread) == Some(b't');
+        loop {
+            if held() {
+                std::thread::sleep(Duration::from_millis(100));
+                if held() {
+                    break;
+                }
+            }
+            assert!(
+                start.elapsed() < LIMIT,
+                "{case}: {thread} did not leave its wait"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let output = std::fs::File::from(read);
+        let drain = std::thread::spawn(move || std::io::copy(&mut &output, &mut std::io::sink()));
+        // strace exits as tsgo does.
+        let (status, stderr) = end_of(child, &case);
+        let _ = drain.join();
+        if signal == Signal::QUIT {
+            assert_eq!(status.code(), Some(2), "{case}: {status} {stderr}");
+            assert!(stderr.starts_with("SIGQUIT: quit"), "{case}: {stderr}");
+        } else {
+            assert_eq!(status.signal(), Some(1), "{case}: {status} {stderr}");
+        }
+    }
+}
+
+/// A SIGINT or SIGTERM that comes before `notify_context` ends a run
+/// without a worker by the signal, as Go's handler does (`_SigKill`), also
+/// a short run (bin/tsgo.rs `notify_defaults`). tsgo runs `--version` under
+/// `strace -e inject=...`: each `rt_sigaction` call returns 5 ms late, so
+/// the handlers take a few hundred milliseconds, and the `go-signals`
+/// thread leaves its wait on the signal pipe 5 s after a signal. The test
+/// sends the signal as soon as /proc shows that tsgo catches it. Followups9
+/// round c acted on it on the `go-signals` thread, so the run exited 0
+/// first. Where strace cannot run, the test says so and passes.
+#[test]
+fn a_signal_before_notify_context_ends_a_short_run() {
+    const STRACE: [&str; 9] = [
+        "-f",
+        "-o",
+        "/dev/null",
+        "-e",
+        "trace=rt_sigaction,recvfrom",
+        "-e",
+        "inject=rt_sigaction:delay_exit=5000",
+        "-e",
+        "inject=recvfrom:delay_exit=5000000",
+    ];
+    let probe = Command::new("strace")
+        .args(STRACE)
+        .arg("true")
+        .stderr(Stdio::null())
+        .status();
+    if !probe.is_ok_and(|status| status.success()) {
+        eprintln!("skipped: strace cannot run here");
+        return;
+    }
+    let tsgo = env!("CARGO_BIN_EXE_tsgo");
+    for signal in [Signal::INT, Signal::TERM] {
+        let case = format!("{signal:?}");
+        let child = Command::new("strace")
+            .args(STRACE)
+            .args([tsgo, "--version"])
+            .env("GOPORT_LAUNCH", "0")
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let start = Instant::now();
+        let traced = loop {
+            let traced = child_of(child.id()).filter(|pid| {
+                std::fs::read_link(format!("/proc/{pid}/exe"))
+                    .is_ok_and(|exe| exe == Path::new(tsgo))
+            });
+            if let Some(pid) = traced {
+                break pid;
+            }
+            assert!(start.elapsed() < LIMIT, "{case}: no tsgo in {LIMIT:?}");
+        };
+        loop {
+            let status = std::fs::read_to_string(format!("/proc/{traced}/status")).unwrap();
+            if mask(&status, "SigCgt:") & bit(signal) != 0 {
+                break;
+            }
+            assert!(start.elapsed() < LIMIT, "{case}: no handler in {LIMIT:?}");
+        }
+        let pid = Pid::from_raw(traced.cast_signed()).unwrap();
+        rustix::process::kill_process(pid, signal).unwrap();
+        // strace ends as tsgo does.
+        let (status, stderr) = end_of(child, &case);
+        assert_eq!(
+            status.signal(),
+            Some(signal.as_raw()),
+            "{case}: {status} {stderr}"
+        );
+    }
+}
+
+/// The state letter of the thread named `name` of the process `pid`, from
+/// /proc/<pid>/task/<tid>/stat (`<tid> (<name>) <state> ...`).
+fn thread_state(pid: u32, name: &str) -> Option<u8> {
+    let name = &name.as_bytes()[..name.len().min(15)];
+    let tasks = std::fs::read_dir(format!("/proc/{pid}/task")).ok()?;
+    tasks.flatten().find_map(|task| {
+        let comm = std::fs::read(task.path().join("comm")).ok()?;
+        if comm.strip_suffix(b"\n") != Some(name) {
+            return None;
+        }
+        let stat = std::fs::read(task.path().join("stat")).ok()?;
+        let name_end = stat.iter().rposition(|&b| b == b')')?;
+        stat.get(name_end + 2).copied()
+    })
 }
 
 /// A launcher whose worker cannot start runs the work itself (bin/tsgo.rs
