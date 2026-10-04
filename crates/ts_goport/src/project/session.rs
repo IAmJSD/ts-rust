@@ -2238,6 +2238,16 @@ impl Session {
             .enqueue(&self.background_context(), move |ctx| {
                 let old_snapshot = &task_old_snapshot;
                 let new_snapshot = &task_new_snapshot;
+                // PORT: Go's garbage collector keeps the programs of
+                // `new_snapshot` alive while this task runs. Here a message
+                // that the task's watch request serves while it waits for
+                // the client (`lsp::Server::wait_client_reply`) can adopt a
+                // newer snapshot and dispose this one, which releases its
+                // programs. This ref keeps them until the publish. It fails
+                // only when a task queued before this one served such a
+                // message: then the programs are gone and the publish is
+                // skipped (Go publishes them, in a race with the newer task).
+                let held = new_snapshot.try_ref();
                 if s.options.logging_enabled {
                     s.logger.logf(&format!(
                         "Adopted snapshot {} (parent {}) as current session snapshot (replacing {})",
@@ -2258,8 +2268,15 @@ impl Session {
                     }
                 }
                 let _ = s.update_content_mapper_registrations(ctx, new_snapshot);
-                s.publish_program_diagnostics(old_snapshot, new_snapshot);
+                if held {
+                    s.publish_program_diagnostics(old_snapshot, new_snapshot);
+                }
                 s.send_project_info_telemetry_for_new_projects(old_snapshot, new_snapshot);
+                // Go's warm takes its own ref (`tryRef`), which fails when
+                // the snapshot is disposed, so this one goes first.
+                if held {
+                    new_snapshot.deref();
+                }
                 s.warm_auto_import_cache(ctx, &change, old_snapshot, new_snapshot);
             });
 
@@ -2478,6 +2495,25 @@ pub fn update_watch<T>(
     errors
 }
 
+/// PORT: a project's program files, typings and content mapper watches.
+type ProjectWatches = (
+    Option<Rc<WatchedFiles<Option<Rc<RefCell<FxHashSet<tspath::Path>>>>>>>,
+    Option<Rc<WatchedFiles<PatternsAndIgnored>>>,
+    Option<Rc<WatchedFiles<Vec<String>>>>,
+);
+
+/// PORT: the watches of a project, out of its `RefCell`, so that
+/// `update_watches` holds no borrow while `update_watch` waits for the
+/// client. The wait can serve messages (`lsp::Server::wait_client_reply`).
+fn project_watches(project: &RefCell<Project>) -> ProjectWatches {
+    let p = project.borrow();
+    (
+        p.program_files_watch.clone(),
+        p.typings_watch.clone(),
+        p.content_mapper_watch.clone(),
+    )
+}
+
 impl Session {
     // Go: project/session.go:1565 updateContentMapperRegistrations (tsgo#4712)
     // updateContentMapperRegistrations computes the union of content mapper extensions across all loaded
@@ -2532,6 +2568,9 @@ impl Session {
 
     // Go: project/session.go:1600 updateWatches
     // PORT: the Go closures all append to `errors`, so it is a `RefCell`.
+    // The closures take the watch handles out of the config entries and
+    // projects first (`project_watches`): no `RefCell` borrow is held while
+    // a call to the client waits.
     // Go ranges over the config map (random order); the port uses the
     // `FxHashMap` order, which only changes the order of watch requests.
     pub fn update_watches(
@@ -2551,37 +2590,29 @@ impl Session {
             },
             Some(
                 &mut |_: &tspath::Path, added_entry: &Rc<RefCell<ConfigFileEntry>>| {
-                    let added = update_watch(
-                        &ctx,
-                        self,
-                        &self.logger,
-                        None,
-                        added_entry.borrow().root_files_watch.as_deref(),
-                    );
+                    let watch = added_entry.borrow().root_files_watch.clone();
+                    let added = update_watch(&ctx, self, &self.logger, None, watch.as_deref());
                     errors.borrow_mut().extend(added);
                 },
             ),
             Some(
                 &mut |_: &tspath::Path, removed_entry: &Rc<RefCell<ConfigFileEntry>>| {
-                    let removed = update_watch(
-                        &ctx,
-                        self,
-                        &self.logger,
-                        removed_entry.borrow().root_files_watch.as_deref(),
-                        None,
-                    );
+                    let watch = removed_entry.borrow().root_files_watch.clone();
+                    let removed = update_watch(&ctx, self, &self.logger, watch.as_deref(), None);
                     errors.borrow_mut().extend(removed);
                 },
             ),
             Some(&mut |_: &tspath::Path,
                        old_entry: &Rc<RefCell<ConfigFileEntry>>,
                        new_entry: &Rc<RefCell<ConfigFileEntry>>| {
+                let old_watch = old_entry.borrow().root_files_watch.clone();
+                let new_watch = new_entry.borrow().root_files_watch.clone();
                 let changed = update_watch(
                     &ctx,
                     self,
                     &self.logger,
-                    old_entry.borrow().root_files_watch.as_deref(),
-                    new_entry.borrow().root_files_watch.as_deref(),
+                    old_watch.as_deref(),
+                    new_watch.as_deref(),
                 );
                 errors.borrow_mut().extend(changed);
             }),
@@ -2589,17 +2620,13 @@ impl Session {
         // Retry config watchers whose IDs didn't change but whose previous registration failed.
         for (path, new_entry) in &new_snapshot.config_file_registry.configs {
             if let Some(old_entry) = old_snapshot.config_file_registry.configs.get(path) {
-                let new_id = WatchedFiles::id(new_entry.borrow().root_files_watch.as_deref());
+                let new_watch = new_entry.borrow().root_files_watch.clone();
+                let new_id = WatchedFiles::id(new_watch.as_deref());
                 if WatchedFiles::id(old_entry.borrow().root_files_watch.as_deref()) == new_id
                     && self.watches.is_pending(&new_id)
                 {
-                    let retried = update_watch(
-                        &ctx,
-                        self,
-                        &self.logger,
-                        None,
-                        new_entry.borrow().root_files_watch.as_deref(),
-                    );
+                    let retried =
+                        update_watch(&ctx, self, &self.logger, None, new_watch.as_deref());
                     errors.borrow_mut().extend(retried);
                 }
             }
@@ -2609,129 +2636,115 @@ impl Session {
             &old_snapshot.project_collection.projects_by_id(),
             &new_snapshot.project_collection.projects_by_id(),
             |_: &ID, added_project| {
-                let added_project = added_project.borrow();
+                let (program_files_watch, typings_watch, content_mapper_watch) =
+                    project_watches(added_project);
                 let program_files = update_watch(
                     &ctx,
                     self,
                     &self.logger,
                     None,
-                    added_project.program_files_watch.as_deref(),
+                    program_files_watch.as_deref(),
                 );
                 errors.borrow_mut().extend(program_files);
-                let typings = update_watch(
-                    &ctx,
-                    self,
-                    &self.logger,
-                    None,
-                    added_project.typings_watch.as_deref(),
-                );
+                let typings =
+                    update_watch(&ctx, self, &self.logger, None, typings_watch.as_deref());
                 errors.borrow_mut().extend(typings);
                 let content_mapper = update_watch(
                     &ctx,
                     self,
                     &self.logger,
                     None,
-                    added_project.content_mapper_watch.as_deref(),
+                    content_mapper_watch.as_deref(),
                 );
                 errors.borrow_mut().extend(content_mapper);
             },
             |_: &ID, removed_project| {
-                let removed_project = removed_project.borrow();
+                let (program_files_watch, typings_watch, content_mapper_watch) =
+                    project_watches(removed_project);
                 let program_files = update_watch(
                     &ctx,
                     self,
                     &self.logger,
-                    removed_project.program_files_watch.as_deref(),
+                    program_files_watch.as_deref(),
                     None,
                 );
                 errors.borrow_mut().extend(program_files);
-                let typings = update_watch(
-                    &ctx,
-                    self,
-                    &self.logger,
-                    removed_project.typings_watch.as_deref(),
-                    None,
-                );
+                let typings =
+                    update_watch(&ctx, self, &self.logger, typings_watch.as_deref(), None);
                 errors.borrow_mut().extend(typings);
                 let content_mapper = update_watch(
                     &ctx,
                     self,
                     &self.logger,
-                    removed_project.content_mapper_watch.as_deref(),
+                    content_mapper_watch.as_deref(),
                     None,
                 );
                 errors.borrow_mut().extend(content_mapper);
             },
             |_: &ID, old_project, new_project| {
-                let old_project = old_project.borrow();
-                let new_project = new_project.borrow();
-                if WatchedFiles::id(old_project.program_files_watch.as_deref())
-                    != WatchedFiles::id(new_project.program_files_watch.as_deref())
+                let (old_program_files, old_typings, old_content_mapper) =
+                    project_watches(old_project);
+                let (new_program_files, new_typings, new_content_mapper) =
+                    project_watches(new_project);
+                if WatchedFiles::id(old_program_files.as_deref())
+                    != WatchedFiles::id(new_program_files.as_deref())
                 {
                     let changed = update_watch(
                         &ctx,
                         self,
                         &self.logger,
-                        old_project.program_files_watch.as_deref(),
-                        new_project.program_files_watch.as_deref(),
-                    );
-                    errors.borrow_mut().extend(changed);
-                } else if self.watches.is_pending(&WatchedFiles::id(
-                    new_project.program_files_watch.as_deref(),
-                )) {
-                    let retried = update_watch(
-                        &ctx,
-                        self,
-                        &self.logger,
-                        None,
-                        new_project.program_files_watch.as_deref(),
-                    );
-                    errors.borrow_mut().extend(retried);
-                }
-                if WatchedFiles::id(old_project.typings_watch.as_deref())
-                    != WatchedFiles::id(new_project.typings_watch.as_deref())
-                {
-                    let changed = update_watch(
-                        &ctx,
-                        self,
-                        &self.logger,
-                        old_project.typings_watch.as_deref(),
-                        new_project.typings_watch.as_deref(),
+                        old_program_files.as_deref(),
+                        new_program_files.as_deref(),
                     );
                     errors.borrow_mut().extend(changed);
                 } else if self
                     .watches
-                    .is_pending(&WatchedFiles::id(new_project.typings_watch.as_deref()))
+                    .is_pending(&WatchedFiles::id(new_program_files.as_deref()))
                 {
-                    let retried = update_watch(
-                        &ctx,
-                        self,
-                        &self.logger,
-                        None,
-                        new_project.typings_watch.as_deref(),
-                    );
+                    let retried =
+                        update_watch(&ctx, self, &self.logger, None, new_program_files.as_deref());
                     errors.borrow_mut().extend(retried);
                 }
-                if WatchedFiles::id(old_project.content_mapper_watch.as_deref())
-                    != WatchedFiles::id(new_project.content_mapper_watch.as_deref())
+                if WatchedFiles::id(old_typings.as_deref())
+                    != WatchedFiles::id(new_typings.as_deref())
                 {
                     let changed = update_watch(
                         &ctx,
                         self,
                         &self.logger,
-                        old_project.content_mapper_watch.as_deref(),
-                        new_project.content_mapper_watch.as_deref(),
+                        old_typings.as_deref(),
+                        new_typings.as_deref(),
                     );
                     errors.borrow_mut().extend(changed);
-                } else if self.watches.is_pending(&WatchedFiles::id(
-                    new_project.content_mapper_watch.as_deref(),
-                )) {
+                } else if self
+                    .watches
+                    .is_pending(&WatchedFiles::id(new_typings.as_deref()))
+                {
+                    let retried =
+                        update_watch(&ctx, self, &self.logger, None, new_typings.as_deref());
+                    errors.borrow_mut().extend(retried);
+                }
+                if WatchedFiles::id(old_content_mapper.as_deref())
+                    != WatchedFiles::id(new_content_mapper.as_deref())
+                {
+                    let changed = update_watch(
+                        &ctx,
+                        self,
+                        &self.logger,
+                        old_content_mapper.as_deref(),
+                        new_content_mapper.as_deref(),
+                    );
+                    errors.borrow_mut().extend(changed);
+                } else if self
+                    .watches
+                    .is_pending(&WatchedFiles::id(new_content_mapper.as_deref()))
+                {
                     let retried = update_watch(
                         &ctx,
                         self,
                         &self.logger,
                         None,
-                        new_project.content_mapper_watch.as_deref(),
+                        new_content_mapper.as_deref(),
                     );
                     errors.borrow_mut().extend(retried);
                 }

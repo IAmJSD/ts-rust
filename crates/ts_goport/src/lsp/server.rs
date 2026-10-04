@@ -43,8 +43,11 @@
 //!   clean) fire at the next `run_pending`: before the async part of the
 //!   running request or after its answer. Go fires them on time.
 //! - A background client request (`update_watches` registerCapability, 1 s
-//!   timeout) blocks the dispatch thread until the client answers. Go waits
-//!   on a goroutine.
+//!   timeout) blocks the dispatch thread for up to `TASK_REPLY_GRACE`.
+//!   Then, until the client answers, its wait serves the queued LSP
+//!   messages (`Server::wait_client_reply`), so a slow client delays them
+//!   by about 50 ms. Go waits on a goroutine, and its dispatch loop goes on
+//!   at once. A content mapper registration (no timeout) only blocks.
 //! - A request that arrives while the auto-import warm runs waits for it,
 //!   unless it is a file event, which cancels the warm (below). Go runs
 //!   the request at the same time.
@@ -64,7 +67,11 @@
 //! publishDiagnostics land. Do not hold them back while messages wait
 //! either: a task queued by didOpen (the `update_watches`
 //! registerCapability) must go out before the answer of the next request,
-//! as Go's does.
+//! as Go's does. While a task's watch request waits for a slow client, the
+//! wait serves the next messages inside the task (above), and a task that a
+//! served message queues runs there too (`MAX_SERVING_WAITS`). Handlers
+//! never serve: `serve_token` is set only while the dispatch loop runs
+//! tasks (`run_tasks`).
 //!
 //! The one exception is idle work (`gostd::local::go_idle`): the clone of
 //! the auto-import warm, which sends nothing to the client. It starts only
@@ -121,13 +128,29 @@ use std::io::{BufRead, Write};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::rc::Weak;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicUsize, Ordering};
-use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
+use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, sync_channel};
 use std::sync::{Arc, Condvar, LazyLock, Mutex, MutexGuard, OnceLock, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 // PORT: Go mutexes do not poison.
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// PORT: sets a `Cell` and puts the old value back when dropped, also when
+/// a panic unwinds.
+struct SetCell<'a, T: Copy>(&'a Cell<T>, T);
+
+impl<'a, T: Copy> SetCell<'a, T> {
+    fn new(cell: &'a Cell<T>, value: T) -> Self {
+        Self(cell, cell.replace(value))
+    }
+}
+
+impl<T: Copy> Drop for SetCell<'_, T> {
+    fn drop(&mut self) {
+        self.0.set(self.1);
+    }
 }
 
 // PORT: Go `sync.RWMutex` read lock (no poison).
@@ -218,7 +241,8 @@ pub fn new_server(opts: ServerOptions) -> Rc<Server> {
         warm_auto_import_preempt: OnceLock::new(),
     });
 
-    Rc::new(Server {
+    Rc::new_cyclic(|this| Server {
+        this: this.clone(),
         logger: shared.logger.clone(),
         shared,
         r: RefCell::new(Some(in_)),
@@ -243,6 +267,8 @@ pub fn new_server(opts: ServerOptions) -> Rc<Server> {
         cpu_profiler: crate::pprof::CpuProfiler::default(),
         dispatch_ctx: RefCell::new(None),
         free_since: Cell::new(Instant::now()),
+        serve_token: Cell::new(false),
+        serving_waits: Cell::new(0),
     })
 }
 
@@ -478,6 +504,9 @@ pub struct ServerShared {
 
 // Go: server.go:171 Server (the dispatch-thread fields)
 pub struct Server {
+    // PORT: the server itself, for a wait of a call to the client that
+    // serves messages (`wait_client_reply`).
+    this: Weak<Server>,
     pub shared: Arc<ServerShared>,
 
     // PORT: taken by `run` for the reader and writer threads.
@@ -538,6 +567,13 @@ pub struct Server {
     // PORT: when the dispatch loop last finished a message (see
     // `IDLE_QUIET_PERIOD` and `gostd::local::note_message_gap`).
     pub free_since: Cell<Instant>,
+    // PORT: true while the dispatch loop runs background tasks
+    // (`run_tasks`), and false in a handler. A call to the client from a
+    // task serves messages only then (`wait_client_reply`).
+    serve_token: Cell<bool>,
+    // PORT: the waits of calls to the client that serve messages now, one
+    // inside another (`MAX_SERVING_WAITS`).
+    serving_waits: Cell<u32>,
     // PORT: Go `progressDelay` and `projectProgress` are in `ServerShared`,
     // `startWatchdog` is `ServerShared::start_watchdog`.
 }
@@ -761,9 +797,8 @@ impl project::Client for Server {
             self.watchers.borrow_mut().insert(id);
             return Ok(());
         }
-        let result = send_client_request(
+        let result = self.call_client(
             ctx,
-            &self.shared,
             &lsproto::CLIENT_REGISTER_CAPABILITY_INFO,
             lsproto::RegistrationParams {
                 registrations: vec![lsproto::Registration {
@@ -778,6 +813,7 @@ impl project::Client for Server {
                     }),
                 }],
             },
+            true,
         );
         if let Err(err) = result {
             return Err(errors::errorf(
@@ -811,9 +847,8 @@ impl project::Client for Server {
             return Ok(());
         }
         if self.watchers.borrow().contains(&id) {
-            let result = send_client_request(
+            let result = self.call_client(
                 ctx,
-                &self.shared,
                 &lsproto::CLIENT_UNREGISTER_CAPABILITY_INFO,
                 lsproto::UnregistrationParams {
                     unregisterations: vec![lsproto::Unregistration {
@@ -823,6 +858,7 @@ impl project::Client for Server {
                             .to_string(),
                     }],
                 },
+                true,
             );
             if let Err(err) = result {
                 return Err(errors::errorf(
@@ -975,13 +1011,16 @@ impl project::Client for Server {
             .collect();
             unregistrations
                 .retain(|registration| self.supports_content_mapper_registration(&registration.id));
-            if let Err(err) = send_client_request(
+            // PORT: this wait does not serve messages: Go serializes these
+            // calls (`contentMapperRegistrationMu`), and a served message
+            // could start another task's calls inside this one.
+            if let Err(err) = self.call_client(
                 ctx,
-                &self.shared,
                 &lsproto::CLIENT_UNREGISTER_CAPABILITY_INFO,
                 lsproto::UnregistrationParams {
                     unregisterations: unregistrations,
                 },
+                false,
             ) {
                 return Err(errors::errorf(
                     format!(
@@ -1344,11 +1383,11 @@ impl project::Client for Server {
         ];
         registrations
             .retain(|registration| self.supports_content_mapper_registration(&registration.id));
-        if let Err(err) = send_client_request(
+        if let Err(err) = self.call_client(
             ctx,
-            &self.shared,
             &lsproto::CLIENT_REGISTER_CAPABILITY_INFO,
             lsproto::RegistrationParams { registrations },
+            false,
         ) {
             return Err(errors::errorf(
                 format!(
@@ -1879,8 +1918,17 @@ impl ServerShared {
                     .clone()
                     .unwrap_or_else(|| crate::core::go_nil_dereference());
                 // Go: respChan <- resp; close(respChan); delete(...)
-                if let Some(resp_chan) = pending_server_requests.remove(&id) {
+                let resp_chan = pending_server_requests.remove(&id);
+                if let Some(resp_chan) = &resp_chan {
                     let _ = resp_chan.try_send(Some(resp));
+                }
+                drop(pending_server_requests);
+                if resp_chan.is_some() {
+                    // PORT: wakes a wait that serves messages
+                    // (`Server::wait_client_reply`). The pending map is
+                    // unlocked first, so the two locks never nest.
+                    let _guard = lock(&self.queued_mu);
+                    self.queued_cond.notify_all();
                 }
             } else {
                 let req = msg.into_request();
@@ -1936,6 +1984,22 @@ impl ServerShared {
                 .unwrap_or_else(|e| e.into_inner())
                 .0;
         }
+    }
+
+    /// PORT: takes the first LSP message out of the request queue and counts
+    /// it down. A `Wake` or `ApiAccepted` stays (`Server::wait_client_reply`).
+    fn take_queued_request(&self) -> Option<lsproto::RequestMessage> {
+        let req = self.request_queue.with_items(|items| {
+            let index = items
+                .iter()
+                .position(|item| matches!(item, QueuedRequest::Request(_)))?;
+            match items.remove(index) {
+                Some(QueuedRequest::Request(req)) => Some(req),
+                _ => None,
+            }
+        })?;
+        self.queued_requests.fetch_sub(1, Ordering::SeqCst);
+        Some(req)
     }
 
     /// PORT: the wait of a call to the client from an API request
@@ -2107,7 +2171,7 @@ impl Server {
                 .wait_quiet(self.free_since.get() + IDLE_QUIET_PERIOD)
             && gostd::local::run_idle()
         {
-            gostd::local::run_pending();
+            self.run_tasks();
             gostd::local::drop_garbage(busy);
         }
 
@@ -2119,32 +2183,44 @@ impl Server {
         let req = match item {
             QueuedRequest::Request(req) => Rc::new(req),
             QueuedRequest::Wake => {
-                gostd::local::run_pending();
+                self.run_tasks();
                 return Ok(());
             }
             QueuedRequest::ApiAccepted(accepted) => {
                 self.serve_api_connection(accepted);
-                gostd::local::run_pending();
+                self.run_tasks();
                 return Ok(());
             }
         };
 
-        self.dispatch_request(ctx, lsp_exit, &req);
+        self.dispatch_request(ctx, lsp_exit, &req, true);
 
-        gostd::local::run_pending();
+        self.run_tasks();
         self.free_since.set(Instant::now());
         Ok(())
     }
 
+    /// PORT: `gostd::local::run_pending` where Go's background goroutines
+    /// run beside the dispatch loop. A task's call to the client can serve
+    /// queued messages while it waits (`wait_client_reply`).
+    fn run_tasks(&self) {
+        let _serve = SetCell::new(&self.serve_token, true);
+        gostd::local::run_pending();
+    }
+
     /// PORT: the part of one turn of the Go dispatch loop that handles the
-    /// request or notification `req`. `dispatch_next` calls it, and so does
-    /// the wait of a call to the client from an API request for the LSP
-    /// messages that it serves (`ApiConnProtocol`).
+    /// request or notification `req`. `dispatch_next` calls it, and so do
+    /// the waits of calls to the client that serve LSP messages: from an API
+    /// request (`ApiConnProtocol`, with `serve_tasks` false, because the API
+    /// request is in the middle of its work on the session) and from a
+    /// background task (`wait_client_reply`). With `serve_tasks`, the tasks
+    /// that run before the async part can serve messages too (`run_tasks`).
     fn dispatch_request(
         self: &Rc<Self>,
         ctx: &Context,
         lsp_exit: &CancelCauseFunc,
         req: &Rc<lsproto::RequestMessage>,
+        serve_tasks: bool,
     ) {
         self.shared
             .last_request_time_ms
@@ -2208,7 +2284,12 @@ impl Server {
             }
         };
 
-        match self.handle_request_or_notification(&request_ctx, req) {
+        // A call to the client in a handler blocks (`wait_client_reply`).
+        let handled = {
+            let _serve = SetCell::new(&self.serve_token, false);
+            self.handle_request_or_notification(&request_ctx, req)
+        };
+        match handled {
             Err(err) => {
                 handle_error(err);
                 remove_request();
@@ -2219,10 +2300,16 @@ impl Server {
                 // updates and publishDiagnostics) before this goroutine,
                 // and they usually end before its answer. Run them
                 // first.
-                gostd::local::run_pending();
+                if serve_tasks {
+                    self.run_tasks();
+                } else {
+                    let _serve = SetCell::new(&self.serve_token, false);
+                    gostd::local::run_pending();
+                }
                 // PORT: Go runs the async work on a goroutine
                 // (`go func() {...}()`); it runs here, on the dispatch
                 // thread, before the next message.
+                let _serve = SetCell::new(&self.serve_token, false);
                 if let Err(ls_error) = do_async_work() {
                     handle_error(ls_error);
                 }
@@ -2241,6 +2328,19 @@ impl Server {
 /// message within about a millisecond of an answer (fast typing: didChange
 /// and a diagnostic pull), so the warm starts only when they pause.
 pub const IDLE_QUIET_PERIOD: Duration = Duration::from_millis(50);
+
+/// PORT: how long a call to the client from a background task waits for
+/// the reply before it serves queued messages (`wait_client_reply`). No Go
+/// counterpart: Go's dispatch loop never waits for a task. A client that
+/// answers in this time sees the same messages in the same order as with a
+/// wait that only blocks (the LSP oracle client answers in under 1 ms).
+pub const TASK_REPLY_GRACE: Duration = Duration::from_millis(50);
+
+/// PORT: the most waits that serve messages at one time, one inside
+/// another: a served message can start a task whose call to the client
+/// waits too. At the cap a wait only blocks, so the dispatch stack stays
+/// bounded.
+pub const MAX_SERVING_WAITS: u32 = 2;
 
 impl ServerShared {
     // Go: server.go:1029 writeLoop
@@ -2279,7 +2379,9 @@ impl ServerShared {
 // WARNING: this should only be called in the async portion of a request handler,
 // otherwise a deadlock can occur.
 // PORT: the reader thread delivers the response, so the dispatch thread can
-// wait here in the sync portion too (Go's handleInitialized does).
+// wait here in the sync portion too (Go's handleInitialized does). This
+// wait only blocks. The calls of background tasks use
+// `Server::call_client`, whose wait can serve queued messages.
 pub fn send_client_request<
     Req: AnyValue,
     Resp: crate::frontend::json::UnmarshalerFrom + Default + 'static,
@@ -2288,6 +2390,26 @@ pub fn send_client_request<
     s: &ServerShared,
     info: &lsproto::RequestInfo<Req, Resp>,
     params: Req,
+) -> Result<Resp, GoError> {
+    send_client_request_with(s, info, params, |wake, response_chan| {
+        recv_or_done(ctx, wake, response_chan)
+    })
+}
+
+/// PORT: `send_client_request` with the given wait for the response. It
+/// gets the sending end (for a context wake-up) and the receiving end of
+/// the response channel.
+fn send_client_request_with<
+    Req: AnyValue,
+    Resp: crate::frontend::json::UnmarshalerFrom + Default + 'static,
+>(
+    s: &ServerShared,
+    info: &lsproto::RequestInfo<Req, Resp>,
+    params: Req,
+    wait: impl FnOnce(
+        &SyncSender<Option<lsproto::ResponseMessage>>,
+        &Receiver<Option<lsproto::ResponseMessage>>,
+    ) -> Result<lsproto::ResponseMessage, GoError>,
 ) -> Result<Resp, GoError> {
     let id = crate::jsonrpc::new_id_string(&format!(
         "ts{}",
@@ -2306,7 +2428,7 @@ pub fn send_client_request<
         //	case <-ctx.Done():
         //		return *new(Resp), ctx.Err()
         //	case resp := <-responseChan:
-        let resp = recv_or_done(ctx, &response_tx, &response_chan)?;
+        let resp = wait(&response_tx, &response_chan)?;
         if resp.error.is_some() {
             return Err(errors::new(format!(
                 "request failed: {}",
@@ -2320,6 +2442,129 @@ pub fn send_client_request<
     lock(&s.pending_server_requests).remove(&id);
 
     result
+}
+
+impl Server {
+    /// PORT: `send_client_request` for the `project::Client` calls of a
+    /// background task, with the wait of `wait_client_reply`. `serve` says
+    /// whether the wait may serve messages.
+    fn call_client<
+        Req: AnyValue,
+        Resp: crate::frontend::json::UnmarshalerFrom + Default + 'static,
+    >(
+        &self,
+        ctx: &Context,
+        info: &lsproto::RequestInfo<Req, Resp>,
+        params: Req,
+        serve: bool,
+    ) -> Result<Resp, GoError> {
+        send_client_request_with(&self.shared, info, params, |_, response_chan| {
+            self.wait_client_reply(ctx, response_chan, serve)
+        })
+    }
+
+    /// PORT: the wait for the response of a call to the client from a
+    /// background task (Go: the `select` in `sendClientRequest`). Go's task
+    /// goroutine blocks there, and the dispatch loop goes on. Here the task
+    /// runs on the dispatch thread. When `serve` is true, the task runs in
+    /// `run_tasks` and fewer than `MAX_SERVING_WAITS` waits serve, the wait
+    /// serves the queued LSP messages in arrival order after
+    /// `TASK_REPLY_GRACE`, until the response comes or `ctx` is done. A
+    /// `Wake` or `ApiAccepted` stays in the queue. The wait also ends when
+    /// the dispatch loop ends (a served `exit`), with `context canceled`: Go's
+    /// process exits then.
+    fn wait_client_reply(
+        &self,
+        ctx: &Context,
+        response_chan: &Receiver<Option<lsproto::ResponseMessage>>,
+        serve: bool,
+    ) -> Result<lsproto::ResponseMessage, GoError> {
+        let shared = &self.shared;
+        let dispatch = self.dispatch_ctx.borrow().clone();
+        // The server and the dispatch loop's context and exit, to serve.
+        let serving = match (&dispatch, self.this.upgrade()) {
+            (Some((dispatch_ctx, lsp_exit)), Some(server))
+                if serve
+                    && self.serve_token.get()
+                    && self.serving_waits.get() < MAX_SERVING_WAITS =>
+            {
+                Some((server, dispatch_ctx.clone(), lsp_exit.clone()))
+            }
+            _ => None,
+        };
+        // The done channels of `ctx` and of the dispatch loop wake the wait.
+        let dones: Vec<context::Done> = std::iter::once(ctx)
+            .chain(dispatch.as_ref().map(|(dispatch_ctx, _)| dispatch_ctx))
+            .filter_map(|ctx| ctx.done())
+            .collect();
+        let wakers: Vec<Option<u64>> = dones
+            .iter()
+            .map(|done| {
+                let shared = shared.clone();
+                done.register_waker(move || {
+                    let _guard = lock(&shared.queued_mu);
+                    shared.queued_cond.notify_all();
+                })
+            })
+            .collect();
+        let grace_end = Instant::now() + TASK_REPLY_GRACE;
+        let result = loop {
+            // The reader thread and the wakers signal under `queued_mu`, so
+            // no signal is lost between these checks and the wait.
+            let guard = lock(&shared.queued_mu);
+            // Go's select takes either ready case. The response goes first,
+            // so a response that came while this wait served a message is
+            // not lost to the timeout.
+            match response_chan.try_recv() {
+                Ok(Some(resp)) => break Ok(resp),
+                Ok(None) | Err(TryRecvError::Empty) => {}
+                // No caller closes the channel (see `recv_or_done`).
+                Err(TryRecvError::Disconnected) => crate::core::go_nil_dereference(),
+            }
+            if let Some(err) = ctx.err() {
+                break Err(err);
+            }
+            if let Some(err) = dispatch
+                .as_ref()
+                .and_then(|(dispatch_ctx, _)| dispatch_ctx.err())
+            {
+                break Err(err);
+            }
+            let now = Instant::now();
+            if let Some((server, dispatch_ctx, lsp_exit)) = &serving
+                && now >= grace_end
+                && let Some(req) = shared.take_queued_request()
+            {
+                // A nested wait takes `queued_mu` again.
+                drop(guard);
+                let _serving = SetCell::new(&self.serving_waits, self.serving_waits.get() + 1);
+                server.dispatch_request(dispatch_ctx, lsp_exit, &Rc::new(req), true);
+                server.run_tasks();
+                continue;
+            }
+            if serving.is_some() && now < grace_end {
+                drop(
+                    shared
+                        .queued_cond
+                        .wait_timeout(guard, grace_end - now)
+                        .unwrap_or_else(|e| e.into_inner()),
+                );
+            } else {
+                drop(
+                    shared
+                        .queued_cond
+                        .wait(guard)
+                        .unwrap_or_else(|e| e.into_inner()),
+                );
+            }
+        };
+        for (done, waker) in dones.iter().zip(wakers) {
+            if let Some(id) = waker {
+                done.unregister_waker(id);
+            }
+        }
+        result
+    }
 }
 
 // Go: server.go:1090 sendClientRequestFireAndForget
@@ -5000,7 +5245,7 @@ impl ipc::Protocol for ApiConnProtocol {
                     return server.dispatch_next(&ctx, &lsp_exit);
                 }
                 if let Some(req) = server.shared.wait_during_api_call(&ctx, &self.inbox) {
-                    server.dispatch_request(&ctx, &lsp_exit, &Rc::new(req));
+                    server.dispatch_request(&ctx, &lsp_exit, &Rc::new(req), false);
                 }
                 Ok(())
             }));

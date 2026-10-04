@@ -1304,6 +1304,10 @@ each message and after each wake-up. Go `WaitForBackgroundTasks` runs
   boundaries. Without an API session, the results of LSP requests are
   Go's and only order and timing differ. With an API session, the limits
   below also change which messages are answered and when.
+- A background task's watch registration that waits for the client holds
+  the next LSP messages for up to 50 ms. Then the wait serves them inside
+  the task until the client answers (`lsp/server.rs`
+  `wait_client_reply`). Go's dispatch loop goes on at once.
 - API sessions of the LSP server (`custom/initializeAPISession`) are
   served on the dispatch thread too (`lsp/server.rs` `ApiConnProtocol`).
   LSP messages and API requests do not run at the same time. These
