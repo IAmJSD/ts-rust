@@ -86,10 +86,13 @@
 //! waits. Other releases free them at once, so that the next check reuses
 //! their memory.
 //!
-//! Cancellation is Go's: `$/cancelRequest` reaches only a request that the
-//! dispatch loop took (`pending_client_requests`); a cancel for a queued
-//! request is dropped. The LS loops check the request context. The checker
-//! checks it at each top-level statement and deferred node, like Go.
+//! Cancellation: `$/cancelRequest` cancels the context of a request that the
+//! dispatch loop took (`pending_client_requests`), as in Go. A cancel for a
+//! request that still waits in the queue marks it, and the dispatch loop
+//! answers it with RequestCancelled without running the handler (Go takes
+//! the request at once, so its cancel finds it; see `cancel_request`). The
+//! LS loops check the request context. The checker checks it at each
+//! top-level statement and deferred node, like Go.
 //!
 //! When the `run` context ends (Go `signal.NotifyContext` in
 //! `cmd/tsc/lsp.go`), every loop returns `context canceled`, as in Go. A
@@ -198,7 +201,7 @@ pub fn new_server(opts: ServerOptions) -> Rc<Server> {
         queued_mu: Mutex::new(()),
         queued_cond: Condvar::new(),
         outgoing_queue: new_dynamic_queue(),
-        pending_client_requests: Mutex::new(FxHashMap::default()),
+        pending_client_requests: Mutex::default(),
         pending_server_requests: Mutex::new(FxHashMap::default()),
         cwd,
         initialize_params: OnceLock::new(),
@@ -264,6 +267,16 @@ pub static FILE_RENAME_FILTERS: LazyLock<Vec<lsproto::FileOperationFilter>> = La
 pub struct PendingClientRequest {
     pub method: lsproto::Method,
     pub cancel: CancelFunc,
+}
+
+/// PORT: Go `pendingClientRequests`, and the ids of queued requests that a
+/// `$/cancelRequest` reached before the dispatch loop took them (no Go
+/// counterpart, see `cancel_request`). One mutex covers both (Go
+/// `pendingClientRequestsMu`).
+#[derive(Default)]
+pub struct PendingClientRequests {
+    pub requests: FxHashMap<crate::jsonrpc::ID, PendingClientRequest>,
+    pub cancelled_before_dispatch: FxHashSet<crate::jsonrpc::ID>,
 }
 
 // Go: server.go:107 Reader
@@ -429,7 +442,7 @@ pub struct ServerShared {
     // the mutexes. A pending server request holds the sending end of its
     // response channel; `None` on that channel is the context wake-up of
     // `send_client_request`.
-    pub pending_client_requests: Mutex<FxHashMap<crate::jsonrpc::ID, PendingClientRequest>>,
+    pub pending_client_requests: Mutex<PendingClientRequests>,
     pub pending_server_requests:
         Mutex<FxHashMap<crate::jsonrpc::ID, SyncSender<Option<lsproto::ResponseMessage>>>>,
 
@@ -1993,12 +2006,26 @@ impl ServerShared {
     }
 
     // Go: server.go:954 cancelRequest
+    // PORT: Go's dispatch loop takes a request at once (its slow part runs
+    // on a goroutine), so a cancel almost always finds it pending. Here a
+    // request waits in the queue while the dispatch thread runs an earlier
+    // one. A cancel for a request in the queue marks its id, and
+    // `dispatch_request` answers it with RequestCancelled and does not run
+    // the handler: Go's answer when the cancel comes during the async part.
+    // A cancel for an id that is neither pending nor queued (answered or
+    // unknown) is dropped, as in Go, so the set holds only queued ids.
     pub fn cancel_request(&self, raw_id: &lsproto::IntegerOrString) {
         let id = lsproto::new_id(raw_id);
         let mut pending_client_requests = lock(&self.pending_client_requests);
-        if let Some(pending_req) = pending_client_requests.get(&id) {
+        if let Some(pending_req) = pending_client_requests.requests.get(&id) {
             (pending_req.cancel)();
-            pending_client_requests.remove(&id);
+            pending_client_requests.requests.remove(&id);
+        } else if self.request_queue.with_items(|items| {
+            items.iter().any(
+                |item| matches!(item, QueuedRequest::Request(req) if req.id.as_ref() == Some(&id)),
+            )
+        }) {
+            pending_client_requests.cancelled_before_dispatch.insert(id);
         }
     }
 
@@ -2126,13 +2153,26 @@ impl Server {
         let mut request_ctx = locale::with_locale(ctx, self.shared.locale());
         let mut cancel: Option<CancelFunc> = None;
         if let Some(id) = &req.id {
+            let mut pending_client_requests = lock(&self.shared.pending_client_requests);
+            // PORT: a `$/cancelRequest` reached this request while it waited
+            // in the queue (see `cancel_request`).
+            if pending_client_requests.cancelled_before_dispatch.remove(id) {
+                drop(pending_client_requests);
+                if let Err(err) = self.shared.send_error(
+                    req.id.clone(),
+                    errors::from_value(ErrorCode::REQUEST_CANCELLED),
+                ) {
+                    lsp_exit(Some(err));
+                }
+                return;
+            }
             let (c, f) = context::with_cancel(&crate::frontend::core_context::with_request_id(
                 &request_ctx,
                 &id.string(),
             ));
             request_ctx = c;
             cancel = Some(f.clone());
-            lock(&self.shared.pending_client_requests).insert(
+            pending_client_requests.requests.insert(
                 id.clone(),
                 PendingClientRequest {
                     method: req.method.clone(),
@@ -2158,7 +2198,9 @@ impl Server {
 
         let remove_request = || {
             if let Some(id) = &req.id {
-                lock(&self.shared.pending_client_requests).remove(id);
+                lock(&self.shared.pending_client_requests)
+                    .requests
+                    .remove(id);
                 // Go: defer cancel()
                 if let Some(cancel) = &cancel {
                     cancel();
@@ -5369,4 +5411,87 @@ pub fn is_valid_contributed_content_mapper_extension(extension: &str) -> bool {
                 extension,
             )
         })
+}
+
+#[cfg(test)]
+mod cancel_tests {
+    use super::*;
+
+    struct NoReader;
+    impl Reader for NoReader {
+        fn read(&mut self) -> (Option<lsproto::Message>, Option<GoError>) {
+            (None, Some(errors::EOF.clone()))
+        }
+    }
+    struct NoWriter;
+    impl Writer for NoWriter {
+        fn write(&mut self, _msg: &lsproto::Message) -> Result<(), GoError> {
+            Ok(())
+        }
+    }
+
+    fn int_id(id: i32) -> lsproto::IntegerOrString {
+        lsproto::IntegerOrString {
+            integer: Some(id),
+            string: None,
+        }
+    }
+
+    // A `$/cancelRequest` for a request that waits in the queue makes the
+    // dispatch loop answer RequestCancelled without running the handler (a
+    // hover before `initialize` would fail in the handler). A cancel for an
+    // id that is not queued leaves no mark.
+    #[test]
+    fn a_cancel_for_a_queued_request_answers_request_cancelled() {
+        let server = new_server(ServerOptions {
+            in_: Box::new(NoReader),
+            out: Box::new(NoWriter),
+            err: Box::new(std::io::sink()),
+            cwd: "/".to_string(),
+            fs: crate::frontend::vfs::osvfs::osvfs_fs(),
+            default_library_path: String::new(),
+            typings_location: String::new(),
+            parse_cache: None,
+            npm_install: None,
+            spawn: None,
+            progress_delay: Duration::ZERO,
+            set_parent_process_id: None,
+        });
+        let ctx = context::background();
+        let _ = server.shared.background_ctx.set(ctx.clone());
+        let hover = lsproto::TEXT_DOCUMENT_HOVER_INFO.new_request_message(
+            Some(crate::jsonrpc::new_id_int(5)),
+            lsproto::HoverParams {
+                text_document: lsproto::TextDocumentIdentifier {
+                    uri: lsproto::DocumentUri("file:///a.ts".into()),
+                },
+                ..Default::default()
+            },
+        );
+        server
+            .shared
+            .queue_request(&ctx, QueuedRequest::Request(hover))
+            .unwrap();
+        server.shared.cancel_request(&int_id(5));
+        server.shared.cancel_request(&int_id(6));
+        assert_eq!(
+            lock(&server.shared.pending_client_requests)
+                .cancelled_before_dispatch
+                .len(),
+            1
+        );
+
+        let (dispatch_ctx, lsp_exit) = context::with_cancel_cause(&ctx);
+        server.dispatch_next(&dispatch_ctx, &lsp_exit).unwrap();
+        let msg = server.shared.outgoing_queue.get(&ctx).unwrap();
+        let resp = msg.as_response();
+        assert_eq!(resp.id, Some(crate::jsonrpc::new_id_int(5)));
+        assert_eq!(
+            resp.error.as_ref().map(|err| err.code),
+            Some(ErrorCode::REQUEST_CANCELLED.0)
+        );
+        let pending = lock(&server.shared.pending_client_requests);
+        assert!(pending.cancelled_before_dispatch.is_empty());
+        assert!(pending.requests.is_empty());
+    }
 }
