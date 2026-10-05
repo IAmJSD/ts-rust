@@ -25,15 +25,18 @@
 # Steps:
 #   0. Dynamic build: make the glibc 2.28 sysroot once (floor_sysroot).
 #   1. Instrumented build (-Cprofile-generate) of goport, tsgo and goport_emit.
-#   2. PGO training: the same runs as build-pgo.sh.
-#   3. Merge the raw profiles with llvm-profdata.
+#   2. PGO training: the same runs as build-pgo.sh, then tsgo on the extra
+#      realworld inputs (RELEASE_EXTRA_INPUTS) into their own profile dir.
+#   3. Merge the raw profiles with llvm-profdata. The extra inputs get about
+#      PGO_EXTRA_SHARE percent of the merged count.
 #   4. PGO use build of the shipped bins (tsgo, goport, goport_emit,
 #      goport_build, goport_typesyms), linked with --emit-relocs. BOLT needs
 #      the relocations. They do not change the code.
 #      Dynamic build: check that no bin needs a GLIBC_ symbol version above
 #      the floor (objdump -T).
 #   5. BOLT: record each bin with perf branch sampling on training runs
-#      (for tsgo, also editor sessions: RELEASE_LSP_SESSIONS), convert with
+#      (for tsgo, also the extra inputs and editor sessions:
+#      RELEASE_EXTRA_INPUTS, RELEASE_LSP_SESSIONS), convert with
 #      perf2bolt, merge with merge-fdata, rewrite with llvm-bolt.
 #      Then check the program headers of the shipped bins (check_headers).
 #   6. Run tsgo in qemu on a CPU without AVX. A dynamic tsgo runs there on the
@@ -155,6 +158,20 @@
 #   RELEASE_BOLT      1 (default). 0: skip step 5, for hosts without llvm-bolt
 #                     or perf branch sampling (Intel LBR, AMD LBR v2 or BRS).
 #   PGO_CORPUS_STEP   train on every Nth corpus case (default 60, about 200)
+#   RELEASE_EXTRA_INPUTS  realworld inputs of the tsgo PGO and BOLT training
+#                     beside the gate projects (default "svelte
+#                     eslint-plugin-svelte"; empty: none, the training of R170
+#                     and before). svelte: packages/svelte of the svelte
+#                     project input, JS with JSDoc (checkJs). eslint-plugin-svelte:
+#                     union narrowing heavy, a pinned clone that
+#                     scripts/pgo-inputs.sh fetches into
+#                     <data-root>/target/pgo-inputs (once, with network;
+#                     BUILD.txt records its commit and tree digest).
+#   PGO_EXTRA_SHARE   percent of the merged PGO count that the extra inputs
+#                     get at most (default 25). Step 3 weights the profile of
+#                     the other runs up until the extra inputs are at or below
+#                     this share, so one heavy repo does not take over the
+#                     profile of the gate projects.
 #   BOLT_PERF_FREQ    perf sample frequency for BOLT (default 20000)
 #   RELEASE_LSP_SESSIONS  editor sessions of the tsgo BOLT training, as
 #                     <project>:<edits> (default "query-core:300 hono:200
@@ -202,7 +219,7 @@
 #     code of jemalloc builds against the same sysroot (CFLAGS_<target>), so
 #     its headers do not ask for newer symbols.
 #
-# The training runs only read project inputs: emit writes to a temp --outDir,
+# The training runs only read project inputs and pgo inputs: emit writes to a temp --outDir,
 # the editor sessions send the edits as overlays (didOpen, didChange),
 # tsgo writes .tsbuildinfo to a temp file, goport_build runs on a temp copy.
 set -euo pipefail
@@ -242,6 +259,9 @@ glibc_floor="${RELEASE_GLIBC_FLOOR:-2.28}"
 bolt="${RELEASE_BOLT:-1}"
 corpus_step="${PGO_CORPUS_STEP:-60}"
 lsp_sessions="${RELEASE_LSP_SESSIONS-query-core:300 hono:200 effect:300}"
+read -ra extra_inputs <<< "${RELEASE_EXTRA_INPUTS-svelte eslint-plugin-svelte}"
+extra_share="${PGO_EXTRA_SHARE:-25}"
+[[ $extra_share =~ ^[1-9][0-9]?$ ]] || { echo "error: PGO_EXTRA_SHARE is a percent from 1 to 99, not $extra_share" >&2; exit 1; }
 export RUSTUP_TOOLCHAIN="${RUSTUP_TOOLCHAIN:-1.95.0}"
 # The training runs start no tsgo worker (bin/tsgo.rs `launch`): when the
 # launcher exits, the parent death signal can kill the worker before it has
@@ -419,14 +439,27 @@ declare -A projects=(
   [zod]="$P/zod/source/packages/zod/tsconfig.json"
   [effect]="$P/effect/source/packages/effect/tsconfig.json"
   [elysia]="$data_root/target/project-inputs-extra/elysia/src/tsconfig.json"
+  [svelte]="$P/svelte/source/packages/svelte/tsconfig.json"
+  [eslint-plugin-svelte]="$data_root/target/pgo-inputs/eslint-plugin-svelte/source/packages/eslint-plugin-svelte/tsconfig.pgo.json"
 )
+# The extra inputs must be there before the builds start: a release trained on
+# part of the inputs is slower and looks fine.
+pgo_inputs="$data_root/target/pgo-inputs"
+pgo_inputs_check=""
+for name in "${extra_inputs[@]}"; do
+  [[ -n ${projects[$name]:-} ]] || { echo "error: RELEASE_EXTRA_INPUTS: no input named $name" >&2; exit 1; }
+  if [[ ${projects[$name]} == "$pgo_inputs"/* && -z $pgo_inputs_check ]]; then
+    pgo_inputs_check="$("$script_dir/pgo-inputs.sh" check "$pgo_inputs")" || exit 1
+  fi
+  [[ -f ${projects[$name]} ]] || { echo "error: ${projects[$name]} not found (input $name)" >&2; exit 1; }
+done
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
 # 1. Instrumented build. Training runs only these three bins; the other two
 # share their code, so they use the same profile.
-profiles="$out/profiles"
-rm -rf "$profiles"
+profiles="$out/profiles" profiles_extra="$out/profiles-extra"
+rm -rf "$profiles" "$profiles_extra"
 mkdir -p "$profiles"
 build target-gen "-Cprofile-generate=$profiles $link_flags" goport tsgo goport_emit
 gen="$out/target-gen/$target/goport"
@@ -460,8 +493,16 @@ for dir in "$cases"/*/; do
     n=$((n + 1))
   fi
 done
+# The extra inputs: tsgo only, into their own profile dir (step 3 weights it).
+for name in "${extra_inputs[@]}"; do
+  train env LLVM_PROFILE_FILE="$profiles_extra/default_%m.profraw" "$gen/tsgo" -p "${projects[$name]}" --noEmit --tsBuildInfoFile "$tmp/$name.tsbuildinfo"
+done
 nprof=$(find "$profiles" -name '*.profraw' | wc -l)
-echo "trained on 5 projects and $n corpus cases, $nprof profraw files"
+echo "trained on 5 projects, ${#extra_inputs[@]} extra inputs and $n corpus cases, $nprof profraw files"
+if ((${#extra_inputs[@]} > 0)) && [[ -z $(find "$profiles_extra" -name '*.profraw' 2> /dev/null) ]]; then
+  echo "error: the extra inputs wrote no profile to $profiles_extra" >&2
+  exit 1
+fi
 if ((killed > 0)); then
   echo "error: $killed PGO training runs were killed by a signal (see above)" >&2
   exit 1
@@ -475,6 +516,20 @@ fi
 # profile content, but it rebuilds when RUSTFLAGS change.
 rm -f "$out"/goport-*.profdata
 "$profdata" merge -o "$tmp/merged.profdata" "$profiles"
+extra_note=none
+if ((${#extra_inputs[@]} > 0)); then
+  # Weight w of the other runs, the smallest with extra / (w * base + extra)
+  # at or below the share. The count is the sum of all block counts.
+  count() { "$profdata" show --detailed-summary "$1" | sed -n 's/^Total count: //p'; }
+  mv "$tmp/merged.profdata" "$tmp/base.profdata"
+  "$profdata" merge -o "$tmp/extra.profdata" "$profiles_extra"
+  base_count=$(count "$tmp/base.profdata") extra_count=$(count "$tmp/extra.profdata")
+  w=$(((extra_count * (100 - extra_share) + extra_share * base_count - 1) / (extra_share * base_count)))
+  ((w >= 1)) || w=1
+  "$profdata" merge -o "$tmp/merged.profdata" --weighted-input="$w,$tmp/base.profdata" "$tmp/extra.profdata"
+  extra_note="${extra_inputs[*]}; PGO count $extra_count against $base_count, other runs weighted $w, so $((100 * extra_count / (w * base_count + extra_count)))% of the profile (PGO_EXTRA_SHARE $extra_share)"
+  echo "pgo extra inputs: $extra_note"
+fi
 merged="$out/goport-$(sha256sum "$tmp/merged.profdata" | cut -c1-12).profdata"
 mv "$tmp/merged.profdata" "$merged"
 
@@ -564,7 +619,9 @@ if [[ $static == 1 && $libc == gnu ]]; then
   bolt_opts+=("-skip-funcs=read_encoded_value_with_base.*,linear_search_fdes.*,fde_single_encoding_extract.*,fde_mixed_encoding_extract.*")
 fi
 bolt_dir="$out/bolt"
-declare -A reps=([query]=12 [hono]=6 [zod]=4 [effect]=3) # about 5 s of work per recording
+# About 5 s of work per recording. The extra inputs record at half the
+# sample frequency, so they are about 1/4 of the tsgo CLI samples, as in PGO.
+declare -A reps=([query]=12 [hono]=6 [zod]=4 [effect]=3 [svelte]=4 [eslint-plugin-svelte]=1)
 
 # rec <name> <reps> <cmd...>: one perf recording of <reps> runs, each without
 # old .tsbuildinfo or emit output in $tmp. freq (default BOLT_PERF_FREQ) sets
@@ -588,6 +645,9 @@ bolt_train() {
       done
       for name in query hono; do
         rec "tsgo-emit-$name" "${reps[$name]}" "$b" -p "${projects[$name]}" --pretty false --outDir "$tmp/out-$name" --tsBuildInfoFile "$tmp/emit-$name.tsbuildinfo"
+      done
+      for name in "${extra_inputs[@]}"; do
+        freq=$((${BOLT_PERF_FREQ:-20000} / 2)) rec "tsgo-$name" "${reps[$name]:-1}" "$b" -p "${projects[$name]}" --noEmit --pretty false --tsBuildInfoFile "$tmp/$name.tsbuildinfo"
       done
       # The editor sessions, in one recording at a lower sample frequency.
       if [[ -n $lsp_sessions ]]; then
@@ -721,6 +781,8 @@ done
   echo "source: $(git -C "$repo" rev-parse HEAD)$(git -C "$repo" diff --quiet HEAD -- crates Cargo.toml Cargo.lock ':(exclude,glob)crates/*/scripts/**' || echo ' (dirty)')"
   echo "rustc: $(rustc -V), target $target, cargo profile goport"
   echo "pgo: $merged, trained on 5 projects and $n corpus cases"
+  echo "extra inputs (tsgo PGO and BOLT): $extra_note"
+  [[ -z $pgo_inputs_check ]] || echo "pgo inputs (name commit digest): $(paste -sd';' <<< "$pgo_inputs_check" | sed 's/;/; /g')"
   echo "pie: $pie"
   if [[ $libc == musl ]]; then
     echo "libc: static musl (rustc self-contained)"
