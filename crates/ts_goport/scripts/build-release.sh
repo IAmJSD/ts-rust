@@ -186,7 +186,11 @@
 #                     edit (studies/lspeffect1).
 #   BOLT_LSP_PERF_FREQ  perf sample frequency of the editor sessions (default
 #                     2500, 1/8 of the CLI runs' rate, so they are about 12%
-#                     of the tsgo samples; see the pgolsp1 note above)
+#                     of the tsgo samples; see the pgolsp1 note above). The
+#                     kernel cap (kernel.perf_event_max_sample_rate) applies to
+#                     both rates: at 3000 (zbook, 2026-10-04) the sessions get
+#                     about 2500 Hz and the CLI runs 3000, so the sessions are
+#                     about 40% of the tsgo samples there.
 #
 # Rules this script keeps:
 #   - Both cargo builds pass --target. The flags then reach only the shipped
@@ -619,9 +623,12 @@ if [[ $static == 1 && $libc == gnu ]]; then
   bolt_opts+=("-skip-funcs=read_encoded_value_with_base.*,linear_search_fdes.*,fde_single_encoding_extract.*,fde_mixed_encoding_extract.*")
 fi
 bolt_dir="$out/bolt"
-# About 5 s of work per recording. The extra inputs record at half the
-# sample frequency, so they are about 1/4 of the tsgo CLI samples, as in PGO.
-declare -A reps=([query]=12 [hono]=6 [zod]=4 [effect]=3 [svelte]=4 [eslint-plugin-svelte]=1)
+# About 5 s of work per recording. The extra inputs are about 30% of the tsgo
+# CLI samples (svelte 2 runs, eslint-plugin-svelte 1). Their weight is set by
+# the run count, not by the frequency: the kernel caps the rate
+# (kernel.perf_event_max_sample_rate, 3000 on zbook on 2026-10-04, so 20000
+# and 2500 Hz both sample at about 3000 there). BUILD.txt records the cap.
+declare -A reps=([query]=12 [hono]=6 [zod]=4 [effect]=3 [svelte]=2 [eslint-plugin-svelte]=1)
 
 # rec <name> <reps> <cmd...>: one perf recording of <reps> runs, each without
 # old .tsbuildinfo or emit output in $tmp. freq (default BOLT_PERF_FREQ) sets
@@ -647,7 +654,7 @@ bolt_train() {
         rec "tsgo-emit-$name" "${reps[$name]}" "$b" -p "${projects[$name]}" --pretty false --outDir "$tmp/out-$name" --tsBuildInfoFile "$tmp/emit-$name.tsbuildinfo"
       done
       for name in "${extra_inputs[@]}"; do
-        freq=$((${BOLT_PERF_FREQ:-20000} / 2)) rec "tsgo-$name" "${reps[$name]:-1}" "$b" -p "${projects[$name]}" --noEmit --pretty false --tsBuildInfoFile "$tmp/$name.tsbuildinfo"
+        rec "tsgo-$name" "${reps[$name]:-1}" "$b" -p "${projects[$name]}" --noEmit --pretty false --tsBuildInfoFile "$tmp/$name.tsbuildinfo"
       done
       # The editor sessions, in one recording at a lower sample frequency.
       if [[ -n $lsp_sessions ]]; then
@@ -797,6 +804,7 @@ done
   echo "lib files: $([[ $noembed == 1 ]] && echo "next to the bins (noembed)" || echo "embedded")"
   if [[ $bolt == 1 ]]; then
     echo "bolt: $(llvm-bolt --version | grep -m1 'LLVM version' | xargs), ${bolt_opts[*]}"
+    echo "bolt perf: -F ${BOLT_PERF_FREQ:-20000}, kernel.perf_event_max_sample_rate $(cat /proc/sys/kernel/perf_event_max_sample_rate 2> /dev/null || echo unknown) at the end"
     if [[ -n $lsp_sessions ]]; then
       echo "bolt editor sessions (tsgo, ${BOLT_LSP_PERF_FREQ:-2500} Hz): $(sed -n 's/^lsp-train: \(.*\): [0-9]* of .*/\1/p' "$bolt_dir/data/tsgo-lsp.out" | paste -sd';' | sed 's/;/; /g'); ls_edit_bench.py sha256 $(sha256sum "$repo/scripts/goport/ls_edit_bench.py" | cut -c1-12)"
     fi
