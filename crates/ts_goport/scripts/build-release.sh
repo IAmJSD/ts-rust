@@ -25,7 +25,8 @@
 # Steps:
 #   0. Dynamic build: make the glibc 2.28 sysroot once (floor_sysroot).
 #   1. Instrumented build (-Cprofile-generate) of goport, tsgo and goport_emit.
-#   2. PGO training: the same runs as build-pgo.sh.
+#   2. PGO training: the same runs as build-pgo.sh, and tsgo --listFilesOnly
+#      with GOPORT_LOAD_PREP=0 on each project (the editor's loader path).
 #   3. Merge the raw profiles with llvm-profdata.
 #   4. PGO use build of the shipped bins (tsgo, goport, goport_emit,
 #      goport_build, goport_typesyms), linked with --emit-relocs. BOLT needs
@@ -453,6 +454,16 @@ for name in query hono zod effect elysia; do
   train "$gen/goport" -p "${projects[$name]}"
   train "$gen/tsgo" -p "${projects[$name]}" --noEmit --tsBuildInfoFile "$tmp/$name.tsbuildinfo"
 done
+# The editor's loader path. The CLI loader takes the parse workers' answers
+# (FilePrep, since loadpar1); the language server's loader does not, and
+# resolves each import name itself (DefaultResolver::resolve_module_name).
+# Without these runs no training run takes that path, and the release editor
+# lost 0.5 to 1% (studies/edbisect1). --listFilesOnly loads, parses and binds
+# but does not check, so the check code keeps its weight.
+loader_projects=(query hono zod effect elysia)
+for name in "${loader_projects[@]}"; do
+  train env GOPORT_LOAD_PREP=0 "$gen/tsgo" -p "${projects[$name]}" --listFilesOnly
+done
 for name in query hono; do
   train "$gen/goport_emit" -p "${projects[$name]}" --outDir "$tmp/out"
   rm -rf "$tmp/out"
@@ -726,6 +737,7 @@ done
   echo "source: $(git -C "$repo" rev-parse HEAD)$(git -C "$repo" diff --quiet HEAD -- crates Cargo.toml Cargo.lock ':(exclude,glob)crates/*/scripts/**' || echo ' (dirty)')"
   echo "rustc: $(rustc -V), target $target, cargo profile goport"
   echo "pgo: $merged, trained on 5 projects and $n corpus cases"
+  echo "pgo editor loader: tsgo --listFilesOnly with GOPORT_LOAD_PREP=0 on ${loader_projects[*]}"
   echo "pie: $pie"
   if [[ $libc == musl ]]; then
     echo "libc: static musl (rustc self-contained)"

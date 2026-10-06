@@ -381,19 +381,25 @@ pub fn get_root_length(path: &str) -> usize {
 }
 
 // Go: tspath/path.go:251 GetDirectoryPath
+// PERF (pgoedit1): one string, not two. `normalize_slashes_cow` borrows a
+// path that has no backslash, as Go's `NormalizeSlashes` returns its input.
+// memchr and memrchr pick their SIMD code at run time. The byte loops they
+// replace were vectorized or not by the PGO profile alone: in the R175
+// release build the language server, whose loader resolves each import name
+// itself, paid about 5x the instructions here (studies/edbisect1).
 pub fn get_directory_path(path: &str) -> String {
-    let path = normalize_slashes(path);
+    let path = normalize_slashes_cow(path);
 
     // If the path provided is itself a root, then return it.
     let root_length = get_root_length(&path);
     if root_length == path.len() {
-        return path;
+        return path.into_owned();
     }
 
     // return the leading portion of the path up to the last (non-terminal) directory separator
     // but not including any trailing directory separator.
     let path = remove_trailing_directory_separator(&path);
-    let end = (root_length as isize).max(last_index_byte(path, b'/')) as usize;
+    let end = memchr::memrchr(b'/', path.as_bytes()).map_or(root_length, |i| i.max(root_length));
     path[..end].to_string()
 }
 
@@ -420,7 +426,18 @@ pub fn get_path_from_path_components(path_components: &[String]) -> String {
 
 // Go: tspath/path.go:283 NormalizeSlashes
 pub fn normalize_slashes(path: &str) -> String {
-    path.replace('\\', "/")
+    normalize_slashes_cow(path).into_owned()
+}
+
+/// `normalize_slashes` that borrows `path` when it has no backslash.
+// PORT: Go's `strings.ReplaceAll` returns its input when nothing matches,
+// so Go makes no copy there either.
+pub fn normalize_slashes_cow(path: &str) -> Cow<'_, str> {
+    if memchr::memchr(b'\\', path.as_bytes()).is_some() {
+        Cow::Owned(path.replace('\\', "/"))
+    } else {
+        Cow::Borrowed(path)
+    }
 }
 
 // Go: tspath/path.go:287 reducePathComponents
@@ -1720,5 +1737,93 @@ mod unicode_case_tests {
             compare_strings_case_insensitive("/a/\u{A7CB}", "/a/\u{264}"),
             0
         );
+    }
+}
+
+#[cfg(test)]
+mod directory_path_tests {
+    use super::{
+        get_directory_path, get_root_length, normalize_slashes, normalize_slashes_cow,
+        remove_trailing_directory_separator,
+    };
+    use std::borrow::Cow;
+
+    /// Go's `GetDirectoryPath` (tspath/path.go:251) as Go writes it: copy,
+    /// then a second string.
+    fn go_get_directory_path(path: &str) -> String {
+        let path = path.replace('\\', "/");
+        let root_length = get_root_length(&path);
+        if root_length == path.len() {
+            return path;
+        }
+        let path = remove_trailing_directory_separator(&path);
+        let last_slash = path.rfind('/').map_or(-1, |i| i as isize);
+        path[..(root_length as isize).max(last_slash) as usize].to_string()
+    }
+
+    /// `get_directory_path` gives Go's answer for every name of up to 5
+    /// bytes over '/', '\\', ':', '.', 'a' and 'c', alone and after disk,
+    /// UNC and URL roots, with and without backslashes.
+    #[test]
+    fn directory_path_matches_go() {
+        let roots = [
+            "",
+            "/",
+            "c:",
+            "c:\\",
+            "//server/",
+            "\\\\server\\share\\",
+            "file:///",
+            "file:///c:/",
+            "file://server/",
+            "http://server/",
+            "https://h/\u{e4}\\\u{fc}/",
+        ];
+        let mut level = vec![String::new()];
+        let mut names = vec![String::new()];
+        for _ in 0..5 {
+            level = level
+                .iter()
+                .flat_map(|path| ['/', '\\', ':', '.', 'a', 'c'].map(|c| format!("{path}{c}")))
+                .collect();
+            names.extend(level.iter().cloned());
+        }
+        for root in roots {
+            for name in &names {
+                let path = format!("{root}{name}");
+                assert_eq!(
+                    get_directory_path(&path),
+                    go_get_directory_path(&path),
+                    "{path:?}"
+                );
+            }
+        }
+    }
+
+    /// `normalize_slashes_cow` borrows a path without a backslash and
+    /// replaces each backslash otherwise.
+    #[test]
+    fn normalize_slashes_borrows_without_backslash() {
+        for path in [
+            "",
+            "a",
+            "/a/b.ts",
+            "c:/a",
+            "file:///c:/a",
+            "http://server/\u{e4}",
+        ] {
+            assert!(matches!(normalize_slashes_cow(path), Cow::Borrowed(p) if p == path));
+            assert_eq!(normalize_slashes(path), path);
+        }
+        for (path, want) in [
+            ("\\", "/"),
+            ("a\\b", "a/b"),
+            ("c:\\a\\", "c:/a/"),
+            ("\\\\server\\share", "//server/share"),
+            ("file:///c:\\\u{e4}\\b", "file:///c:/\u{e4}/b"),
+        ] {
+            assert!(matches!(normalize_slashes_cow(path), Cow::Owned(ref p) if p == want));
+            assert_eq!(normalize_slashes(path), want);
+        }
     }
 }
