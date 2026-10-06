@@ -48,8 +48,9 @@ pub struct ParseTask {
 
     /// The subtasks for the depth replay, recorded when a parallel load
     /// first starts them (`FilesParser::set_parallel_depths`).
-    // PORT: not in Go.
-    pub(crate) depth_edges: Option<DepthEdges>,
+    // PORT: not in Go. Boxed: a larger task takes a larger allocation size
+    // class, for every task of the load.
+    pub(crate) depth_edges: Option<Box<DepthEdges>>,
 }
 
 /// Go `*parseTask`.
@@ -814,7 +815,7 @@ impl FilesParser {
                     self.start_tasks(loader, &sub_tasks, lowest_depth, Some(&mut edges));
                     let mut task = task_by_file_name.borrow_mut();
                     let text_len = task.file.as_ref().map_or(0, |file| file.text.len() as u64);
-                    task.depth_edges = Some(DepthEdges { text_len, edges });
+                    task.depth_edges = Some(Box::new(DepthEdges { text_len, edges }));
                 }
             } else if relower
                 && !self.single_threaded
