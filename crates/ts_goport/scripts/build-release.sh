@@ -97,6 +97,16 @@
 #     layout.
 #   - Sessions in PGO and BOLT at full weight or 1/4: zod and effect check
 #     lost 1.1 to 2.2%.
+# Measured on R175 source (pgoedit1, target/continuation-r97-goport/pgoedit1):
+# the editor loader runs of step 2, with the get_directory_path fix, against
+# the fix alone, 3 builds a side. Output is byte-equal. The runs bring the
+# training calls of DefaultResolver::resolve_module_name back to R174's
+# (53k; R175 28k).
+#   - zbook user instructions per query-core editor session: typing -0.3%,
+#     imports -0.5%, long -0.15%.
+#   - mini-743d edit medians: query-core long +0.3%, typing and imports the
+#     same; hono long -0.2%. CLI wall time the same; query check peak RSS
+#     +0.5% (0.5 MiB).
 #
 # Environment:
 #   RUSTUP_TOOLCHAIN  default 1.95.0. Its LLVM 22 matches the system
