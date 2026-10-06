@@ -45,6 +45,11 @@ pub struct ParseTask {
 
     pub loaded_task: Option<ParseTaskRef>,
     pub all_include_reasons: Vec<Rc<FileIncludeReason>>,
+
+    /// The subtasks for the depth replay, recorded when a parallel load
+    /// first starts them (`FilesParser::set_parallel_depths`).
+    // PORT: not in Go.
+    pub(crate) depth_edges: Option<DepthEdges>,
 }
 
 /// Go `*parseTask`.
@@ -359,10 +364,12 @@ impl Drop for ParseTaskLinks {
 // Go: filesparser.go:243 getParseTaskData
 // PORT: Go takes the value from `parseTaskDataPool`; `putParseTaskData`
 // (filesparser.go:226) returns an unused one. No pool is needed here.
-fn get_parse_task_data(task: &ParseTaskRef) -> Rc<RefCell<ParseTaskData>> {
+fn get_parse_task_data(task: &ParseTaskRef, index: u32) -> Rc<RefCell<ParseTaskData>> {
     let mut tasks = IndexMap::with_capacity(1);
     tasks.insert(task.borrow().normalized_file_path.clone(), task.clone());
     Rc::new(RefCell::new(ParseTaskData {
+        index,
+        any_loaded: false,
         tasks,
         // PORT: Go `math.MaxInt`. Depths are small, so `i32::MAX` gives the same comparisons.
         lowest_depth: i32::MAX,
@@ -376,6 +383,12 @@ fn get_parse_task_data(task: &ParseTaskRef) -> Rc<RefCell<ParseTaskData>> {
 // insertion order. The map holds more than one task only when one path is
 // reached through file names that differ in casing.
 pub struct ParseTaskData {
+    /// The order in which the load made this value (`DepthEdge::data`).
+    // PORT: not in Go.
+    pub(crate) index: u32,
+    /// The load loaded a task of this path.
+    // PORT: not in Go.
+    pub(crate) any_loaded: bool,
     // map of tasks by file casing
     pub tasks: IndexMap<String, ParseTaskRef>,
     pub lowest_depth: i32,
@@ -569,6 +582,17 @@ impl FilesParser {
 
     // Go: filesparser.go:269 (*filesParser).start
     pub fn start(&mut self, loader: &FileLoader, tasks: &[ParseTaskRef], depth: i32) {
+        self.start_tasks(loader, tasks, depth, None);
+    }
+
+    /// Go `start`. `edges`: gets the task data and flags of each task.
+    fn start_tasks(
+        &mut self,
+        loader: &FileLoader,
+        tasks: &[ParseTaskRef],
+        depth: i32,
+        mut edges: Option<&mut Vec<DepthEdge>>,
+    ) {
         let prefetch = PREFETCH.with(|p| p.borrow().clone());
         let mut requests = Vec::new();
         for task in tasks {
@@ -592,7 +616,7 @@ impl FilesParser {
                     (data.clone(), true)
                 }
                 None => {
-                    let candidate = get_parse_task_data(task);
+                    let candidate = get_parse_task_data(task, self.task_data_by_path.len() as u32);
                     self.task_data_by_path
                         .insert(path.clone(), candidate.clone());
                     if prefetch.is_some() {
@@ -607,6 +631,14 @@ impl FilesParser {
                 }
             };
 
+            if let Some(edges) = edges.as_deref_mut() {
+                let task = task.borrow();
+                edges.push(DepthEdge {
+                    data: data.borrow().index,
+                    increase_depth: task.increase_depth,
+                    elide_on_depth: task.elide_on_depth,
+                });
+            }
             self.queue.push(QueuedParseTask {
                 task: task.clone(),
                 data,
@@ -764,6 +796,7 @@ impl FilesParser {
             let mut load_sub_tasks = start_subtasks;
             if !task_by_file_name.borrow().loaded {
                 task_by_file_name.borrow_mut().load(loader);
+                data.borrow_mut().any_loaded = true;
                 if task_by_file_name.borrow().redirected_parse_task.is_some() {
                     // Always load redirected task
                     load_sub_tasks = true;
@@ -774,7 +807,15 @@ impl FilesParser {
                 task_by_file_name.borrow_mut().started_sub_tasks = true;
                 let sub_tasks = task_by_file_name.borrow().sub_tasks.clone();
                 let lowest_depth = data.borrow().lowest_depth;
-                self.start(loader, &sub_tasks, lowest_depth);
+                if self.single_threaded {
+                    self.start(loader, &sub_tasks, lowest_depth);
+                } else {
+                    let mut edges = Vec::with_capacity(sub_tasks.len());
+                    self.start_tasks(loader, &sub_tasks, lowest_depth, Some(&mut edges));
+                    let mut task = task_by_file_name.borrow_mut();
+                    let text_len = task.file.as_ref().map_or(0, |file| file.text.len() as u64);
+                    task.depth_edges = Some(DepthEdges { text_len, edges });
+                }
             } else if relower
                 && !self.single_threaded
                 && task_by_file_name.borrow().started_sub_tasks
@@ -1364,6 +1405,23 @@ const REPLAY_DISPATCH: u64 = 10_000;
 /// the Ps take them about in queue order.
 const REPLAY_ROOT_STEP: u64 = 100;
 
+/// A task whose subtasks started in a parallel load, for the depth replay.
+pub(crate) struct DepthEdges {
+    /// The length of the task's text.
+    text_len: u64,
+    /// One per subtask, in order.
+    edges: Vec<DepthEdge>,
+}
+
+/// A subtask in the depth replay.
+#[derive(Clone, Copy)]
+pub(crate) struct DepthEdge {
+    /// `ParseTaskData::index` of the subtask's path.
+    data: u32,
+    increase_depth: bool,
+    elide_on_depth: bool,
+}
+
 /// One run of the queued func of Go `start` in the depth replay.
 #[derive(Clone, Copy)]
 struct ReplayArrival {
@@ -1382,8 +1440,10 @@ struct ReplayData {
     started: bool,
     /// The load loaded a task of the data: the file is in the program.
     in_program: bool,
+    /// The data has one task (one file name casing).
+    single: bool,
     /// The tasks of `ParseTaskData::tasks` that arrived, in arrival order.
-    casings: Vec<ReplayCasing>,
+    casings: smallvec::SmallVec<[ReplayCasing; 1]>,
 }
 
 /// A task of `ParseTaskData::tasks` in the depth replay.
@@ -1396,6 +1456,7 @@ struct ReplayCasing {
 
 /// The depth replay of a parallel load (`FilesParser::set_parallel_depths`).
 struct DepthReplay {
+    /// The task data by `ParseTaskData::index`.
     datas: Vec<Rc<RefCell<ParseTaskData>>>,
     states: Vec<ReplayData>,
     max_depth: i32,
@@ -1405,24 +1466,24 @@ impl DepthReplay {
     /// Replays the load of `parser` from `roots`. `None`: the replay needs
     /// a task that the load did not load or queue.
     fn run(parser: &FilesParser, roots: &[ParseTaskRef]) -> Option<Self> {
-        let mut index: FxHashMap<&Path, u32> =
-            FxHashMap::with_capacity_and_hasher(parser.task_data_by_path.len(), Default::default());
-        let mut datas = Vec::with_capacity(parser.task_data_by_path.len());
-        for (path, data) in &parser.task_data_by_path {
-            index.insert(path, datas.len() as u32);
-            datas.push(data.clone());
+        let mut datas: Vec<Option<Rc<RefCell<ParseTaskData>>>> =
+            vec![None; parser.task_data_by_path.len()];
+        for data in parser.task_data_by_path.values() {
+            let index = data.borrow().index as usize;
+            datas[index] = Some(data.clone());
         }
+        let datas: Vec<_> = datas.into_iter().collect::<Option<_>>()?;
         let states = datas
             .iter()
-            .map(|data| ReplayData {
-                lowest: i32::MAX,
-                started: false,
-                in_program: data
-                    .borrow()
-                    .tasks
-                    .values()
-                    .any(|task| task.borrow().loaded),
-                casings: Vec::new(),
+            .map(|data| {
+                let data = data.borrow();
+                ReplayData {
+                    lowest: i32::MAX,
+                    started: false,
+                    in_program: data.any_loaded,
+                    single: data.tasks.len() == 1,
+                    casings: smallvec::SmallVec::new(),
+                }
             })
             .collect();
         let mut replay = DepthReplay {
@@ -1434,11 +1495,19 @@ impl DepthReplay {
         let mut queue = std::collections::BinaryHeap::new();
         let mut arrivals = Vec::new();
         for (i, root) in roots.iter().enumerate() {
+            let edge = {
+                let root = root.borrow();
+                DepthEdge {
+                    data: parser.task_data_by_path.get(&root.path)?.borrow().index,
+                    increase_depth: root.increase_depth,
+                    elide_on_depth: root.elide_on_depth,
+                }
+            };
             queue.push(std::cmp::Reverse((
                 i as u64 * REPLAY_ROOT_STEP,
                 arrivals.len() as u32,
             )));
-            arrivals.push(replay.arrival(&index, &root.borrow(), 0)?);
+            arrivals.push(replay.arrival(edge, root, 0)?);
         }
         let mut started = Vec::new();
         while let Some(std::cmp::Reverse((time, order))) = queue.pop() {
@@ -1448,74 +1517,62 @@ impl DepthReplay {
             for casing in started.drain(..) {
                 let task = replay.task(arrival.data, casing);
                 let task = task.borrow();
-                let sub_tasks = replay.sub_arrivals(&index, &task, depth);
-                let end = time + replay.load_time(&task, &sub_tasks);
-                let last = sub_tasks
-                    .iter()
-                    .rposition(|sub| sub.is_some_and(|sub| replay.in_program(sub)));
-                for (i, sub) in sub_tasks.into_iter().enumerate() {
+                let (text_len, edges) = match &task.depth_edges {
+                    Some(edges) => (edges.text_len, edges.edges.as_slice()),
+                    None if task.sub_tasks.is_empty() => (0, &[][..]),
+                    None => return None,
+                };
+                let end = time + replay.load_time(text_len, edges);
+                let last = edges.iter().rposition(|edge| replay.in_program(edge.data));
+                for (i, &edge) in edges.iter().enumerate() {
+                    let sub = replay.arrival(edge, &task.sub_tasks[i], depth)?;
+                    if replay.has_no_effect(sub) {
+                        continue;
+                    }
                     let wait = if Some(i) == last { 0 } else { REPLAY_DISPATCH };
                     queue.push(std::cmp::Reverse((end + wait, arrivals.len() as u32)));
-                    arrivals.push(sub?);
+                    arrivals.push(sub);
                 }
             }
         }
         Some(replay)
     }
 
-    /// The arrival of `task` (a task that the load queued) at `depth`.
-    fn arrival(
-        &self,
-        index: &FxHashMap<&Path, u32>,
-        task: &ParseTask,
-        depth: i32,
-    ) -> Option<ReplayArrival> {
-        let data = *index.get(&task.path)?;
-        let tasks = &self.datas[data as usize].borrow().tasks;
-        let casing = if tasks.len() == 1 {
+    /// The arrival through `edge` of `task` (the task that the edge is of)
+    /// at `depth`.
+    fn arrival(&self, edge: DepthEdge, task: &ParseTaskRef, depth: i32) -> Option<ReplayArrival> {
+        let casing = if self.states[edge.data as usize].single {
             0
         } else {
-            tasks.get_index_of(&task.normalized_file_path)?
+            let data = self.datas[edge.data as usize].borrow();
+            data.tasks
+                .get_index_of(&task.borrow().normalized_file_path)?
         };
         Some(ReplayArrival {
-            data,
+            data: edge.data,
             casing: casing as u32,
             depth,
-            increase_depth: task.increase_depth,
-            elide_on_depth: task.elide_on_depth,
+            increase_depth: edge.increase_depth,
+            elide_on_depth: edge.elide_on_depth,
         })
     }
 
-    /// The arrivals of the subtasks of `task` at `depth`; `None` for a
-    /// subtask that the load did not queue.
-    fn sub_arrivals(
-        &self,
-        index: &FxHashMap<&Path, u32>,
-        task: &ParseTask,
-        depth: i32,
-    ) -> Vec<Option<ReplayArrival>> {
-        task.sub_tasks
-            .iter()
-            .map(|sub| self.arrival(index, &sub.borrow(), depth))
-            .collect()
-    }
-
-    fn in_program(&self, arrival: ReplayArrival) -> bool {
-        self.states[arrival.data as usize].in_program
+    fn in_program(&self, data: u32) -> bool {
+        self.states[data as usize].in_program
     }
 
     fn task(&self, data: u32, casing: usize) -> ParseTaskRef {
         self.datas[data as usize].borrow().tasks[casing].clone()
     }
 
-    /// The time of the load of `task`: its text, and its subtasks whose
+    /// The time of the load of a task: its text, and its subtasks whose
     /// files are in the program.
-    fn load_time(&self, task: &ParseTask, sub_tasks: &[Option<ReplayArrival>]) -> u64 {
-        let mut time = REPLAY_FILE + task.file.as_ref().map_or(0, |file| file.text.len() as u64);
-        for sub in sub_tasks.iter().flatten() {
-            if self.in_program(*sub) {
+    fn load_time(&self, text_len: u64, edges: &[DepthEdge]) -> u64 {
+        let mut time = REPLAY_FILE + text_len;
+        for edge in edges {
+            if self.in_program(edge.data) {
                 time += REPLAY_SUB_TASK;
-                if sub.increase_depth {
+                if edge.increase_depth {
                     time += REPLAY_EXTERNAL_SUB_TASK;
                 }
             }
@@ -1523,12 +1580,30 @@ impl DepthReplay {
         time
     }
 
+    /// True when `arrival` changes nothing whenever it runs: its casing
+    /// arrived, it does not lower the depth, and it is elided or every
+    /// casing is loaded. The state only moves toward this.
+    fn has_no_effect(&self, arrival: ReplayArrival) -> bool {
+        let state = &self.states[arrival.data as usize];
+        let current_depth = if arrival.increase_depth {
+            arrival.depth + 1
+        } else {
+            arrival.depth
+        };
+        state
+            .casings
+            .iter()
+            .any(|c| c.index == arrival.casing as usize)
+            && current_depth >= state.lowest
+            && (arrival.elide_on_depth && current_depth > self.max_depth
+                || state.casings.iter().all(|c| c.loaded))
+    }
+
     /// Runs the queued func body of Go `start` (filesparser.go:283-325) for
     /// `arrival`. Pushes the casings whose subtasks start to `started`.
     /// `None`: the load did not load a task that this run loads.
     fn arrive(&mut self, arrival: ReplayArrival, started: &mut Vec<usize>) -> Option<()> {
         let max_depth = self.max_depth;
-        let data = self.datas[arrival.data as usize].borrow();
         let state = &mut self.states[arrival.data as usize];
         let casing = arrival.casing as usize;
         let mut start_subtasks = false;
@@ -1558,6 +1633,7 @@ impl DepthReplay {
             let casing = state.casings[i];
             let mut load_sub_tasks = start_subtasks;
             if !casing.loaded {
+                let data = self.datas[arrival.data as usize].borrow();
                 let task = data.tasks[casing.index].borrow();
                 if !task.loaded {
                     return None;
