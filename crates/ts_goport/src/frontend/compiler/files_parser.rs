@@ -814,8 +814,8 @@ impl FilesParser {
                     let mut edges = Vec::with_capacity(sub_tasks.len());
                     self.start_tasks(loader, &sub_tasks, lowest_depth, Some(&mut edges));
                     let mut task = task_by_file_name.borrow_mut();
-                    let text_len = task.file.as_ref().map_or(0, |file| file.text.len() as u64);
-                    task.depth_edges = Some(Box::new(DepthEdges { text_len, edges }));
+                    let load_time = replay_load_time(&task);
+                    task.depth_edges = Some(Box::new(DepthEdges { load_time, edges }));
                 }
             } else if relower
                 && !self.single_threaded
@@ -846,8 +846,8 @@ impl FilesParser {
     // Which arrival is first is a race between goroutines. This replays the
     // queued func body over the loaded task graph in the order of a model
     // of that race: an arrival happens when the load of its parent ends.
-    // A load takes time for the file's size, its subtasks and its external
-    // (node_modules) subtasks. The last subtask that a file queues runs
+    // A load takes the time of its parse and its module resolutions
+    // (`replay_load_time`). The last subtask that a file queues runs
     // next on the same P (the Go scheduler's `runnext` slot); the others
     // wait for another P to take them (`REPLAY_DISPATCH`). Ties go to the
     // first queued. When the replay needs a task that the load did not
@@ -1389,29 +1389,66 @@ impl FilesParser {
     }
 }
 
-// PORT: the times of the depth replay (`set_parallel_depths`) are in
-// points: one point is the parse time of one byte of source text. The
-// values are ratios that fit the measured parallel Go answers of the
-// depthgo2 study; Go has no such constants.
-/// The fixed time of a file's load.
-const REPLAY_FILE: u64 = 10_000;
-/// The resolution time of a subtask whose file is in the program.
-const REPLAY_SUB_TASK: u64 = 500;
-/// The added time of an external (node_modules) subtask in the program.
-const REPLAY_EXTERNAL_SUB_TASK: u64 = 3_000;
+// PORT: the times of the depth replay (`set_parallel_depths`) are in ns.
+// They come from an instrumented build of the Go pin on a 32-core host
+// (depthgo2 round b), except `REPLAY_EXTERNAL_RESOLUTION`, which is fitted
+// to the measured parallel Go answers. Go has no such constants. On hosts
+// with 4 or fewer Ps (partly 8), Go's answers move toward the runnext
+// chain, and no fixed time can follow that.
+/// The fixed time of a file's load (metadata, read and parse setup).
+const REPLAY_FILE: u64 = 20_000;
+/// The parse time of one node. Comments make no nodes, and a string
+/// literal is one node.
+const REPLAY_NODE: u64 = 80;
+/// The scan time of one byte of text, comments and strings included.
+const REPLAY_BYTE: u64 = 2;
+/// A module or type reference resolution to a file outside node_modules.
+const REPLAY_RESOLUTION: u64 = 7_000;
+/// A resolution through node_modules (`is_external_library_import`): Go
+/// reads the package's package.json and exports, and resolves symlinks.
+const REPLAY_EXTERNAL_RESOLUTION: u64 = 150_000;
+/// A resolution that finds no file: Go looks up every node_modules
+/// directory up to the root.
+const REPLAY_UNRESOLVED: u64 = 17_000;
 /// The wait of a subtask that is not the last one its parent queues, until
 /// another P takes it.
-const REPLAY_DISPATCH: u64 = 10_000;
+const REPLAY_DISPATCH: u64 = 40_000;
 /// The time between two root tasks: Go queues the roots one at a time, and
 /// the Ps take them about in queue order.
-const REPLAY_ROOT_STEP: u64 = 100;
+const REPLAY_ROOT_STEP: u64 = 1_000;
 
 /// A task whose subtasks started in a parallel load, for the depth replay.
 pub(crate) struct DepthEdges {
-    /// The length of the task's text.
-    text_len: u64,
+    /// The time of the task's load (`replay_load_time`).
+    load_time: u64,
     /// One per subtask, in order.
     edges: Vec<DepthEdge>,
+}
+
+/// The time of the load of `task` in the depth replay: its parse, and each
+/// module and type reference resolution of its file. A name that the file
+/// resolves more than once in one mode counts once.
+fn replay_load_time(task: &ParseTask) -> u64 {
+    let (text, nodes) = task.file.as_ref().map_or((0, 0), |file| {
+        (file.text.len() as u64, file.node_count as u64)
+    });
+    let modules = task
+        .resolutions_in_file
+        .values()
+        .map(|r| (r.is_resolved(), r.is_external_library_import));
+    let types = task
+        .type_resolutions_in_file
+        .values()
+        .map(|r| (r.is_resolved(), r.is_external_library_import));
+    let resolutions: u64 = modules
+        .chain(types)
+        .map(|resolution| match resolution {
+            (false, _) => REPLAY_UNRESOLVED,
+            (true, false) => REPLAY_RESOLUTION,
+            (true, true) => REPLAY_EXTERNAL_RESOLUTION,
+        })
+        .sum();
+    REPLAY_FILE + REPLAY_NODE * nodes + REPLAY_BYTE * text + resolutions
 }
 
 /// A subtask in the depth replay.
@@ -1518,12 +1555,12 @@ impl DepthReplay {
             for casing in started.drain(..) {
                 let task = replay.task(arrival.data, casing);
                 let task = task.borrow();
-                let (text_len, edges) = match &task.depth_edges {
-                    Some(edges) => (edges.text_len, edges.edges.as_slice()),
+                let (load_time, edges) = match &task.depth_edges {
+                    Some(edges) => (edges.load_time, edges.edges.as_slice()),
                     None if task.sub_tasks.is_empty() => (0, &[][..]),
                     None => return None,
                 };
-                let end = time + replay.load_time(text_len, edges);
+                let end = time + load_time;
                 let last = edges.iter().rposition(|edge| replay.in_program(edge.data));
                 for (i, &edge) in edges.iter().enumerate() {
                     let sub = replay.arrival(edge, &task.sub_tasks[i], depth)?;
@@ -1564,21 +1601,6 @@ impl DepthReplay {
 
     fn task(&self, data: u32, casing: usize) -> ParseTaskRef {
         self.datas[data as usize].borrow().tasks[casing].clone()
-    }
-
-    /// The time of the load of a task: its text, and its subtasks whose
-    /// files are in the program.
-    fn load_time(&self, text_len: u64, edges: &[DepthEdge]) -> u64 {
-        let mut time = REPLAY_FILE + text_len;
-        for edge in edges {
-            if self.in_program(edge.data) {
-                time += REPLAY_SUB_TASK;
-                if edge.increase_depth {
-                    time += REPLAY_EXTERNAL_SUB_TASK;
-                }
-            }
-        }
-        time
     }
 
     /// True when `arrival` changes nothing whenever it runs: its casing
@@ -4210,5 +4232,107 @@ mod depth_tests {
             "{:?}",
             loads.single_files
         );
+    }
+
+    /// app/main.ts and `chain`. main.ts imports `{ name }` from `./file`
+    /// for `first` = (name, file), then for `last`: the last subtask that
+    /// main.ts queues.
+    fn race_files(
+        first: (&str, &str),
+        last: (&str, &str),
+        chain: &[(String, String)],
+    ) -> Vec<(String, String)> {
+        let main = format!(
+            "import {{ {} }} from \"./{}\";\nimport {{ {} }} from \"./{}\";\nexport const m = r + p;\n",
+            first.0, first.1, last.0, last.1
+        );
+        let mut files = vec![("app/main.ts".to_string(), main)];
+        files.extend_from_slice(chain);
+        files
+    }
+
+    /// Padding lines, as the depthgo2 shapes add them.
+    fn pad_lines(n: usize) -> String {
+        (0..n)
+            .map(|i| format!("const _p{i} = {{ a: {i}, b: \"{i}\" }};\n"))
+            .collect()
+    }
+
+    /// A chain `{prefix}1` to `{prefix}{k}` whose last file has `last`, each
+    /// file with `pad` padding lines.
+    fn chain(prefix: &str, k: usize, last: &str, pad: usize) -> Vec<(String, String)> {
+        (1..=k)
+            .map(|i| {
+                let text = if i == k {
+                    last.to_string()
+                } else {
+                    format!("export * from \"./{prefix}{}\";\n", i + 1)
+                };
+                (format!("app/{prefix}{i}.ts"), text + &pad_lines(pad))
+            })
+            .collect()
+    }
+
+    const PKG_IMPORT: &str = "import { a as p_ } from \"@x/lib\";\nexport const p = p_;\n";
+    const REL_IMPORT: &str = "import { a as r_ } from \"../lib/index\";\nexport const r = r_;\n";
+
+    /// depthgo2 round b: u.ts (the package route) is queued first and waits
+    /// for another P; the chain r1 -> r2 -> r3 is queued last and runs on the
+    /// same P. A node_modules resolution costs Go as much as many tiny
+    /// files, so the chain reaches lib/index.ts first (200 of 200 runs).
+    #[test]
+    fn runnext_chain_beats_a_package_resolution() {
+        let mut files = race_files(("p", "u"), ("r", "r1"), &chain("r", 3, REL_IMPORT, 0));
+        files.push(("app/u.ts".to_string(), PKG_IMPORT.to_string()));
+        let (parallel, single) = external_files("pkgrel3", &files);
+        assert!(parallel.is_empty(), "{parallel:?}");
+        assert!(single.is_empty(), "{single:?}");
+    }
+
+    /// depthgo2 round b: u.ts has the relative import and 50 imports that
+    /// do not resolve; the package chain p1 -> p2 is queued last. Each
+    /// unresolved import costs Go a lookup in every node_modules directory,
+    /// so the package route reaches lib/index.ts first (200 of 200 runs).
+    #[test]
+    fn unresolved_imports_delay_their_route() {
+        let tsconfig = r#"{ "compilerOptions": { "module": "esnext", "moduleResolution": "bundler",
+            "target": "es2022", "outDir": "out", "rootDir": ".", "types": [], "skipLibCheck": true },
+            "files": ["app/main.ts", "app/ambient.d.ts"] }"#;
+        let imports: String = (0..50)
+            .map(|i| format!("import v{i} from \"virt-{i}\";\n"))
+            .collect();
+        let names: Vec<String> = (0..50).map(|i| format!("v{i}")).collect();
+        let u = format!(
+            "{imports}export const vs = [{}];\n{REL_IMPORT}",
+            names.join(",")
+        );
+        let mut files = race_files(("r", "u"), ("p", "p1"), &chain("p", 2, PKG_IMPORT, 0));
+        files.push(("app/u.ts".to_string(), u));
+        files.push((
+            "app/ambient.d.ts".to_string(),
+            "declare module \"virt-*\" { const v: number; export default v; }\n".to_string(),
+        ));
+        let loads = load("unres50", tsconfig, &files);
+        assert_eq!(loads.parallel, ["lib/child.ts", "lib/grand.ts"]);
+        assert_eq!(loads.single, ["lib/child.ts", "lib/grand.ts"]);
+    }
+
+    /// depthgo2 round b: big.ts has a 400 KB comment and the relative
+    /// import; the package chain p1 -> p4 is queued last, with 300 lines in
+    /// each file. Go scans a comment much faster than it parses code, so
+    /// the relative route reaches lib/index.ts first (40 of 40 runs).
+    #[test]
+    fn comment_bytes_cost_less_than_code() {
+        let comment = format!("// {}\n", "x".repeat(76)).repeat(400 * 1024 / 80);
+        let pad = pad_lines(300);
+        let mut files = race_files(("r", "big"), ("p", "p1"), &chain("p", 4, PKG_IMPORT, 300));
+        files[0].1.push_str(&pad);
+        files.push((
+            "app/big.ts".to_string(),
+            format!("{comment}{REL_IMPORT}{pad}"),
+        ));
+        let (parallel, single) = external_files("cmt400", &files);
+        assert!(parallel.is_empty(), "{parallel:?}");
+        assert_eq!(single, ["lib/child.ts", "lib/grand.ts"]);
     }
 }
