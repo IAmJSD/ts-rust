@@ -415,7 +415,18 @@ fn all_roots_cached(
 
 impl FilesParser {
     // Go: filesparser.go:264 (*filesParser).parse
+    // PORT: a parallel load then sets the depths that parallel Go gives
+    // (`set_parallel_depths`).
     pub fn parse(&mut self, loader: &FileLoader, tasks: &[ParseTaskRef]) {
+        self.load_files(loader, tasks);
+        if !self.single_threaded {
+            self.set_parallel_depths(tasks);
+        }
+    }
+
+    /// Go `parse`: queues the root tasks and runs the queue, with parse
+    /// workers when the load can use them.
+    fn load_files(&mut self, loader: &FileLoader, tasks: &[ParseTaskRef]) {
         if PREFETCH.with(|p| p.borrow().is_some()) {
             self.run(loader, tasks);
             return;
@@ -768,20 +779,48 @@ impl FilesParser {
                 && !self.single_threaded
                 && task_by_file_name.borrow().started_sub_tasks
             {
-                // PORT: parallel tsgo runs each queued task in its own
-                // goroutine, so the shallowest path to a file usually arrives
-                // first and its subtasks start at that depth. This queue pops
-                // LIFO (Go singleThreadedWorkGroup order) and can reach a file
-                // first through a deeper path. Go then lowers `lowestDepth`
-                // but does not restart subtasks that already started, so the
-                // children keep a depth > 0 (node_modules files: no TS6059, no
-                // emit). Start them again at the new depth to give the result
-                // of parallel tsgo. This is also the Strada rule. Tested in
-                // pinned Go: all project configs match parallel tsgo.
-                // `--singleThreaded` keeps the exact Go order.
+                // PORT: Go does not start subtasks that already started. In
+                // a parallel load the port starts them again at the lower
+                // depth, so this pass loads every file that some parallel Go
+                // order loads (it matters for JS files under node_modules
+                // when `maxNodeModuleJsDepth` > 0). `set_parallel_depths`
+                // then sets the depths of one parallel Go order. The queue
+                // order is not changed, so traces and caches stay those of
+                // Go's single-threaded order. `--singleThreaded` keeps the
+                // exact Go order and depths.
                 let sub_tasks = task_by_file_name.borrow().sub_tasks.clone();
                 let lowest_depth = data.borrow().lowest_depth;
                 self.start(loader, &sub_tasks, lowest_depth);
+            }
+        }
+    }
+
+    /// Sets the depth of each loaded file to the depth that parallel Go
+    /// gives it, and unloads the files that parallel Go does not load.
+    // PORT: parallel Go runs each queued func of `start` in its own
+    // goroutine. The first goroutine that locks a file's task data starts
+    // the file's subtasks, once, at its own depth; a later arrival at a lower
+    // depth lowers only the file's own `lowestDepth` (filesparser.go:298-325).
+    // Which arrival is first is a race between goroutines. This replays the
+    // queued func body over the loaded task graph in the order of a model
+    // of that race: an arrival happens when the load of its parent ends.
+    // A load takes time for the file's size, its subtasks and its external
+    // (node_modules) subtasks. The last subtask that a file queues runs
+    // next on the same P (the Go scheduler's `runnext` slot); the others
+    // wait for another P to take them (`REPLAY_DISPATCH`). Ties go to the
+    // first queued. When the replay needs a task that the load did not
+    // load or queue, the depths of the load stay.
+    fn set_parallel_depths(&mut self, roots: &[ParseTaskRef]) {
+        let Some(replay) = DepthReplay::run(self, roots) else {
+            return;
+        };
+        for (data, state) in replay.datas.iter().zip(&replay.states) {
+            let mut data = data.borrow_mut();
+            data.lowest_depth = state.lowest;
+            for (index, task) in data.tasks.values().enumerate() {
+                if !state.casings.iter().any(|c| c.index == index && c.loaded) {
+                    task.borrow_mut().loaded = false;
+                }
             }
         }
     }
@@ -1305,6 +1344,237 @@ impl FilesParser {
                 reasons.insert(t.path.clone(), vec![reason]);
             }
         }
+    }
+}
+
+// PORT: the times of the depth replay (`set_parallel_depths`) are in
+// points: one point is the parse time of one byte of source text. The
+// values are ratios that fit the measured parallel Go answers of the
+// depthgo2 study; Go has no such constants.
+/// The fixed time of a file's load.
+const REPLAY_FILE: u64 = 10_000;
+/// The resolution time of a subtask whose file is in the program.
+const REPLAY_SUB_TASK: u64 = 500;
+/// The added time of an external (node_modules) subtask in the program.
+const REPLAY_EXTERNAL_SUB_TASK: u64 = 3_000;
+/// The wait of a subtask that is not the last one its parent queues, until
+/// another P takes it.
+const REPLAY_DISPATCH: u64 = 10_000;
+/// The time between two root tasks: Go queues the roots one at a time, and
+/// the Ps take them about in queue order.
+const REPLAY_ROOT_STEP: u64 = 100;
+
+/// One run of the queued func of Go `start` in the depth replay.
+#[derive(Clone, Copy)]
+struct ReplayArrival {
+    /// The index of the task data (`DepthReplay::datas`).
+    data: u32,
+    /// The index of the task's file name in `ParseTaskData::tasks`.
+    casing: u32,
+    depth: i32,
+    increase_depth: bool,
+    elide_on_depth: bool,
+}
+
+/// The replay state of one task data (Go `parseTaskData`).
+struct ReplayData {
+    lowest: i32,
+    started: bool,
+    /// The load loaded a task of the data: the file is in the program.
+    in_program: bool,
+    /// The tasks of `ParseTaskData::tasks` that arrived, in arrival order.
+    casings: Vec<ReplayCasing>,
+}
+
+/// A task of `ParseTaskData::tasks` in the depth replay.
+#[derive(Clone, Copy)]
+struct ReplayCasing {
+    index: usize,
+    loaded: bool,
+    started: bool,
+}
+
+/// The depth replay of a parallel load (`FilesParser::set_parallel_depths`).
+struct DepthReplay {
+    datas: Vec<Rc<RefCell<ParseTaskData>>>,
+    states: Vec<ReplayData>,
+    max_depth: i32,
+}
+
+impl DepthReplay {
+    /// Replays the load of `parser` from `roots`. `None`: the replay needs
+    /// a task that the load did not load or queue.
+    fn run(parser: &FilesParser, roots: &[ParseTaskRef]) -> Option<Self> {
+        let mut index: FxHashMap<&Path, u32> =
+            FxHashMap::with_capacity_and_hasher(parser.task_data_by_path.len(), Default::default());
+        let mut datas = Vec::with_capacity(parser.task_data_by_path.len());
+        for (path, data) in &parser.task_data_by_path {
+            index.insert(path, datas.len() as u32);
+            datas.push(data.clone());
+        }
+        let states = datas
+            .iter()
+            .map(|data| ReplayData {
+                lowest: i32::MAX,
+                started: false,
+                in_program: data
+                    .borrow()
+                    .tasks
+                    .values()
+                    .any(|task| task.borrow().loaded),
+                casings: Vec::new(),
+            })
+            .collect();
+        let mut replay = DepthReplay {
+            datas,
+            states,
+            max_depth: parser.max_depth,
+        };
+        // Arrivals by (time, queue order); the queue order indexes `arrivals`.
+        let mut queue = std::collections::BinaryHeap::new();
+        let mut arrivals = Vec::new();
+        for (i, root) in roots.iter().enumerate() {
+            queue.push(std::cmp::Reverse((
+                i as u64 * REPLAY_ROOT_STEP,
+                arrivals.len() as u32,
+            )));
+            arrivals.push(replay.arrival(&index, &root.borrow(), 0)?);
+        }
+        let mut started = Vec::new();
+        while let Some(std::cmp::Reverse((time, order))) = queue.pop() {
+            let arrival = arrivals[order as usize];
+            replay.arrive(arrival, &mut started)?;
+            let depth = replay.states[arrival.data as usize].lowest;
+            for casing in started.drain(..) {
+                let task = replay.task(arrival.data, casing);
+                let task = task.borrow();
+                let sub_tasks = replay.sub_arrivals(&index, &task, depth);
+                let end = time + replay.load_time(&task, &sub_tasks);
+                let last = sub_tasks
+                    .iter()
+                    .rposition(|sub| sub.is_some_and(|sub| replay.in_program(sub)));
+                for (i, sub) in sub_tasks.into_iter().enumerate() {
+                    let wait = if Some(i) == last { 0 } else { REPLAY_DISPATCH };
+                    queue.push(std::cmp::Reverse((end + wait, arrivals.len() as u32)));
+                    arrivals.push(sub?);
+                }
+            }
+        }
+        Some(replay)
+    }
+
+    /// The arrival of `task` (a task that the load queued) at `depth`.
+    fn arrival(
+        &self,
+        index: &FxHashMap<&Path, u32>,
+        task: &ParseTask,
+        depth: i32,
+    ) -> Option<ReplayArrival> {
+        let data = *index.get(&task.path)?;
+        let tasks = &self.datas[data as usize].borrow().tasks;
+        let casing = if tasks.len() == 1 {
+            0
+        } else {
+            tasks.get_index_of(&task.normalized_file_path)?
+        };
+        Some(ReplayArrival {
+            data,
+            casing: casing as u32,
+            depth,
+            increase_depth: task.increase_depth,
+            elide_on_depth: task.elide_on_depth,
+        })
+    }
+
+    /// The arrivals of the subtasks of `task` at `depth`; `None` for a
+    /// subtask that the load did not queue.
+    fn sub_arrivals(
+        &self,
+        index: &FxHashMap<&Path, u32>,
+        task: &ParseTask,
+        depth: i32,
+    ) -> Vec<Option<ReplayArrival>> {
+        task.sub_tasks
+            .iter()
+            .map(|sub| self.arrival(index, &sub.borrow(), depth))
+            .collect()
+    }
+
+    fn in_program(&self, arrival: ReplayArrival) -> bool {
+        self.states[arrival.data as usize].in_program
+    }
+
+    fn task(&self, data: u32, casing: usize) -> ParseTaskRef {
+        self.datas[data as usize].borrow().tasks[casing].clone()
+    }
+
+    /// The time of the load of `task`: its text, and its subtasks whose
+    /// files are in the program.
+    fn load_time(&self, task: &ParseTask, sub_tasks: &[Option<ReplayArrival>]) -> u64 {
+        let mut time = REPLAY_FILE + task.file.as_ref().map_or(0, |file| file.text.len() as u64);
+        for sub in sub_tasks.iter().flatten() {
+            if self.in_program(*sub) {
+                time += REPLAY_SUB_TASK;
+                if sub.increase_depth {
+                    time += REPLAY_EXTERNAL_SUB_TASK;
+                }
+            }
+        }
+        time
+    }
+
+    /// Runs the queued func body of Go `start` (filesparser.go:283-325) for
+    /// `arrival`. Pushes the casings whose subtasks start to `started`.
+    /// `None`: the load did not load a task that this run loads.
+    fn arrive(&mut self, arrival: ReplayArrival, started: &mut Vec<usize>) -> Option<()> {
+        let max_depth = self.max_depth;
+        let data = self.datas[arrival.data as usize].borrow();
+        let state = &mut self.states[arrival.data as usize];
+        let casing = arrival.casing as usize;
+        let mut start_subtasks = false;
+        if !state.casings.iter().any(|c| c.index == casing) {
+            state.casings.push(ReplayCasing {
+                index: casing,
+                loaded: false,
+                started: false,
+            });
+            // This is new task for file name - so load subtasks if there was loading for any other casing
+            start_subtasks = state.started;
+        }
+        let current_depth = if arrival.increase_depth {
+            arrival.depth + 1
+        } else {
+            arrival.depth
+        };
+        if current_depth < state.lowest {
+            state.lowest = current_depth;
+            start_subtasks = true;
+            state.started = true;
+        }
+        if arrival.elide_on_depth && current_depth > max_depth {
+            return Some(());
+        }
+        for i in 0..state.casings.len() {
+            let casing = state.casings[i];
+            let mut load_sub_tasks = start_subtasks;
+            if !casing.loaded {
+                let task = data.tasks[casing.index].borrow();
+                if !task.loaded {
+                    return None;
+                }
+                state.casings[i].loaded = true;
+                if task.redirected_parse_task.is_some() {
+                    // Always load redirected task
+                    load_sub_tasks = true;
+                    state.started = true;
+                }
+            }
+            if !casing.started && load_sub_tasks {
+                state.casings[i].started = true;
+                started.push(casing.index);
+            }
+        }
+        Some(())
     }
 }
 
@@ -3551,5 +3821,317 @@ pub fn take_prefetched(
     } else {
         unusable();
         Prefetched::Text(worker_text)
+    }
+}
+
+#[cfg(all(test, unix))]
+mod depth_tests {
+    use super::super::file_loader::process_all_program_files;
+    use super::*;
+    use crate::frontend::bundled;
+    use crate::frontend::tsoptions::{ParseConfigHost, get_parsed_command_line_of_config_file};
+    use crate::frontend::vfs::osvfs_fs;
+
+    struct System {
+        fs: Rc<dyn Fs>,
+        current_directory: String,
+    }
+
+    impl ParseConfigHost for System {
+        fn fs(&self) -> Rc<dyn Fs> {
+            self.fs.clone()
+        }
+        fn get_current_directory(&self) -> String {
+            self.current_directory.clone()
+        }
+    }
+
+    const TSCONFIG: &str = r#"{ "compilerOptions": { "module": "esnext", "moduleResolution": "bundler",
+        "target": "es2022", "outDir": "out", "rootDir": ".", "types": [], "skipLibCheck": true },
+        "files": ["app/main.ts"] }"#;
+
+    /// The workspace package `@x/lib` (lib/index.ts -> child.ts -> grand.ts),
+    /// linked as app/node_modules/@x/lib.
+    const LIB: [(&str, &str); 4] = [
+        (
+            "lib/package.json",
+            r#"{ "name": "@x/lib", "version": "1.0.0", "exports": { ".": "./index.ts" } }"#,
+        ),
+        (
+            "lib/index.ts",
+            "export { c } from \"./child\";\nexport const a = 1;\n",
+        ),
+        (
+            "lib/child.ts",
+            "export { g } from \"./grand\";\nexport const c = 2;\n",
+        ),
+        ("lib/grand.ts", "export const g = 3;\n"),
+    ];
+
+    /// What a parallel load and a single-threaded load find.
+    struct Loads {
+        /// The files outside node_modules that the parallel load found
+        /// searching node_modules (depth > 0: not emitted).
+        parallel: Vec<String>,
+        /// The same for the single-threaded load.
+        single: Vec<String>,
+        /// The program files of the parallel load.
+        parallel_files: Vec<String>,
+        /// The program files of the single-threaded load.
+        single_files: Vec<String>,
+    }
+
+    /// Loads app/main.ts with `tsconfig`, `files` and `LIB` (linked as
+    /// app/node_modules/@x/lib) in a temp dir.
+    fn load(label: &str, tsconfig: &str, files: &[(String, String)]) -> Loads {
+        let dir = std::env::temp_dir().join(format!(
+            "ts_goport_files_parser_{label}_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        for (path, text) in owned(&LIB).iter().chain(files) {
+            let path = dir.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        }
+        std::fs::write(dir.join("tsconfig.json"), tsconfig).unwrap();
+        std::fs::create_dir_all(dir.join("app/node_modules/@x")).unwrap();
+        std::os::unix::fs::symlink("../../../lib", dir.join("app/node_modules/@x/lib")).unwrap();
+        let cwd = dir.to_string_lossy().replace('\\', "/");
+        let prefix = format!("{cwd}/");
+        let fs = bundled::wrap_fs(osvfs_fs());
+        let sys = System {
+            fs: fs.clone(),
+            current_directory: cwd.clone(),
+        };
+        let load = |single_threaded: bool| {
+            let (config, errors) = get_parsed_command_line_of_config_file(
+                &format!("{cwd}/tsconfig.json"),
+                None,
+                None,
+                &sys,
+                None,
+            );
+            assert!(errors.is_empty());
+            let host = new_cached_fs_compiler_host(
+                &cwd,
+                fs.clone(),
+                &bundled::lib_path(),
+                None,
+                None,
+                None,
+            );
+            let processed = process_all_program_files(
+                ProgramOptions {
+                    host,
+                    config: Rc::new(config.unwrap()),
+                    use_source_of_project_reference: false,
+                    single_threaded: if single_threaded {
+                        Tristate::True
+                    } else {
+                        Tristate::False
+                    },
+                    typings_location: String::new(),
+                    project_name: String::new(),
+                    create_module_resolver: None,
+                    skip_module_resolution: false,
+                },
+                single_threaded,
+            );
+            let mut external: Vec<String> = processed
+                .source_files_found_searching_node_modules
+                .iter()
+                .filter_map(|path| path.as_str().strip_prefix(&prefix))
+                .filter(|name| !name.contains("node_modules"))
+                .map(str::to_string)
+                .collect();
+            external.sort();
+            let files = processed
+                .files
+                .iter()
+                .filter_map(|file| file.file_name().strip_prefix(&prefix))
+                .map(str::to_string)
+                .collect();
+            (external, files)
+        };
+        let (parallel, parallel_files) = load(false);
+        let (single, single_files) = load(true);
+        let _ = std::fs::remove_dir_all(&dir);
+        Loads {
+            parallel,
+            single,
+            parallel_files,
+            single_files,
+        }
+    }
+
+    /// The external files of a parallel and a single-threaded load
+    /// (`load` with `TSCONFIG`).
+    fn external_files(label: &str, files: &[(String, String)]) -> (Vec<String>, Vec<String>) {
+        let loads = load(label, TSCONFIG, files);
+        (loads.parallel, loads.single)
+    }
+
+    /// `files` (path, text) as owned pairs.
+    fn owned(files: &[(&str, &str)]) -> Vec<(String, String)> {
+        files
+            .iter()
+            .map(|(path, text)| (path.to_string(), text.to_string()))
+            .collect()
+    }
+
+    /// depthgo2: a chain of 20 relative imports reaches lib/index.ts at depth
+    /// 0, and the package import of main.ts reaches it in one parse at depth
+    /// 1. Parallel Go starts its subtasks at depth 1 (105 of 105 runs);
+    /// --singleThreaded runs the chain first.
+    #[test]
+    fn deep_relative_chain_loses_the_race() {
+        let mut files = owned(&[(
+            "app/main.ts",
+            "import { a } from \"@x/lib\";\nimport { c } from \"./b1\";\nexport const m = a + c;\n",
+        )]);
+        for i in 1..20 {
+            files.push((
+                format!("app/b{i}.ts"),
+                format!("export * from \"./b{}\";\n", i + 1),
+            ));
+        }
+        files.push((
+            "app/b20.ts".to_string(),
+            "export { c } from \"../lib/index\";\n".to_string(),
+        ));
+        let (parallel, single) = external_files("chain20", &files);
+        assert_eq!(parallel, ["lib/child.ts", "lib/grand.ts"]);
+        assert!(single.is_empty(), "{single:?}");
+    }
+
+    /// depthgo2: main.ts imports a.ts (the package) and a large b.ts (the
+    /// relative route, queued last). Parallel Go reaches lib/index.ts through
+    /// the package first, while b.ts still parses (105 of 105 runs).
+    #[test]
+    fn large_file_delays_its_route() {
+        let big: String = (0..2500)
+            .map(|i| format!("const _p{i} = {{ a: {i}, b: \"{i}\" }};\n"))
+            .collect();
+        let mut files = owned(&[
+            (
+                "app/main.ts",
+                "import \"./a\";\nimport \"./b\";\nexport const m = 1;\n",
+            ),
+            ("app/a.ts", "export { a as v_a } from \"@x/lib\";\n"),
+        ]);
+        files.push((
+            "app/b.ts".to_string(),
+            format!("export {{ a as v_b }} from \"../lib/index\";\n{big}"),
+        ));
+        let (parallel, single) = external_files("bigb", &files);
+        assert_eq!(parallel, ["lib/child.ts", "lib/grand.ts"]);
+        assert!(single.is_empty(), "{single:?}");
+    }
+
+    /// depthgo2: the package route a|b -> s -> @x/lib takes 3 parses, the
+    /// relative route r1 -> r2 -> r3 -> ../lib/index 4. The relative route is
+    /// queued last, so it runs at once on the same P, while the others wait
+    /// for another P: parallel Go reaches lib/index.ts at depth 0 first in
+    /// 105 of 105 runs.
+    #[test]
+    fn last_queued_route_runs_first() {
+        let files = owned(&[
+            (
+                "app/main.ts",
+                "import { s } from \"./a\";\nimport { t } from \"./b\";\nimport { c } from \"./r1\";\nexport const m = s + t + c;\n",
+            ),
+            ("app/a.ts", "export { s } from \"./s\";\n"),
+            ("app/b.ts", "export { s as t } from \"./s\";\n"),
+            ("app/s.ts", "export { a as s } from \"@x/lib\";\n"),
+            ("app/r1.ts", "export * from \"./r2\";\n"),
+            ("app/r2.ts", "export * from \"./r3\";\n"),
+            ("app/r3.ts", "export { c } from \"../lib/index\";\n"),
+        ]);
+        let (parallel, single) = external_files("diamond", &files);
+        assert!(parallel.is_empty(), "{parallel:?}");
+        assert!(single.is_empty(), "{single:?}");
+    }
+
+    /// depthgo2: the prisma client.build shape. lib/index.ts is one parse away
+    /// through a relative import and two through the package. Parallel Go
+    /// takes the relative route first; --singleThreaded runs ./c1 first.
+    #[test]
+    fn short_relative_route_wins() {
+        let files = owned(&[
+            (
+                "app/main.ts",
+                "import { a } from \"../lib/index\";\nimport { c } from \"./c1\";\nexport const m = a + c;\n",
+            ),
+            (
+                "app/c1.ts",
+                "import { a } from \"@x/lib\";\nexport const c = a;\n",
+            ),
+        ]);
+        let (parallel, single) = external_files("shallow", &files);
+        assert!(parallel.is_empty(), "{parallel:?}");
+        assert_eq!(single, ["lib/child.ts", "lib/grand.ts"]);
+    }
+
+    /// depthgo2: with `maxNodeModuleJsDepth` 2, wrap/index.js -> pkg is
+    /// depth 2 in 2 parses and r1 -> r2 -> pkg depth 1 in 3 parses, so
+    /// pkg/child.js (depth 3 or 2) is in the program only when the relative
+    /// route reaches pkg first. With 300 lines in each file parallel Go
+    /// leaves child.js out (35 of 35 runs); --singleThreaded and the first
+    /// load pass take it in, and the replay unloads it.
+    #[test]
+    fn replay_unloads_files_parallel_go_does_not_load() {
+        let tsconfig = r#"{ "compilerOptions": { "module": "esnext", "moduleResolution": "bundler",
+            "target": "es2022", "outDir": "out", "rootDir": ".", "types": [], "skipLibCheck": true,
+            "allowJs": true, "maxNodeModuleJsDepth": 2 }, "files": ["app/main.ts"] }"#;
+        let pad: String = (0..300)
+            .map(|i| format!("const _p{i} = {{ a: {i}, b: \"{i}\" }};\n"))
+            .collect();
+        let mut files = owned(&[
+            (
+                "app/node_modules/pkg/package.json",
+                r#"{ "name": "pkg", "version": "1.0.0", "main": "index.js" }"#,
+            ),
+            (
+                "app/node_modules/wrap/package.json",
+                r#"{ "name": "wrap", "version": "1.0.0", "main": "index.js" }"#,
+            ),
+        ]);
+        for (path, text) in [
+            (
+                "app/node_modules/pkg/index.js",
+                "export { c } from \"./child.js\";\nexport const p = 1;\n",
+            ),
+            ("app/node_modules/pkg/child.js", "export const c = 2;\n"),
+            (
+                "app/node_modules/wrap/index.js",
+                "export { p, c } from \"pkg\";\n",
+            ),
+            (
+                "app/main.ts",
+                "import { p as w } from \"wrap\";\nimport { p } from \"./r1\";\nexport const m = p + w;\n",
+            ),
+            ("app/r1.ts", "export * from \"./r2\";\n"),
+            ("app/r2.ts", "export { p } from \"pkg\";\n"),
+        ] {
+            files.push((path.to_string(), format!("{text}{pad}")));
+        }
+        let loads = load("nmjs", tsconfig, &files);
+        let child = "app/node_modules/pkg/child.js".to_string();
+        assert!(
+            loads
+                .parallel_files
+                .contains(&"app/node_modules/pkg/index.js".to_string())
+        );
+        assert!(
+            !loads.parallel_files.contains(&child),
+            "{:?}",
+            loads.parallel_files
+        );
+        assert!(
+            loads.single_files.contains(&child),
+            "{:?}",
+            loads.single_files
+        );
     }
 }
