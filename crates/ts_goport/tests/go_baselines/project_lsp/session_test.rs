@@ -1897,3 +1897,49 @@ child_test! {
         }
     }
 }
+
+child_test! {
+    // PORT: no Go counterpart (editfuzz5 DEFP). The programs of app (through
+    // the import) and node (by its include) both contain shared/meta.ts
+    // directly. After an edit of meta.ts, a request for main.ts makes the
+    // new snapshot, and the auto-import warm for meta.ts waits as idle work.
+    // Go's warm runs at once: its DidRequestFile caches node as the default
+    // project of meta.ts. The next request for meta.ts must use node, not
+    // the fallback of GetDefaultProject (app, the first configured project).
+    fn request_runs_pending_auto_import_warm_that_sets_the_default_project() {
+        const MAIN_URI: &str = "file:///home/projects/app/src/main.ts";
+        const META_URI: &str = "file:///home/projects/app/shared/meta.ts";
+        const MAIN: &str = "import { appName } from \"../shared/meta\";\nexport const n = appName;";
+        const META: &str = "export const appName = \"app\";";
+        const NODE: &str = "/home/projects/app/tsconfig.node.json";
+        let (session, _) = projecttestutil::setup(files(&[
+            (
+                "/home/projects/app/tsconfig.json",
+                r#"{ "files": [], "references": [{ "path": "./tsconfig.app.json" }, { "path": "./tsconfig.node.json" }] }"#,
+            ),
+            (
+                "/home/projects/app/tsconfig.app.json",
+                r#"{ "compilerOptions": { "composite": true, "noLib": true }, "include": ["src"] }"#,
+            ),
+            (
+                NODE,
+                r#"{ "compilerOptions": { "composite": true, "noLib": true }, "include": ["shared"] }"#,
+            ),
+            ("/home/projects/app/src/main.ts", MAIN),
+            ("/home/projects/app/shared/meta.ts", META),
+        ]));
+        open(&session, MAIN_URI, MAIN);
+        open(&session, META_URI, META);
+        session.wait_for_background_tasks();
+        assert_eq!(default_project_config_file_name(&session, META_URI), NODE);
+
+        edit(&session, META_URI, 2, (0, 0), (0, 0), "function version() {}\n");
+        let _ = language_service(&session, MAIN_URI);
+        // The background task that queues the warm runs; the idle warm does not.
+        session.background_queue.wait();
+        let ls = language_service(&session, META_URI);
+        assert_eq!(ls.project_id.0, NODE);
+        assert_eq!(default_project_config_file_name(&session, META_URI), NODE);
+        session.close();
+    }
+}

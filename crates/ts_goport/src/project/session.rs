@@ -14,7 +14,8 @@
 //! `background::TaskHold` until its timer has run. `WaitForBackgroundTasks`
 //! drains `gostd::local` through `Queue::wait`. The one exception is the
 //! clone of the auto-import warm, which is `gostd::local` idle work: the
-//! LSP server runs it only after a quiet period with no message, and the
+//! LSP server runs it only after a quiet period with no message (or a
+//! request runs it first, `run_pending_warm_for_request`), and the
 //! reader thread can cancel it (`WarmAutoImportPreempt`).
 //!
 //! Go runtime metrics (`runtime/metrics`) exist only in the Go runtime.
@@ -1657,6 +1658,7 @@ impl Session {
                 .expect("updateSnapshot without an API request returns the snapshot");
         }
         // If there are no pending file changes, we can try to use the current snapshot.
+        self.run_pending_warm_for_request(&request);
         let snapshot = self.snapshot.borrow().clone();
         let mut update_reason = UpdateReason::UNKNOWN;
         if !request.projects.is_empty() {
@@ -3447,7 +3449,9 @@ impl Session {
     // ms) runs as idle work (`gostd::local::go_idle`, `run_pending_warm`),
     // after the checks and the cancel setup that Go does first. The LSP
     // dispatch loop starts it only after a quiet period with no message, so
-    // a request does not wait for it. Go runs the whole warm on a goroutine.
+    // a request does not wait for it, except a request whose default
+    // project depends on it (`run_pending_warm_for_request`). Go runs the
+    // whole warm on a goroutine.
     // A file event or a newer warm cancels the context before or during the
     // clone (`WarmAutoImportPreempt`). A clone that has started runs to its
     // next cancel point, and its result is discarded, as Go's is. Its
@@ -3555,6 +3559,38 @@ impl Session {
                     crate::core::go_wait_group_task(|| s.run_pending_warm())
                 }));
             }
+        }
+    }
+
+    /// PORT: no Go counterpart. `get_snapshot` calls it before it reads the
+    /// session snapshot. Go's warm runs at once, so the next request
+    /// usually sees its snapshot. The warm's `DidRequestFile` caches the
+    /// default project of the changed file, which `GetDefaultProject` cannot
+    /// always find again: its search starts at the nearest config, which
+    /// may not be a loaded project (editfuzz5 DEFP). So a pending warm on
+    /// the session snapshot runs now when a requested file needs that search
+    /// (`ProjectCollection::default_project_needs_search`). In all other
+    /// cases it stays idle work.
+    fn run_pending_warm_for_request(self: &Rc<Self>, request: &ResourceRequest) {
+        let needs_warm = {
+            let snapshot = self.snapshot.borrow().clone();
+            let ready = matches!(
+                &*self.warm_auto_import_pending.borrow(),
+                Some(warm) if warm.ctx.err().is_none() && Rc::ptr_eq(&warm.new_snapshot, &snapshot)
+            );
+            ready
+                && request
+                    .documents
+                    .iter()
+                    .chain(&request.configured_project_documents)
+                    .any(|document| {
+                        snapshot.project_collection.default_project_needs_search(
+                            &document.path(snapshot.use_case_sensitive_file_names()),
+                        )
+                    })
+        };
+        if needs_warm {
+            self.run_pending_warm();
         }
     }
 

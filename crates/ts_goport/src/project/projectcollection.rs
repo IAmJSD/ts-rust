@@ -310,6 +310,24 @@ impl ProjectCollection {
         first_configured_project
     }
 
+    /// PORT: no Go counterpart. Whether `get_default_project(path)` has no
+    /// cached default and more than one configured project contains the
+    /// file directly, so that it ends in `find_default_configured_project`.
+    /// See `Session::run_pending_warm_for_request`.
+    pub fn default_project_needs_search(&self, path: &tspath::Path) -> bool {
+        if self.file_default_projects.contains_key(path) {
+            return false;
+        }
+        self.configured_projects
+            .values()
+            .filter(|p| {
+                let p = p.borrow();
+                p.contains_file(path) && !p.is_source_from_project_reference(path)
+            })
+            .nth(1)
+            .is_some()
+    }
+
     // Go: project/projectcollection.go:265 findDefaultConfiguredProject
     pub fn find_default_configured_project(
         &self,
