@@ -1525,13 +1525,17 @@ impl DepthEdges {
             REPLAY_NODE * file.node_count as u64 + REPLAY_BYTE * file.text.len() as u64
         });
         let directory = get_directory_path(&task.normalized_file_path);
+        let ancestors = replay_ancestors(&directory);
+        let directory_id = ancestors
+            .last()
+            .map_or(REPLAY_HASH_START, |&(_, hash)| hash);
         let mut resolutions = Vec::with_capacity(
             task.type_resolutions_in_file.len() + task.resolutions_in_file.len(),
         );
-        replay_resolutions(loader, task, &directory, &mut resolutions);
+        replay_resolutions(loader, task, &directory, directory_id, &mut resolutions);
         DepthEdges {
             parse,
-            walk: replay_walk(loader, task, &directory),
+            walk: replay_walk(loader, task, &directory, &ancestors),
             resolutions: resolutions.into_boxed_slice(),
             edges,
         }
@@ -1556,14 +1560,18 @@ fn package_json_id(directory_hash: u64, exists: bool) -> u64 {
 }
 
 /// The package.json lookups of Go `loadSourceFileMetaData` for the file of
-/// `task` in `directory`: the package scope walk from the directory up to
+/// `task` in `directory` (with its `replay_ancestors`): the package scope walk from the directory up to
 /// the directory of its package.json (`SourceFileMetaData::
 /// package_json_directory`), or to the root or the global cache.
-fn replay_walk(loader: &FileLoader, task: &ParseTask, directory: &str) -> Box<[u64]> {
+fn replay_walk(
+    loader: &FileLoader,
+    task: &ParseTask,
+    directory: &str,
+    ancestors: &[(usize, u64)],
+) -> Box<[u64]> {
     if task.file.is_none() || task.lib_file.is_some() || loader.opts.skip_module_resolution {
         return Box::default();
     }
-    let ancestors = replay_ancestors(directory);
     let mut walk: smallvec::SmallVec<[u64; 16]> = smallvec::SmallVec::new();
     let found = task.metadata.package_json_directory.len();
     let global_cache = &loader.opts.typings_location;
@@ -1604,7 +1612,8 @@ fn replay_ancestors(directory: &str) -> smallvec::SmallVec<[(usize, u64); 16]> {
 }
 
 /// Adds to `out` the module and type reference resolutions of the file of
-/// `task` in `directory`, one per name and mode: its type reference
+/// `task` in `directory` (whose id is `directory_id`), one per name and
+/// mode: its type reference
 /// directives, then its imports and module augmentations, as Go resolves
 /// them (`resolve_type_reference_directives`,
 /// `resolve_imports_and_module_augmentations`). In each group they come in
@@ -1615,12 +1624,13 @@ fn replay_resolutions(
     loader: &FileLoader,
     task: &ParseTask,
     directory: &str,
+    directory_id: u64,
     out: &mut Vec<ReplayResolution>,
 ) {
     if task.is_for_automatic_type_directive {
         let key = ReplayKey {
             type_reference: true,
-            directory: replay_hash(REPLAY_HASH_START, directory.as_bytes()),
+            directory: directory_id,
             mode: RESOLUTION_MODE_NONE,
             redirect: "",
             from_inferred_types_file: true,
@@ -1644,13 +1654,16 @@ fn replay_resolutions(
         &containing_file
     };
     let containing_directory = if containing_file == task.normalized_file_path {
-        std::borrow::Cow::Borrowed(directory)
+        directory_id
     } else {
-        std::borrow::Cow::Owned(get_directory_path(containing_file))
+        replay_hash(
+            REPLAY_HASH_START,
+            get_directory_path(containing_file).as_bytes(),
+        )
     };
     let key = ReplayKey {
         type_reference: true,
-        directory: replay_hash(REPLAY_HASH_START, containing_directory.as_bytes()),
+        directory: containing_directory,
         mode: RESOLUTION_MODE_NONE,
         redirect: redirect
             .as_deref()
@@ -1742,23 +1755,24 @@ struct ReplayKey<'a> {
 impl ReplayKey<'_> {
     /// The id of the key with `name`.
     fn id(&self, name: &str) -> u64 {
-        let hash = replay_hash(self.directory, &[0xff]);
-        let hash = replay_hash(hash, name.as_bytes());
-        let hash = replay_hash(hash, &[0xff]);
-        let hash = replay_hash(hash, &self.mode.0.to_le_bytes());
-        let hash = replay_hash(hash, self.redirect.as_bytes());
-        replay_hash(
-            hash,
-            &[u8::from(self.type_reference) | u8::from(self.from_inferred_types_file) << 1],
-        )
+        use std::hash::BuildHasher;
+        rustc_hash::FxBuildHasher.hash_one((
+            self.directory,
+            name,
+            self.mode,
+            self.redirect,
+            u8::from(self.type_reference) | u8::from(self.from_inferred_types_file) << 1,
+        ))
     }
 }
 
 impl DepthKey<'_> {
-    fn id(&self) -> u64 {
+    /// The id of the key (`ReplayKey::id`), with `directory` the id of its
+    /// containing directory.
+    fn id(&self, directory: u64) -> u64 {
         ReplayKey {
             type_reference: self.type_reference,
-            directory: replay_hash(REPLAY_HASH_START, self.containing_directory.as_bytes()),
+            directory,
             mode: self.mode,
             redirect: self.redirect,
             from_inferred_types_file: self.from_inferred_types_file,
@@ -1820,11 +1834,18 @@ struct DepthLookups {
 }
 
 /// The depth log of a thread: what it found, and the resolutions that run
-/// on it now, with the ids of their containing directory and its ancestors.
+/// on it now.
 struct DepthLogThread {
     log: Arc<DepthLog>,
     found: DepthLookupsFound,
-    open: Vec<(DepthLookups, smallvec::SmallVec<[u64; 16]>)>,
+    /// The resolutions that run now, with their containing directory: the
+    /// first `open` entries. The others keep their buffers for the next.
+    stack: Vec<(DepthLookups, String)>,
+    open: usize,
+    /// The last containing directory of `depth_note_resolution_end`, and
+    /// its id (`replay_hash`).
+    directory: String,
+    directory_id: u64,
 }
 
 thread_local! {
@@ -1837,7 +1858,10 @@ fn set_depth_log(log: Option<Arc<DepthLog>>) -> Option<Arc<DepthLog>> {
     let thread = log.map(|log| DepthLogThread {
         log,
         found: DepthLookupsFound::default(),
-        open: Vec::new(),
+        stack: Vec::new(),
+        open: 0,
+        directory: String::new(),
+        directory_id: 0,
     });
     let old = DEPTH_LOG.with(|cell| cell.replace(thread))?;
     lock(&old.log.found).add(old.found);
@@ -1854,11 +1878,16 @@ fn depth_log() -> Option<Arc<DepthLog>> {
 pub(crate) fn depth_note_resolution_start(containing_directory: &str) {
     DEPTH_LOG.with(|thread| {
         if let Some(thread) = thread.borrow_mut().as_mut() {
-            let ancestors = replay_ancestors(containing_directory)
-                .into_iter()
-                .map(|(_, hash)| hash & !1)
-                .collect();
-            thread.open.push((DepthLookups::default(), ancestors));
+            if thread.open == thread.stack.len() {
+                thread.stack.push(Default::default());
+            }
+            let (lookups, directory) = &mut thread.stack[thread.open];
+            lookups.missing = 0;
+            lookups.found = 0;
+            lookups.package_jsons.clear();
+            directory.clear();
+            directory.push_str(containing_directory);
+            thread.open += 1;
         }
     });
 }
@@ -1870,19 +1899,27 @@ pub(crate) fn depth_note_resolution_end(key: DepthKey<'_>) {
         let Some(thread) = thread.as_mut() else {
             return;
         };
-        if let Some((lookups, _)) = thread.open.pop() {
-            thread.found.resolutions.entry(key.id()).or_insert(lookups);
+        if thread.open == 0 {
+            return;
         }
+        thread.open -= 1;
+        let lookups = std::mem::take(&mut thread.stack[thread.open].0);
+        if thread.directory != key.containing_directory {
+            thread.directory.clear();
+            thread.directory.push_str(key.containing_directory);
+            thread.directory_id =
+                replay_hash(REPLAY_HASH_START, key.containing_directory.as_bytes());
+        }
+        let id = key.id(thread.directory_id);
+        thread.found.resolutions.entry(id).or_insert(lookups);
     });
 }
 
 /// A file probe of a resolution (Go `tryFileLookup`).
 pub(crate) fn depth_note_file_probe(found: bool) {
     DEPTH_LOG.with(|thread| {
-        if let Some((lookups, _)) = thread
-            .borrow_mut()
-            .as_mut()
-            .and_then(|thread| thread.open.last_mut())
+        if let Some(thread) = thread.borrow_mut().as_mut()
+            && let Some((lookups, _)) = thread.open.checked_sub(1).map(|i| &mut thread.stack[i])
         {
             if found {
                 lookups.found += 1;
@@ -1893,6 +1930,14 @@ pub(crate) fn depth_note_file_probe(found: bool) {
     });
 }
 
+/// True when `ancestor` is `directory` or one of its ancestors.
+fn is_ancestor_directory(ancestor: &str, directory: &str) -> bool {
+    directory.starts_with(ancestor)
+        && (directory.len() == ancestor.len()
+            || ancestor.ends_with('/')
+            || directory.as_bytes()[ancestor.len()] == b'/')
+}
+
 /// A lookup of Go `getPackageJsonInfo` of the package.json in `directory`,
 /// which exists. `size`: the text length, when this lookup read the file.
 pub(crate) fn depth_note_package_json(directory: &str, exists: bool, size: Option<usize>) {
@@ -1901,18 +1946,25 @@ pub(crate) fn depth_note_package_json(directory: &str, exists: bool, size: Optio
         let Some(thread) = thread.as_mut() else {
             return;
         };
+        let open = thread.open.checked_sub(1).map(|i| &mut thread.stack[i]);
+        // A lookup of the package scope walk from the containing directory
+        // (an ancestor's package.json) is not logged.
+        let scope = open
+            .as_ref()
+            .is_some_and(|(_, containing)| is_ancestor_directory(directory, containing));
+        if scope && size.is_none() {
+            return;
+        }
         let id = package_json_id(replay_hash(REPLAY_HASH_START, directory.as_bytes()), exists);
+        if !scope && let Some((lookups, _)) = open {
+            lookups.package_jsons.push(id);
+        }
         if let Some(size) = size {
             thread
                 .found
                 .package_json_sizes
                 .entry(id & !1)
                 .or_insert(u32::try_from(size).unwrap_or(u32::MAX));
-        }
-        if let Some((lookups, ancestors)) = thread.open.last_mut()
-            && !ancestors.contains(&(id & !1))
-        {
-            lookups.package_jsons.push(id);
         }
     });
 }
