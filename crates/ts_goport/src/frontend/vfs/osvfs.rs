@@ -655,6 +655,18 @@ fn os_read_dir(dirname: &str) -> io::Result<Vec<DirEntry>> {
 /// copies each name twice.
 #[cfg(target_os = "linux")]
 fn read_dir_entries(dirname: &str, dir: &Rc<str>) -> io::Result<Vec<DirEntry>> {
+    read_dir_entries_typed(dirname, dir, |_, file_type| file_type)
+}
+
+/// `read_dir_entries`, with the type of each entry from
+/// `d_type(name, file type of its d_type)`. A test gives
+/// `FileType::Unknown`, as a file system with no `d_type` does.
+#[cfg(target_os = "linux")]
+fn read_dir_entries_typed(
+    dirname: &str,
+    dir: &Rc<str>,
+    mut d_type: impl FnMut(&std::ffi::CStr, rustix::fs::FileType) -> rustix::fs::FileType,
+) -> io::Result<Vec<DirEntry>> {
     use rustix::fs::{AtFlags, FileType, Mode, OFlags, RawDir, openat, statat};
     let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
     let fd = openat(rustix::fs::CWD, &*os_path(dirname), flags, Mode::empty())?;
@@ -669,8 +681,9 @@ fn read_dir_entries(dirname: &str, dir: &Rc<str>) -> io::Result<Vec<DirEntry>> {
         if name == b"." || name == b".." {
             continue;
         }
-        let file_type = match entry.file_type() {
+        let file_type = match d_type(entry.file_name(), entry.file_type()) {
             // Go and std `lstat` an entry of an unknown type.
+            // Go: os/file_unix.go:469 newUnixDirent, os/dir_unix.go:141
             FileType::Unknown => match statat(&fd, entry.file_name(), AtFlags::SYMLINK_NOFOLLOW) {
                 Ok(stat) => FileType::from_raw_mode(stat.st_mode),
                 Err(rustix::io::Errno::NOENT) => continue,
@@ -1334,5 +1347,89 @@ mod tests {
         assert!(want[12].is_some_and(|m_time| m_time.is_some()));
         assert_eq!(want[12], want[0]);
         assert_eq!(want[13], Some(None));
+    }
+
+    // PORT: not in Go. Go `os.ReadDir` lstats an entry whose `d_type` is
+    // unknown (os/file_unix.go:469 newUnixDirent), skips it when the lstat
+    // finds no file and fails on any other lstat error (os/dir_unix.go:141).
+    // Some file systems give no `d_type`, so the test makes every type
+    // unknown (`read_dir_entries_typed`): the entries and their types equal
+    // those of the `d_type` read (a directory, a file, a link to the
+    // directory, a FIFO), an entry removed before its lstat is skipped, and
+    // a directory with no search permission is an error. The last part
+    // skips when the lstat still works there (root, CAP_DAC_OVERRIDE).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn read_dir_lstats_entries_of_unknown_type() {
+        use rustix::fs::FileType;
+        let dir = std::env::temp_dir().join(format!("ts_goport_dirent_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("a.ts"), "a").unwrap();
+        std::fs::write(dir.join("gone.ts"), "g").unwrap();
+        std::os::unix::fs::symlink("sub", dir.join("link")).unwrap();
+        rustix::fs::mknodat(
+            rustix::fs::CWD,
+            dir.join("fifo"),
+            FileType::Fifo,
+            rustix::fs::Mode::from_raw_mode(0o644),
+            0,
+        )
+        .unwrap();
+        let root = dir.to_str().unwrap();
+        let names = |entries: io::Result<Vec<DirEntry>>| -> Vec<(String, FileMode)> {
+            let mut names: Vec<_> = entries
+                .unwrap()
+                .into_iter()
+                .map(|entry| (entry.name, entry.typ))
+                .collect();
+            names.sort_by(|a, b| a.0.cmp(&b.0));
+            names
+        };
+        let from_d_type = names(read_dir_entries(root, &Rc::from(root)));
+        let mut seen = Vec::new();
+        let from_lstat = names(read_dir_entries_typed(root, &Rc::from(root), |name, _| {
+            seen.push(name.to_bytes().to_vec());
+            if name.to_bytes() == b"gone.ts" {
+                std::fs::remove_file(dir.join("gone.ts")).unwrap();
+            }
+            FileType::Unknown
+        }));
+
+        let locked = dir.join("sub");
+        std::fs::write(locked.join("x.ts"), "x").unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o444)).unwrap();
+        let locked_name = locked.to_str().unwrap();
+        let locked_d_type = read_dir_entries(locked_name, &Rc::from(locked_name)).map(|e| e.len());
+        let locked_lstat = read_dir_entries_typed(locked_name, &Rc::from(locked_name), |_, _| {
+            FileType::Unknown
+        })
+        .map(|e| e.len());
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let want = [
+            ("a.ts", FileMode(0)),
+            ("fifo", FileMode::NAMED_PIPE),
+            ("gone.ts", FileMode(0)),
+            ("link", FileMode::SYMLINK),
+            ("sub", FileMode::DIR),
+        ]
+        .map(|(name, typ)| (name.to_string(), typ));
+        assert_eq!(from_d_type, want);
+        assert_eq!(seen.len(), 5, "each entry once");
+        let mut want_lstat = want.to_vec();
+        want_lstat.retain(|(name, _)| name != "gone.ts");
+        assert_eq!(from_lstat, want_lstat);
+        assert_eq!(locked_d_type.ok(), Some(1));
+        match locked_lstat {
+            // An lstat that works there (root) lists x.ts; an lstat error
+            // that the read skipped would list nothing.
+            Ok(n) => {
+                assert_eq!(n, 1, "an lstat that works there lists x.ts");
+                eprintln!("skipped: the lstat works in a directory with no search permission")
+            }
+            Err(err) => assert_eq!(err.kind(), io::ErrorKind::PermissionDenied),
+        }
     }
 }

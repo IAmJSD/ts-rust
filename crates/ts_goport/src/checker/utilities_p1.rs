@@ -2057,12 +2057,16 @@ pub(crate) mod union_sort_tests {
 
     /// The types of the type aliases in `source` (one file `a.ts`), then
     /// the members of those that are unions or intersections, on the
-    /// checker of that file.
+    /// checker of that file. Each call writes its files in a temp dir of
+    /// its own, so no call reads or removes the files of another.
     pub(crate) fn with_alias_types<R: Send + 'static>(
         source: &str,
         f: impl FnOnce(&mut Checker, &[TypeId]) -> R + Send + 'static,
     ) -> R {
-        let dir = std::env::temp_dir().join(format!("ts_goport_unionsort_{}", std::process::id()));
+        static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let call = CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("ts_goport_unionsort_{}_{call}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("a.ts"), source).unwrap();
         std::fs::write(

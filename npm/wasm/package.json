@@ -2,10 +2,10 @@
     "name": "ts-rust-wasm",
     "version": "7.0.0-dev",
     "description": "The ts-rust TypeScript compiler and type checker (a Rust port of typescript-go) as WebAssembly",
-    "license": "Apache-2.0",
+    "license": "MIT AND Apache-2.0",
     "repository": {
         "type": "git",
-        "url": "git+https://github.com/t3dotgg/ts-rust.git",
+        "url": "git+https://github.com/pingdotgg/ts-rust.git",
         "directory": "npm/wasm"
     },
     "type": "module",

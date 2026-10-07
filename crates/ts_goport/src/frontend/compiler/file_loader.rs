@@ -2577,7 +2577,10 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&dir);
         let mut out = String::new();
-        let name = |file_name: &str| file_name.replace(&cwd, "<dir>");
+        // The include reasons name files by path (Go `tspath.Path`), which
+        // is in lower case on a case-insensitive file system (macOS).
+        let cwd_path = to_path(&cwd, "", osvfs_fs().use_case_sensitive_file_names()).0;
+        let name = |file_name: &str| file_name.replace(&cwd, "<dir>").replace(&cwd_path, "<dir>");
         for file in &processed.files {
             let path = file.path();
             writeln!(out, "file {}", name(file.file_name())).unwrap();
@@ -2956,13 +2959,22 @@ export declare namespace JSX { interface IntrinsicElements { [name: string]: any
                 .as_ref()
                 .and_then(|resolver| resolver.as_default_resolver())
                 .expect("the default resolver");
-            let name = |directory: &str| {
+            // The name in the package.json of the package scope of `path`.
+            let name = |path: &str| {
                 resolver
-                    .get_package_scope_for_path(&format!("{cwd}/{directory}"))
+                    .get_package_scope_for_path(path)
                     .and_then(|entry| entry.contents.clone())
                     .map(|contents| contents.fields.header_fields.name.get_value().0)
             };
-            let names = (name("src"), name("node_modules/lib"));
+            // The resolver gives a node_modules file by its real path (Go
+            // `resolutionState.realPath`, module/resolver.go:1859), so the
+            // scope of `lib/index.d.ts` is under the real path of the dir.
+            // On macOS the temp dir is under /var, a symlink to /private/var.
+            let real = osvfs_fs().realpath(&cwd);
+            let names = (
+                name(&format!("{cwd}/src")),
+                name(&format!("{real}/node_modules/lib")),
+            );
             let adopted = crate::frontend::module::cache::adopted_package_jsons() - before;
             let _ = std::fs::remove_dir_all(&dir);
             assert_eq!(

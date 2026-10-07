@@ -629,7 +629,8 @@ pub fn build_node_index_table(source_file: Node) -> Rc<NodeIndexTable> {
                 }
                 visitor.ctx.node_count += 1;
                 visitor.ctx.node_table.push(Node::NIL); // NodeLists are not *ast.Node
-                visitor.visit_slice(&node_list.nodes().to_vec());
+                // PERF: (apiperf1) in place, as in `encode_tree`.
+                let _ = visitor.visit_slice_changed(node_list.nodes().iter());
                 node_list
             },
         )),
@@ -900,7 +901,10 @@ fn encode_tree(
                 let current_index = st.node_count;
                 st.prev_index = 0;
                 st.parent_index = current_index;
-                visitor.visit_slice(&node_list.nodes().to_vec());
+                // PERF: (apiperf1) Go `VisitSlice` over the list in place
+                // (`visit_slice_changed`). The visit returns each node as it
+                // is, so nothing is copied.
+                let _ = visitor.visit_slice_changed(node_list.nodes().iter());
                 visitor.ctx.prev_index = current_index;
                 visitor.ctx.parent_index = save_parent_index;
 

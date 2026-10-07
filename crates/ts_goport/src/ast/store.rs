@@ -1580,9 +1580,12 @@ impl PoolBlock {
 /// older version of the file, where each shell leaked them before. The
 /// blocks never go back to the allocator.
 /// - A version gives its block back when it dies (`VersionStore`). The
-///   block waits in `quarantine` until `QUARANTINE_RELEASES` more program
+///   block waits in `quarantine` until `QUARANTINE_RELEASES` more pin
 ///   releases (`file_version::pin_epoch`) have happened, then goes to the
-///   free list of its size class (`pool_class`).
+///   free list of its size class (`pool_class`). A pin release is a
+///   program release, or the release of a source file lease that held the
+///   last holder of a freeable parse
+///   (`file_version::release_file_version_pins_later`, apimem1).
 /// - A node shell of `len` slots takes the first free block of `len` to
 ///   `2 * len + 64` slots (`take_pool_block`), or a fresh one of
 ///   `len + len / 8 + 64` slots, so a file that grows a little while it is
@@ -1590,9 +1593,10 @@ impl PoolBlock {
 // PORT: Go frees a dead `*ast.SourceFile` with the GC. Every holder of a
 // node of a version holds the version, so no read of it can follow its
 // death; the quarantine is a margin for a thread that keeps a node handle
-// and reads only its header, which does not pin the version. After a reuse
-// such a read gives the new owner's data; with debug assertions it panics
-// (`file_block`, `block_is_owned`).
+// and reads only its header, which does not pin the version. A client that
+// releases leases fast makes the pin releases come sooner, so the margin is
+// shorter in time. After a reuse such a read gives the new owner's data;
+// with debug assertions it panics (`file_block`, `block_is_owned`).
 struct BlockPool {
     /// The free blocks by size class.
     free: Vec<Vec<PoolBlock>>,
@@ -1604,11 +1608,11 @@ struct BlockPool {
     kind_columns: FxHashMap<u64, Vec<&'static [SyntaxKind]>>,
 }
 
-/// The number of program releases a given-back block waits
-/// (`BlockPool`). A version usually dies inside a release, after its epoch
-/// bump, and a node shell takes its block before the release of its edit:
-/// in a language server the version that dies in the release of edit N
-/// gives its block to the version of edit N + 3.
+/// The number of pin releases a given-back block waits (`BlockPool`). A
+/// version usually dies inside a release, after its epoch bump, and a node
+/// shell takes its block before the release of its edit: in a language
+/// server with no lease release between the edits, the version that dies
+/// in the release of edit N gives its block to the version of edit N + 3.
 const QUARANTINE_RELEASES: usize = 2;
 
 static POOL: Mutex<BlockPool> = Mutex::new(BlockPool {
@@ -7278,7 +7282,7 @@ mod tests {
 
     // AST node records, step 4: the node shell of a freeable file version
     // takes a pooled block (`BlockPool`). A dead version gives its block
-    // back, the block waits for two program releases, and then the next
+    // back, the block waits for two pin releases, and then the next
     // node shell that fits it takes it. A stale read of the dead version
     // then fails the owner check, and panics as a read of a dead version's
     // store does: a binder field read (the symbol, the flags, the flow node
@@ -7321,7 +7325,7 @@ mod tests {
         assert!(node_block_is_owned(cy), "the block of a dead version waits");
         assert_eq!(cy.kind(), SyntaxKind::Identifier);
 
-        // Its block waits for two program releases.
+        // Its block waits for two pin releases.
         let (d, d_nodes) = identifiers("/pool/d.ts", &["z", "w"]);
         assert_ne!(addr(d_nodes[0]), c_block, "no release yet");
         // Shells with equal kinds share one kind column (`shell_kinds`).

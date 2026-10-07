@@ -4732,9 +4732,46 @@ pub struct SourceFileResponse {
     pub data: String,
 }
 
-proto_json!(marshal SourceFileResponse {
-    data: "data" plain,
-});
+// Go: the v2 default struct marshal (`data` is `plain`).
+// PERF: (apiperf1) `data` is base64 text, which has no byte that JSON
+// escapes, so `PlainJsonText` copies it as it is. The string marshal of
+// each char was 12% of an API createSourceFile loop of a 260 KB file.
+impl MarshalerTo for SourceFileResponse {
+    fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
+        write_object_start(enc);
+        let mut first = true;
+        marshal_field(enc, &mut first, "data", &PlainJsonText(&self.data))?;
+        write_object_end(enc);
+        Ok(())
+    }
+}
+
+/// PERF: (apiperf1) the string marshal of a text that may need no JSON
+/// escape (`SourceFileResponse.data`). When every byte is ASCII and none is
+/// a control character, `"` or `\`, the string marshal writes the text as
+/// it is between quotes, so this copies it at once. Other text takes the
+/// string marshal.
+struct PlainJsonText<'a>(&'a str);
+
+impl MarshalerTo for PlainJsonText<'_> {
+    fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
+        // A fold over each chunk, with no early exit inside it, so the test
+        // is vector code.
+        let plain = self.0.as_bytes().chunks(64).all(|chunk| {
+            chunk.iter().fold(true, |plain, &b| {
+                plain & (b >= 0x20) & (b < 0x80) & (b != b'"') & (b != b'\\')
+            })
+        });
+        if !plain {
+            return self.0.marshal_json_to(enc);
+        }
+        enc.reserve(self.0.len() + 2);
+        enc.push('"');
+        enc.push_str(self.0);
+        enc.push('"');
+        Ok(())
+    }
+}
 
 // GetDiagnosticsParams are parameters for per-file diagnostic methods.
 // Go: proto.go:1861 GetDiagnosticsParams
@@ -5139,6 +5176,29 @@ pub fn no_params(data: &[u8]) -> Result<Option<Box<dyn AnyValue>>, GoError> {
 // side (content mappers) does not depend on `api`. Go keeps them in `core`
 // (struct tags) and in the json package.
 pub use crate::options_json::{CompilerOptionsJSON, TypeAcquisitionJSON, marshal_field_omitempty};
+
+#[cfg(test)]
+mod source_file_response_tests {
+    use super::*;
+    use crate::frontend::json::json_marshal;
+
+    // apiperf1: the marshal of `SourceFileResponse` is the v2 struct marshal
+    // of its string, for base64 text (copied as it is) and for text with
+    // bytes that JSON escapes or that are not ASCII (the string marshal).
+    #[test]
+    fn data_is_the_string_marshal() {
+        for data in ["", "Zm9vYmE=", "ab+/09==", "a\"b\\c\n\u{1}", "\u{7f}é"] {
+            let response = SourceFileResponse {
+                data: data.to_string(),
+            };
+            let want = format!(
+                "{{\"data\":{}}}",
+                json_marshal(&data.to_string(), &[]).expect("a string marshals")
+            );
+            assert_eq!(json_marshal(&response, &[]).expect("it marshals"), want);
+        }
+    }
+}
 
 #[cfg(test)]
 mod config_file_response_tests {

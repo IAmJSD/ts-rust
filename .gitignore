@@ -3,3 +3,4 @@ target/
 .claude
 
 __pycache__/
+/.tmp-cargo/

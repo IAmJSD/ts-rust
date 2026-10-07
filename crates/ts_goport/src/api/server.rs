@@ -223,7 +223,10 @@ impl StdioServer {
 
         // Create protocol and connection based on async mode
         // PORT: the frees of a message wait until it ends (`FreeAfterMessage`).
+        // A source file version that a lease release frees is freed on the
+        // free thread (perf, apiperf1).
         crate::gostd::local::keep_garbage();
+        crate::ast::free_released_versions_in_background();
         let handler: Rc<dyn Handler> = Rc::new(FreeAfterMessage {
             inner: session.clone(),
             depth: Cell::new(0),

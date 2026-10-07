@@ -1,0 +1,20 @@
+{
+  "compilerOptions": {
+    "strict": true,
+    "target": "es2015",
+    "module": "esnext",
+    "lib": [
+      "es5"
+    ],
+    "types": [],
+    "declaration": true,
+    "rootDir": "src",
+    "outDir": "out",
+    "removeComments": true,
+    "newLine": "crlf",
+    "sourceMap": true
+  },
+  "include": [
+    "src"
+  ]
+}

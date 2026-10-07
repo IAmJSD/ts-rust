@@ -144,6 +144,13 @@ impl FileVersion {
         self.published.get()
     }
 
+    /// The node count of the version (its parser flags), 0 before the
+    /// publish.
+    fn node_count(&self) -> usize {
+        self.published()
+            .map_or(0, |store| store.go_file().parser_flags.len())
+    }
+
     /// The `GoFile` of this version. Panics before the publish. A
     /// `FileRef::Pinned` getter starts here.
     #[inline]
@@ -622,24 +629,41 @@ fn drop_hot() {
 /// (`release_file_version_pins_later`). The versions that the live
 /// programs read are pinned again on their next read.
 pub fn release_file_version_pins() {
+    // Dropped after the borrow ends.
+    drop(take_file_version_pins());
+}
+
+/// The pins of this thread, taken out as `release_file_version_pins` drops
+/// them.
+fn take_file_version_pins() -> Vec<(usize, VersionPin)> {
     PIN_EPOCH.fetch_add(1, Ordering::AcqRel);
     drop_hot();
-    let pins = PINS
-        .try_with(|pins| {
-            let mut pins = pins.try_borrow_mut().ok()?;
-            Some(std::mem::take(&mut pins.list))
-        })
-        .ok()
-        .flatten();
-    // Dropped after the borrow ends.
-    drop(pins);
+    PINS.try_with(|pins| {
+        let mut pins = pins.try_borrow_mut().ok()?;
+        Some(std::mem::take(&mut pins.list))
+    })
+    .ok()
+    .flatten()
+    .unwrap_or_default()
 }
 
 thread_local! {
     /// True while a `PinRelease` of this thread waits for its drop
     /// (`release_file_version_pins_later`).
     static PIN_RELEASE_QUEUED: Cell<bool> = const { Cell::new(false) };
+    /// `Some(min_nodes)` on a thread whose `PinRelease` frees a version of
+    /// `min_nodes` or more nodes on the free thread
+    /// (`free_released_versions_in_background`).
+    static FREE_IN_BACKGROUND: Cell<Option<usize>> = const { Cell::new(None) };
 }
+
+/// The node count from which the free of a dying version goes to the free
+/// thread (`free_released_versions_in_background`): about a 60 KB file.
+// PERF: (apiperf1) mini-743d. The free of a version of a 260 KB file (about
+// 70,000 nodes) took about 1 ms of each releaseSourceFile. For small texts
+// (about 150 nodes) the free thread made a loop of 3,000 leases 3 to 6%
+// slower: the next parse reused memory that the other thread freed.
+const BACKGROUND_FREE_MIN_NODES: usize = 10_000;
 
 /// `release_file_version_pins` when the value drops.
 struct PinRelease;
@@ -647,17 +671,74 @@ struct PinRelease;
 impl Drop for PinRelease {
     fn drop(&mut self) {
         let _ = PIN_RELEASE_QUEUED.try_with(|queued| queued.set(false));
-        release_file_version_pins();
+        let pins = take_file_version_pins();
+        let Some(min_nodes) = FREE_IN_BACKGROUND.try_with(Cell::get).ok().flatten() else {
+            drop(pins);
+            return;
+        };
+        // A pin that a `FileRef` guard of this thread shares drops here: the
+        // guard keeps the version.
+        let versions: Vec<Arc<FileVersion>> = pins
+            .into_iter()
+            .filter_map(|(_, pin)| Rc::try_unwrap(pin).ok())
+            .collect();
+        let big_dies = versions
+            .iter()
+            .any(|version| Arc::strong_count(version) == 1 && version.node_count() >= min_nodes);
+        if big_dies {
+            free_in_background(Box::new(versions));
+        }
+        // Else they drop here.
     }
+}
+
+/// Not in Go (perf, apiperf1): on this thread, the pin release of a source
+/// file lease release (`release_file_version_pins_later`) gives the
+/// versions that it held to the free thread (`free_in_background`) when one
+/// of `BACKGROUND_FREE_MIN_NODES` or more nodes dies, so it is freed there,
+/// beside the next requests, as Go's GC frees the leased
+/// `*ast.SourceFile`. The stdio API server calls it with
+/// `gostd::local::keep_garbage`. Elsewhere the free runs in the release, so
+/// a test sees the version die at `drop_garbage`.
+pub fn free_released_versions_in_background() {
+    FREE_IN_BACKGROUND.with(|min_nodes| min_nodes.set(Some(BACKGROUND_FREE_MIN_NODES)));
+}
+
+/// Not in Go (perf, apiperf1): drops `garbage` on a thread that drops the
+/// values sent to it in order, or here when that thread cannot start
+/// (wasm32-wasip1 has no threads). A value still queued at exit is not
+/// dropped. `execute::build::build_task::drop_in_background` is the same
+/// thread for the data of a build.
+fn free_in_background(garbage: Box<dyn Send>) {
+    if cfg!(target_family = "wasm") {
+        drop(garbage);
+        return;
+    }
+    static QUEUE: OnceLock<Option<std::sync::mpsc::Sender<Box<dyn Send>>>> = OnceLock::new();
+    let queue = QUEUE.get_or_init(|| {
+        let (send, receive) = std::sync::mpsc::channel::<Box<dyn Send>>();
+        std::thread::Builder::new()
+            .name("goport-free-versions".to_string())
+            .spawn(move || receive.into_iter().for_each(drop))
+            .ok()
+            .map(|_| send)
+    });
+    let unsent = match queue {
+        Some(send) => send.send(garbage).err().map(|err| err.0),
+        None => Some(garbage),
+    };
+    drop(unsent);
 }
 
 /// Not in Go: `release_file_version_pins` after the answer
 /// (`gostd::local::drop_later`; at once on a thread that does not keep
 /// garbage). The release of a source file lease whose freeable parse has no
 /// other holder calls it (`project::drop_released_lease`), so the version
-/// dies with the lease, as Go's GC frees the leased `*ast.SourceFile`. One
-/// release waits at a time: the leases that one message releases (a
-/// session close) bump the pin epoch once.
+/// dies with the lease, as Go's GC frees the leased `*ast.SourceFile`; on
+/// the free thread when this thread frees in the background
+/// (`free_released_versions_in_background`). One release waits at a time:
+/// the leases that one message releases (a session close) bump the pin
+/// epoch once.
 pub fn release_file_version_pins_later() {
     if PIN_RELEASE_QUEUED.replace(true) {
         return;
@@ -1034,6 +1115,49 @@ mod tests {
         map.write();
         assert_eq!(map.get(&node(DYING)), None);
         assert_eq!(map.get(&node(OTHER)), Some(&2));
+    }
+
+    // apiperf1: on a thread that frees in the background (the stdio API
+    // server), the pin release of a lease release gives the version to the
+    // free thread, which frees it after the values queued before it.
+    #[test]
+    fn background_pin_release_frees_on_the_free_thread() {
+        const DYING: usize = (1 << 22) - 7;
+        /// Holds the free thread until its sender sends or drops.
+        struct Blocker(std::sync::mpsc::Receiver<()>);
+        impl Drop for Blocker {
+            fn drop(&mut self) {
+                let _ = self.0.recv();
+            }
+        }
+        // Its own thread, so the background mode stays there.
+        std::thread::spawn(|| {
+            let version = FileVersion::new(DYING);
+            let probe = file_version_probe(node(DYING)).expect("the registry has the version");
+            drop(pinned_file_version(DYING).expect("the version is live"));
+            drop(version);
+            assert!(
+                !probe.is_freed(),
+                "the pin of this thread holds the version"
+            );
+            let (go, wait) = std::sync::mpsc::channel();
+            free_in_background(Box::new(Blocker(wait)));
+            // Every dying version, whatever its node count.
+            FREE_IN_BACKGROUND.with(|min_nodes| min_nodes.set(Some(0)));
+            release_file_version_pins_later();
+            assert!(!probe.is_freed(), "the release does not free the version");
+            go.send(()).expect("the free thread waits");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            while !probe.is_freed() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the free thread frees the version"
+                );
+                std::thread::yield_now();
+            }
+        })
+        .join()
+        .expect("the test thread ends");
     }
 
     // A node of a dead version whose id the map forgot gets no new id: the

@@ -34,9 +34,11 @@ set -uo pipefail
 REPO=/home/theo/Code/sandbox/ts-rust
 T=$REPO/target
 # The ssh config names the minis over Tailscale. These options set the LAN name, and HostKeyAlias checks
-# the host key that ~/.ssh/known_hosts has for the Tailscale name. dbook-lan is a LAN alias in the ssh config.
+# the host key that ~/.ssh/known_hosts has for the Tailscale name (the config's HostName, from ssh -G, so
+# the tailnet name stays out of the repo). dbook-lan is a LAN alias in the ssh config.
+ts_name() { ssh -G "$1" 2> /dev/null | awk '$1 == "hostname" { print $2 }'; }
 declare -A SSH_OPTS=(
-  [mini-743d]="-o HostName=mini-743d.local -o HostKeyAlias=mini-743d.<tailnet>.ts.net"
+  [mini-743d]="-o HostName=mini-743d.local -o HostKeyAlias=$(ts_name mini-743d)"
 )
 # The name remote.sh uses for a host. Tailscale names of LAN hosts map to their LAN route.
 canon() {

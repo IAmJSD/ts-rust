@@ -938,13 +938,19 @@ impl Checker {
         // the first property of the name.
         // PERF: a name seen again with that value declaration is not tested
         // again. That is almost always the same member (an instantiation of
-        // it). It can be another symbol: a union or intersection property is
-        // a property with the value declaration of its first constituent's
-        // property (Go `createUnionOrIntersectionProperty`), so in
-        // `A & (A | B)`, where `A.m` is a public method and `B.m` a
-        // property, `(A | B).m` is skipped and `m` stays with the public
-        // methods. That changes only the order of the tests below, not the
-        // answer: both groups are tested. The tuples of an intersection
+        // it). It can be another symbol: a union or intersection property of
+        // two or more properties is a property, not a method, with their
+        // value declaration when they have one and the same (Go
+        // `createUnionOrIntersectionProperty`, checker.go:21821 and :21988).
+        // So in `A<string> & T`, where `T extends A<string> | A<number>` and
+        // `A.m` is a public method, the `m` of `T` (a property of its
+        // apparent type `A<string> | A<number>`, checker.go:19187) is
+        // skipped, and `m` stays with the public methods
+        // (`tests::a_skipped_property_can_be_a_union_property`). An
+        // intersection has no union constituent: Go distributes
+        // `A & (A | B)` over the union (checker.go:26508), so that type is
+        // the union `A | (A & B)`. That changes only the order of the tests
+        // below, not the answer: both groups are tested. The tuples of an intersection
         // share the lib declarations of their array methods, so this saves
         // a test for each method of each tuple (mongodb test check: the test
         // cost 6.5% more instructions, 1.6% with the parent of the first
@@ -2246,5 +2252,58 @@ fn ordered_symbol_set_add(
         }
     } else if index.insert(s) {
         list.push(s);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::checker::utilities_p1::union_sort_tests::with_alias_types;
+
+    /// The example of `some_property_reduces_to_never`. In `A<string> & T`,
+    /// where `T extends A<string> | A<number>`, the `m` of `A<string>` is a
+    /// public method, and the `m` of `T` is the union property of
+    /// `A<string> | A<number>`: a property with the same value declaration
+    /// (Go `createUnionOrIntersectionProperty`, checker.go:21821 and
+    /// :21988). `A<string> & (A<string> | B)` is a union: Go distributes an
+    /// intersection over a union (checker.go:26508).
+    #[test]
+    fn a_skipped_property_can_be_a_union_property() {
+        const SOURCE: &str = r#"
+interface A<X> { m(): X }
+interface B { m: number }
+type D = A<string> & (A<string> | B);
+type I<T extends A<string> | A<number>> = A<string> & T;
+"#;
+        let got = with_alias_types(SOURCE, |c, types| {
+            let (d, i) = (types[0], types[1]);
+            let props: Vec<SymbolId> = c
+                .ty(i)
+                .types()
+                .to_vec()
+                .into_iter()
+                .map(|u| {
+                    let props = c.get_properties_of_type(u);
+                    props
+                        .iter()
+                        .copied()
+                        .find(|&p| c.sym(p).name == "m")
+                        .expect("each constituent has m")
+                })
+                .collect();
+            let mut public_methods: Vec<bool> =
+                props.iter().map(|&p| c.is_public_method(p)).collect();
+            public_methods.sort();
+            (
+                c.ty(d).flags.intersects(TypeFlags::UNION),
+                c.ty(i).flags.intersects(TypeFlags::INTERSECTION),
+                props.len(),
+                c.sym(props[0]).value_declaration.is_some()
+                    && c.sym(props[0]).value_declaration == c.sym(props[1]).value_declaration,
+                public_methods,
+            )
+        });
+        // One public method and one union property, in either order.
+        assert_eq!(got, (true, true, 2, true, vec![false, true]));
     }
 }

@@ -21,7 +21,9 @@
 #          tsc-rs) and @tsc-rs/linux-x64 from <tsc>, plus @tsc-rs/<os>-<arch> for each --also, a
 #          tsc built for that platform (for example darwin-arm64=<path>). It does not run here, so
 #          only <tsc> is checked. <tsc> reports the TypeScript version (not stamped with <v>).
-# The pin is GOPORT_PIN, else the current pin (scripts/upstream/pin.py path goCheckout). Both pin
+# The pin is GOPORT_PIN, else the current pin (scripts/upstream/pin.py path goCheckout).
+# NPM_PACK_GO_DIR=<dir> names the pin's Go checkout dir when it is not at the pin.py path (CI, the
+# release workflow). It needs the npm install of the repo root (node_modules/.bin/tsc). Both pin
 # layouts work. "typescript" (microsoft/TypeScript, pin N on): the Go module is <repo>/tsc
 # (./cmd/tsc, module github.com/microsoft/TypeScript/tsc) and the package input is
 # <repo>/packages/typescript. "typescript-go": the Go module is the checkout (./cmd/tsgo, module
@@ -31,7 +33,7 @@
 # tsc-rs: <out-dir>/tsc-rs, <out-dir>/tsc-rs-<os>-<arch> and their tarballs.
 set -euo pipefail
 repo="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
-usage() { sed -n '9,28p' "$0" >&2; exit 2; }
+usage() { sed -n '9,30p' "$0" >&2; exit 2; }
 
 go_version="" name=typescript also=() package_version=()
 while [[ ${1:-} == --name || ${1:-} == --also || ${1:-} == --package-version ]]; do
@@ -55,7 +57,7 @@ else
 fi
 mkdir -p "$out"
 out=$(realpath "$out")
-go_dir=$("$repo/scripts/upstream/pin.py" path goCheckout)
+go_dir=${NPM_PACK_GO_DIR:-$("$repo/scripts/upstream/pin.py" path goCheckout)}
 read -r pin layout go_toolchain < <("$repo/scripts/upstream/pin.py" show |
   node -e 'const p = JSON.parse(require("fs").readFileSync(0, "utf8")); console.log(p.key, p.layout, p.oracle.go)')
 case $layout in

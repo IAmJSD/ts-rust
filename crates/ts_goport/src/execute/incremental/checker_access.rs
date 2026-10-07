@@ -122,6 +122,12 @@ mod tests {
         dir.to_string_lossy().replace('\\', "/")
     }
 
+    /// The package.json cache key of `file_name` (Go `tspath.Path`). On a
+    /// case-insensitive file system (macOS) the key is in lower case.
+    fn cache_key(file_name: &str) -> String {
+        to_path(file_name, "", osvfs_fs().use_case_sensitive_file_names()).0
+    }
+
     // specstat1 (realworld3 gap 3): the package.json lookups that module
     // specifier generation makes on a checker thread are entries of the
     // program's package.json cache, as in Go, where they go to the
@@ -164,11 +170,15 @@ mod tests {
         assert_eq!(nearest, format!("{dir}/node_modules/pkg"));
         for expected in [
             (
-                format!("{dir}/node_modules/pkg/dist/package.json"),
+                cache_key(&format!("{dir}/node_modules/pkg/dist/package.json")),
                 true,
                 false,
             ),
-            (format!("{dir}/node_modules/pkg/package.json"), true, true),
+            (
+                cache_key(&format!("{dir}/node_modules/pkg/package.json")),
+                true,
+                true,
+            ),
         ] {
             assert!(
                 entries.contains(&expected),
@@ -240,7 +250,7 @@ mod tests {
             "the edit keeps the imports, so the program is reused"
         );
         let expected = (
-            format!("{dir}/node_modules/pkg/dist/package.json"),
+            cache_key(&format!("{dir}/node_modules/pkg/dist/package.json")),
             true,
             false,
         );

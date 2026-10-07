@@ -384,10 +384,12 @@ methods reach the AST through it.
   copies its records and kids into a pooled block (a leaked block of
   records and kids, 40 bytes per slot, with room for about 1/8 more slots
   and 64 more). The version gives the block back when it dies; it waits
-  in a quarantine until 2 more program releases (`pin_epoch`), then a
+  in a quarantine until 2 more pin releases (`pin_epoch`: program
+  releases, and lease releases that free a parse, below), then a
   later node shell of a size it fits (`len` to `2 * len + 64` slots) takes
-  it. In a language server the version that dies in the release of edit N
-  gives its block to the version of edit N + 3. `bind` of the nil slot
+  it. In a language server with no lease release between the edits, the
+  version that dies in the release of edit N gives its block to the
+  version of edit N + 3. `bind` of the nil slot
   holds the owner (the file id), written at the publish. A read that
   finds another owner panics with "file version N is released", as a read
   of a dead version's store does. With debug assertions every
@@ -462,7 +464,8 @@ The batch that adds it is not accepted until Theo approves.
   released version's tables on a thread with no copy panics ("program
   version N is released"). `GOPORT_KEEP_VERSION_TABLES=1` keeps them (A/B
   runs and a field fallback). The `GoProgram` shell and the static file
-  versions (the first version of each file) stay leaked for now. A
+  versions (the first version of each file, but a leased one, below) stay
+  leaked for now. A
   one-program process forgets its checkers and the
   synthetic nodes of both pools at the end, like Go. Watch mode uses
   `program::release_program_in_background`: the old checker pool stops
@@ -487,7 +490,11 @@ The batch that adds it is not accepted until Theo approves.
 - Freeable file versions (lsshells M3a to M3d, `ast/file_version.rs`). In
   a language server or API process (`project::new_session`), a parse cache
   parse of a path that a publish on this thread published before gets a
-  `FileVersion`. In a `tsc --watch` process (`Watcher::start`,
+  `FileVersion`. An API source file lease (`acquire_source_file`, apimem1)
+  notes its path before its parse, so its parse gets one even as the first
+  version of the path, and the release of its last lease frees it, as Go's
+  GC frees the leased `*ast.SourceFile` (`project::drop_released_lease`).
+  In a `tsc --watch` process (`Watcher::start`,
   `ast::set_watch_process`; watchfree1) each build does the same for its
   new parses (`program::mark_freeable_parses`), and parses ahead
   (prefetch) only in a build with an empty source file cache: the first
@@ -529,8 +536,11 @@ The batch that adds it is not accepted until Theo approves.
   holds it (`ParsedSourceFile::version`), and so
   do the `VersionTables` of each program version that has the file, so a
   seeded thread keeps it too. A thread that reads it pins it until the
-  next program release (`release_file_version_pins`, run when a
-  `ReleasedProgram` drops) or its end, and a `FileRef` guard holds it. The
+  next pin release (`release_file_version_pins`: run when a
+  `ReleasedProgram` drops, and after the answer when a lease release lets
+  go of the last holder of a freeable parse,
+  `release_file_version_pins_later`) or its end, and a `FileRef` guard
+  holds it. The
   registry keeps a `Weak`. At publish the version takes its `FileStore`
   and its `GoFile` (M3b). Its node records and kids (`NodeRecord`,
   `NodeKids`; 40 bytes per node, and 2 in the kind column) are in its node shell, the registry
@@ -569,8 +579,8 @@ The batch that adds it is not accepted until Theo approves.
   symbol or table ids panics (index out of bounds). Its pooled block goes
   back to the pool (see "Pooled node blocks" above); its small `BlockFile`,
   its foreign parents and its text stay leaked for now. The first publish, the
-  first version of each file and every CLI publish except `tsc --watch`
-  and `tsc -b --watch` never get one.
+  first version of each file (but a leased one, above) and every CLI
+  publish except `tsc --watch` and `tsc -b --watch` never get one.
   `GOPORT_FREE_FILE_VERSIONS=0` turns this off, `=1` turns it on in any
   process; there `update_program_version` (`goport_multiprog`) also gives
   each new parse of a published path a version, so a leak record can

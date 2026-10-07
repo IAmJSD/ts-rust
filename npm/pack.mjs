@@ -64,8 +64,8 @@ const packageVersion = args["package-version"] ?? version;
 const atN = layout === "typescript";
 const root = atN ? path.dirname(goDir) : goDir;
 const inputDir = atN ? path.join(root, "packages", "typescript") : path.join(goDir, "_packages", "native-preview");
-const licenseFile = path.join(root, atN ? "LICENSE.txt" : "LICENSE");
-const noticeFile = path.join(root, "NOTICE.txt");
+const tsLicenseFile = path.join(root, atN ? "LICENSE.txt" : "LICENSE");
+const tsNoticeFile = path.join(root, "NOTICE.txt");
 
 // Go: Herebyfile.mjs getPlatforms. PORT: the platforms are the --exe values, not only the current
 // platform as in Go's local build.
@@ -114,13 +114,17 @@ if (asTypescript) {
     input.repository = { type: "git", url: "https://github.com/microsoft/TypeScript.git" };
 }
 else {
-    // PORT: the port's own package. LICENSE and NOTICE.txt stay TypeScript's (Apache-2.0).
+    // PORT: the port's own package. The port is MIT. The JS launcher, the JS API and the lib files
+    // are TypeScript's, unchanged (Apache-2.0). See portNotice below.
+    input.license = "MIT AND Apache-2.0";
     input.author = "Theo Browne";
     input.description = "A Rust port of the TypeScript 7 compiler";
     input.keywords = ["typescript", "tsc", "compiler", "rust"];
-    delete input.homepage;
-    delete input.bugs;
-    delete input.repository;
+    // npm trusted publishing (the release workflow) needs repository.url to name the repo that
+    // publishes. The platform packages copy it.
+    input.homepage = "https://github.com/pingdotgg/ts-rust";
+    input.bugs = { url: "https://github.com/pingdotgg/ts-rust/issues" };
+    input.repository = { type: "git", url: "git+https://github.com/pingdotgg/ts-rust.git" };
 }
 delete input.scripts;
 delete input.devDependencies;
@@ -133,6 +137,30 @@ fs.rmSync(out, { recursive: true, force: true });
 // The main package (`typescript`, or `tsc-rs`).
 const mainDir = path.join(out, name);
 const here = path.dirname(fileURLToPath(import.meta.url));
+const repoRoot = path.dirname(here);
+
+// PORT: tsc-rs ships the port's MIT LICENSE, and a NOTICE.txt with the licenses and notices of
+// the code it ports or copies (the repo's NOTICE.md and licenses/). Go's set keeps TypeScript's.
+function portNotice() {
+    const part = (title, file) => [`${"=".repeat(78)}\n${title}\n${"=".repeat(78)}\n`, fs.readFileSync(file, "utf8")];
+    return [
+        fs.readFileSync(path.join(repoRoot, "NOTICE.md"), "utf8"),
+        ...part("TypeScript license", tsLicenseFile),
+        ...part("TypeScript third-party notices", tsNoticeFile),
+        ...part("Go license", path.join(repoRoot, "licenses", "Go-LICENSE.txt")),
+        ...part("Unicode license", path.join(repoRoot, "licenses", "Unicode-LICENSE.txt")),
+    ].join("\n");
+}
+function writeLicense(dir) {
+    if (asTypescript) {
+        fs.copyFileSync(tsLicenseFile, path.join(dir, "LICENSE"));
+        fs.copyFileSync(tsNoticeFile, path.join(dir, "NOTICE.txt"));
+    }
+    else {
+        fs.copyFileSync(path.join(repoRoot, "LICENSE"), path.join(dir, "LICENSE"));
+        fs.writeFileSync(path.join(dir, "NOTICE.txt"), portNotice());
+    }
+}
 const mainPackage = {
     ...input,
     name,
@@ -174,8 +202,7 @@ if (args["native-bin"]) {
     fs.copyFileSync(path.join(here, "install.js"), path.join(mainDir, "lib", "install.js"));
 }
 writeJson(path.join(mainDir, "package.json"), mainPackage);
-fs.copyFileSync(licenseFile, path.join(mainDir, "LICENSE"));
-fs.copyFileSync(noticeFile, path.join(mainDir, "NOTICE.txt"));
+writeLicense(mainDir);
 
 // The platform packages: the lib files and the native tsc in lib/.
 for (const { nodeOs, nodeArch, exe, packageName } of platforms) {
@@ -197,8 +224,7 @@ for (const { nodeOs, nodeArch, exe, packageName } of platforms) {
     fs.copyFileSync(exe, path.join(platformDir, "lib", exeName));
     fs.chmodSync(path.join(platformDir, "lib", exeName), 0o755);
     writeJson(path.join(platformDir, "package.json"), platformPackage);
-    fs.copyFileSync(licenseFile, path.join(platformDir, "LICENSE"));
-    fs.copyFileSync(noticeFile, path.join(platformDir, "NOTICE.txt"));
+    writeLicense(platformDir);
     fs.writeFileSync(
         path.join(platformDir, "README.md"),
         [

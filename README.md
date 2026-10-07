@@ -1,77 +1,92 @@
 # ts-rust
 
-`ts-rust` is an experimental attempt to port
-[`microsoft/typescript-go`](https://github.com/microsoft/typescript-go) to
-Rust. It is not currently a replacement for `tsgo` or `tsc`.
+A Rust port of the TypeScript 7 compiler.
 
-Current typechecker work follows the [reset plan](docs/typechecker-reset-plan.md)
-and [accountability rules](docs/typechecker-accountability.md). Read the
-[saved state](docs/typechecker-state/current.json) before resuming work.
+ts-rust is a direct port of Microsoft's native TypeScript compiler, which is written in Go
+([microsoft/TypeScript](https://github.com/microsoft/TypeScript), formerly
+[typescript-go](https://github.com/microsoft/typescript-go)). It keeps Go's algorithms and
+behavior and has the same command line (`tsc`), language server and API.
 
-The newest checker is `crates/ts_goport`, a direct port of the pinned Go
-checker. It checks TanStack Query core and Hono with diagnostics identical to
-`tsgo`, and is faster than `tsgo` on every measured project. Accepted
-revisions and evidence are in the saved state.
+**This is a preview.** It is not yet a full replacement for `tsc`. See
+[Known problems](#known-problems).
 
-## The model experiment
+## Install
 
-This repository is also an experiment in how capable `gpt-5.6-sol` is at
-understanding, validating, and completing a compiler-sized systems port through
-Codex and its subagents.
+```sh
+npm install -D tsc-rs@next
+npx tsc-rs -p tsconfig.json
+```
 
-There is an important provenance caveat: the archived Codex log labels 236 of
-the original implementation turns as an earlier model, one later turn as
-`gpt-5.5`, and only the brief July 8 resume as `gpt-5.6-sol`. The existing code
-is therefore the starting artifact for the `gpt-5.6-sol` experiment, not
-evidence that every existing line was produced by that model name.
+`tsc-rs` takes the same options as `tsc`. The npm package is `tsc-rs` so that it does not clash
+with the `typescript` package. Each [release](https://github.com/pingdotgg/ts-rust/releases) also
+has a standalone archive per platform: the `tsc` binary with the lib files next to it.
 
-## Current state
+Platforms: Linux x64 (static, any distribution) and macOS arm64. Windows and Linux arm64 are not
+available yet.
 
-`crates/ts_goport` has two parts crates, `goport_util` and `goport_lsproto`, in
-`crates/ts_goport/parts`. It uses the lib files in `crates/ts_goport/libs`.
+To use it in VS Code, see the [npm package README](npm/tsc-rs-readme.md#vs-code).
+
+## Status
+
+The port is pinned to one upstream revision ([UPSTREAM.md](UPSTREAM.md)) and compared with Go at
+that revision:
+
+- **Same results.** TanStack Query core and Hono check with diagnostics identical to Go's. All
+  181,711 ported Go tests pass. The language server and API answers match Go on the oracle test
+  sets.
+- **Faster.** On 60 open-source projects, type checking takes about half of Go's time (geometric
+  mean). The preview packages are built in CI without PGO and BOLT, so they are slower than that
+  measured build.
+- **Real projects.** On 120 open-source repos, the command-line output differs from Go's only in
+  the problems below and where Go's own output changes from run to run.
+
+## Known problems
+
+- In some monorepos, the source files of a workspace package are reachable both through
+  `node_modules` and through a direct import. There, `tsc-rs` can write output for more of those
+  files than `tsc` does.
+- In `tsc -b`, when one project imports the output of another project without a project reference,
+  `tsc-rs` can report TS2307 (cannot find module) where `tsc` happens to build the other project
+  first. Add the reference to fix it.
+- `tsc -b --watch` can stop with an internal error (exit code 70) after some edits.
+- In the editor, memory grows slowly during long edit sessions.
+- `tsc-rs --version` prints the TypeScript version that it ports (7.1.0-dev), not the npm
+  version. The compiler matches `typesVersions` against it.
+
+## Development
+
+`crates/ts_goport` is the compiler. It has two parts crates, `goport_util` and `goport_lsproto`,
+in `crates/ts_goport/parts`, and uses the lib files in `crates/ts_goport/libs`.
 `tools/ts_ast_codegen` generates `crates/ts_goport/src/astdata`, and
-`tools/ts_diagnostics_codegen` generates `crates/ts_goport/src/diagnostics/catalog.rs`
-and `crates/ts_goport/src/diag.rs`.
-
-On 2026-09-28 the rest of the first prototype (the legacy parser, binder,
-checker, printer, compiler, CLI, LSP and their tools) was deleted. It is in the
-git history.
-
-## How the project got here
-
-The implementation logs show three distinct Codex goal runs:
-
-| Goal run | Outcome | Goal-accounted tokens |
-| --- | --- | ---: |
-| Full Rust port, June 22–26 | Produced the broad prototype. A later audit found 70 failing tests and measured the broad compiler 2.6–3.4x slower than Go for equivalent work. Paused. | 207,170,354 |
-| `minimal-working-v0`, June 26 | Narrowed the claim to the explicit five-file no-check contract and built its oracle, runtime, and benchmark gates. Completed. | 1,439,471 |
-| Type-checking parity, June 27–July 8 | Added substantial checker work, but never demonstrated full `tsgo` parity. Paused. | 7,438,681 |
-| **Total** |  | **216,048,506 (~216 million)** |
-
-The estimate uses Codex's goal-level `tokensUsed` counters for the three runs
-that were explicitly tied to this repository. Those counters equal uncached
-input plus output tokens. The raw session log records about 8.34 billion
-input-plus-output tokens, but about 8.12 billion of those are cached context
-replay, so that larger number is not a useful estimate of new inference spent
-on the project. Work between goals and this README update are not included.
-
-The history also explains why breadth is not the same as completion here. The
-first goal landed hundreds of commits across many compiler subsystems before
-the parity harness was authoritative. A recovery audit then reduced the scope
-to one measurable path. The later checker goal expanded the scope again and
-was suspended before cleanup and full verification were complete.
-
-## Building
+`tools/ts_diagnostics_codegen` generates `crates/ts_goport/src/diagnostics/catalog.rs` and
+`crates/ts_goport/src/diag.rs`. `crates/ts_wasm` is the WebAssembly build
+([npm/wasm](npm/wasm/README.md)).
 
 ```sh
 ./scripts/run-cargo-capped.sh build --release -p ts_goport --bins
 ./scripts/verify.sh
 ```
 
-The bins are `goport` (type check) and `tsgo` (the Go `tsgo` command line).
-The Go baseline tests run with
+The bins are `goport` (type check) and `tsgo` (the Go `tsgo` command line). The Go baseline tests
+run with
 `TS_GO_REPO=/path/to/typescript-go ./scripts/run-cargo-capped.sh test -p ts_goport --test go_baselines`.
-The measurement and gate scripts are in [scripts/goport](scripts/goport/README.md).
-The port rules are in [crates/ts_goport/PORTING.md](crates/ts_goport/PORTING.md).
-The port is pinned to the upstream revision recorded in [UPSTREAM.md](UPSTREAM.md)
-and [UPSTREAM.json](UPSTREAM.json).
+
+- Port rules: [crates/ts_goport/PORTING.md](crates/ts_goport/PORTING.md)
+- Measurement and gate scripts: [scripts/goport](scripts/goport/README.md)
+- npm packages and releases: [npm/README.md](npm/README.md)
+- Typechecker work rules: [AGENTS.md](AGENTS.md), the
+  [accountability rules](docs/typechecker-accountability.md) and the
+  [saved state](docs/typechecker-state/current.json)
+- How the project started: [docs/history.md](docs/history.md)
+
+## Releases
+
+Push a tag `v<version>` (for example `v0.1.0-preview.1`). The
+[release workflow](.github/workflows/release.yml) builds, packs and tests the packages, publishes
+them to npm under the dist-tag `next` and creates a GitHub prerelease. See
+[npm/README.md](npm/README.md#tsc-rs-releases).
+
+## License
+
+[MIT](LICENSE). The port keeps the licenses and notices of the code it ports: TypeScript
+(Apache-2.0) and parts of the Go standard library (BSD-3-Clause). See [NOTICE.md](NOTICE.md).

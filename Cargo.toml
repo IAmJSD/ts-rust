@@ -12,7 +12,7 @@ resolver = "3"
 [workspace.package]
 version = "7.0.0-dev"
 edition = "2024"
-license = "Apache-2.0"
+license = "MIT AND Apache-2.0"
 repository = "https://github.com/microsoft/typescript-go"
 
 [workspace.lints.rust]

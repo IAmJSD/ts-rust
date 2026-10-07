@@ -62,21 +62,48 @@ against that version. A tsc that reported 0.1.0 picked the `<=5.6` typings of zo
 and lost 2 of Go's 21 zod errors. The main package records the tsc version as `tscVersion` for the
 postinstall check.
 
-1. Linux, on a host with BOLT (zbook): `RELEASE_FEATURES=noembed RELEASE_LIBC=musl RELEASE_PIE=0
-   crates/ts_goport/scripts/build-release.sh <out>/linux-x64` (no `RELEASE_VERSION`). Static musl:
-   it starts on any x86-64 Linux.
-2. macOS: the workflow `tsc-rs darwin build` (`.github/workflows/tsc-rs-darwin.yml`) builds on a Mac
-   and uploads the artifact `tsc-darwin-arm64`. jemalloc does not cross-build for macOS with zig.
-   `gh run download <run> -n tsc-darwin-arm64 -D <out>/darwin-arm64`. Both tsc builds must come
-   from the same source.
-3. Pack and test:
+The release workflow (`.github/workflows/release.yml`) makes a release:
 
-   ```sh
-   GOPORT_PIN=<pin> scripts/goport/npm-pack.sh --name tsc-rs --package-version <v> \
-     --also darwin-arm64=<out>/darwin-arm64/tsgo <out>/pkg <out>/linux-x64/bin/tsgo
-   scripts/goport/npm-test.sh --name tsc-rs <out>/pkg <out>/test
-   ```
+1. Push a tag `v<version>`, for example `git tag v0.1.0-preview.1 && git push origin v0.1.0-preview.1`.
+   The npm version is the tag without the `v`.
+2. It builds the tsc on Linux (static musl, non-PIE: it starts on any x86-64 Linux) and on a Mac
+   (jemalloc does not cross-build for macOS with zig), from the same source.
+3. It packs the set with `npm-pack.sh --name tsc-rs --package-version <v> --also darwin-arm64=<tsc>`,
+   makes one archive per platform (the tsc, the lib files, LICENSE and NOTICE.txt) and installs
+   the packages in a fresh project on each platform.
+4. It publishes the platform packages, then `tsc-rs`, under the dist-tag `next`, and creates a
+   GitHub prerelease with the archives, the .tgz files and `SHA256SUMS`. The publish uses npm
+   trusted publishing (see below), so there is no npm token in the repo.
 
-4. Publish the platform packages first, then the main package: `npm publish <tgz> --tag next` for
-   each. Check `npx tsc-rs@next` on each platform, then
-   `npm dist-tag add tsc-rs@<v> latest` (and the same for each platform package).
+Pull requests that change the release files run steps 2 and 3 with the version `0.0.0-ci.<run>`.
+After a check of `npx tsc-rs@next` on each platform, `npm dist-tag add tsc-rs@<v> latest` (and the
+same for each platform package) makes it the default.
+
+The CI builds are the plain shipped profile (fat LTO). They have no PGO and BOLT, which give 14 to
+15% fewer cycles (build-release.sh header), because those need a host with BOLT and the project
+inputs. For a faster build, make the Linux tsc on zbook with
+`RELEASE_FEATURES=noembed RELEASE_LIBC=musl RELEASE_PIE=0 crates/ts_goport/scripts/build-release.sh <out>/linux-x64`
+and pack and test it by hand:
+
+```sh
+GOPORT_PIN=<pin> scripts/goport/npm-pack.sh --name tsc-rs --package-version <v> \
+  --also darwin-arm64=<darwin tsc from the release workflow> <out>/pkg <out>/linux-x64/bin/tsgo
+scripts/goport/npm-test.sh --name tsc-rs <out>/pkg <out>/test
+```
+
+### Trusted publishing
+
+npm trusts the workflow file `release.yml` of `pingdotgg/ts-rust`, in the GitHub environment
+`npm`, to publish each of the 3 packages (OIDC, no token). Set it up once with
+`npm/trust-setup.sh`, logged in to npm with 2FA and npm 11.15.0 or later. It publishes a
+`0.0.0-placeholder` version of a package that is not on npm yet, because npm can only trust a
+workflow for a package that exists. The workflow refuses `0.0.x` tags, so a release never
+collides with a placeholder. npm drops a new trust that publishes nothing in 2 days, so run it
+shortly before the first tag. Add required reviewers to the `npm` environment (repo settings,
+Environments) to approve each publish by hand.
+
+While the repo is private, npm publishes with no provenance. From a public repo it adds
+provenance by itself.
+
+The packages carry the port's MIT LICENSE and a NOTICE.txt with the licenses of TypeScript
+(Apache-2.0) and Go (BSD-3-Clause), from `NOTICE.md` and `licenses/` at the repo root.

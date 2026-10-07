@@ -2884,29 +2884,70 @@ impl Session {
 // Go: encoding/base64/base64.go:139 (*Encoding).EncodeToString (StdEncoding)
 // PORT: the crate has no base64 dependency. Go `base64.StdEncoding`: the
 // standard alphabet with `=` padding.
+// PERF: (apiperf1) Go `Encode` (base64.go:145) writes each 3 bytes as 4
+// bytes of a buffer of the final size; so does this. The text is ASCII, so
+// the UTF-8 check at the end is one fast pass. A `String::push` for each
+// byte was 5% of an API createSourceFile loop of a 260 KB file.
 pub fn base64_std_encoding_encode_to_string(src: &[u8]) -> String {
     const ENCODE_STD: &[u8; 64] =
         b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut dst = String::with_capacity(src.len().div_ceil(3) * 4);
-    for chunk in src.chunks(3) {
-        let b0 = u32::from(chunk[0]);
-        let b1 = chunk.get(1).map_or(0, |&b| u32::from(b));
-        let b2 = chunk.get(2).map_or(0, |&b| u32::from(b));
-        let val = (b0 << 16) | (b1 << 8) | b2;
-        dst.push(ENCODE_STD[((val >> 18) & 0x3F) as usize] as char);
-        dst.push(ENCODE_STD[((val >> 12) & 0x3F) as usize] as char);
-        if chunk.len() > 1 {
-            dst.push(ENCODE_STD[((val >> 6) & 0x3F) as usize] as char);
-        } else {
-            dst.push('=');
-        }
-        if chunk.len() > 2 {
-            dst.push(ENCODE_STD[(val & 0x3F) as usize] as char);
-        } else {
-            dst.push('=');
+    let encode = |val: u32, shift: u32| ENCODE_STD[((val >> shift) & 0x3F) as usize];
+    let mut dst = vec![0u8; src.len().div_ceil(3) * 4];
+    let (whole, rest) = src.as_chunks::<3>();
+    let (quads, _) = dst.as_chunks_mut::<4>();
+    for (quad, &[b0, b1, b2]) in quads.iter_mut().zip(whole) {
+        let val = (u32::from(b0) << 16) | (u32::from(b1) << 8) | u32::from(b2);
+        *quad = [
+            encode(val, 18),
+            encode(val, 12),
+            encode(val, 6),
+            encode(val, 0),
+        ];
+    }
+    // Go: the remaining small block of `Encode`, with `=` padding.
+    if let Some(quad) = quads.get_mut(whole.len()) {
+        let val = (u32::from(rest[0]) << 16) | rest.get(1).map_or(0, |&b| u32::from(b) << 8);
+        *quad = [
+            encode(val, 18),
+            encode(val, 12),
+            if rest.len() == 2 {
+                encode(val, 6)
+            } else {
+                b'='
+            },
+            b'=',
+        ];
+    }
+    String::from_utf8(dst).expect("base64 text is ASCII")
+}
+
+#[cfg(test)]
+mod base64_tests {
+    use super::*;
+
+    // Go: encoding/base64/base64_test.go pairs (RFC 3548 examples and the
+    // padding cases), StdEncoding.
+    #[test]
+    fn encode_to_string_matches_go() {
+        for (raw, encoded) in [
+            (&b""[..], ""),
+            (b"f", "Zg=="),
+            (b"fo", "Zm8="),
+            (b"foo", "Zm9v"),
+            (b"foob", "Zm9vYg=="),
+            (b"fooba", "Zm9vYmE="),
+            (b"foobar", "Zm9vYmFy"),
+            (b"\x14\xfb\x9c\x03\xd9\x7e", "FPucA9l+"),
+            (b"\x14\xfb\x9c\x03\xd9", "FPucA9k="),
+            (b"\x14\xfb\x9c\x03", "FPucAw=="),
+        ] {
+            assert_eq!(base64_std_encoding_encode_to_string(raw), encoded);
+            assert_eq!(
+                base64_std_encoding_decode_string(encoded).expect("valid base64"),
+                raw
+            );
         }
     }
-    dst
 }
 
 // Go: encoding/base64/base64.go:429 (*Encoding).DecodeString (StdEncoding)

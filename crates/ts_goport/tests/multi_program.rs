@@ -52,6 +52,11 @@ const WATCH_BUILD_FIXTURE: &str = concat!(
     "/tests/fixtures/multiprog/watch-build"
 );
 
+const WATCH_CONFIG_FIXTURE: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/multiprog/watch-config"
+);
+
 const BUILD_DEDUP_FIXTURE: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/fixtures/multiprog/build-dedup"
@@ -768,6 +773,94 @@ fn watch_build_frees_file_versions() {
         (made, dead),
         (4, 3),
         "each build after the first parses a.ts again; the last a.ts version lives"
+    );
+    fs::remove_dir_all(&root).unwrap_or_else(|error| panic!("remove {}: {error}", root.display()));
+}
+
+/// watchcfg1: config edits that change only emit options, with
+/// `--pretty`. `src/b.ts` (TS2741, with related information into
+/// `src/a.ts`) and `src/c.ts` have errors; `src/a.ts` and `src/d.ts` have
+/// none. The edits: `removeComments` on, a comment line added to `a.ts`
+/// (the related information moves), `newLine: crlf` and `sourceMap` on, a
+/// fix of `b.ts`, and the first config again. Go parses every file again
+/// after a config edit (execute/watcher.go doBuild,
+/// build/orchestrator.go resetCaches); the port keeps the parses of the
+/// files with no errors (`WatchCompilerHost::reuse_parse`,
+/// `BuildHost::keep_watch_sources_for_config_change`). The output (times
+/// and clear-screen codes removed) equals `expected-w.txt`, the output of
+/// `tsgo-oracle-673a5f17d713 -w -p tsconfig.json --pretty` for the same
+/// edits. The outputs equal Go's (`expected-out`): the last edit emits
+/// each file again, with its comments and LF line ends, and the source
+/// maps of the crlf build stay.
+// PORT: no Go counterpart; the output is Go's.
+#[test]
+fn watch_config_edits_of_emit_options_print_like_go() {
+    watch_config_edits(
+        "watch-config",
+        &["--watch", "-p", "tsconfig.json", "--pretty"],
+        "expected-w.txt",
+    );
+}
+
+/// `watch_config_edits_of_emit_options_print_like_go` in `tsc -b --watch`:
+/// the output equals `expected-bw.txt`, the output of
+/// `tsgo-oracle-673a5f17d713 -b -w tsconfig.json --pretty` (a build prints
+/// no error summary), and the outputs equal Go's.
+// PORT: no Go counterpart; the output is Go's.
+#[test]
+fn build_watch_config_edits_of_emit_options_print_like_go() {
+    watch_config_edits(
+        "build-watch-config",
+        &["-b", "--watch", "tsconfig.json", "--pretty"],
+        "expected-bw.txt",
+    );
+}
+
+/// Runs `goport_watch` with `tsc_args` on a copy of the `watch-config`
+/// fixture through its edits, and checks the output against `expected` and
+/// the outputs against `expected-out`.
+fn watch_config_edits(test: &str, tsc_args: &[&str], expected: &str) {
+    let root = scratch_dir(test);
+    // Go `CanWatchDirectory` does not watch `/tmp/<dir>/project`, so a
+    // config edit would start no build there (`watch_frees_file_versions`).
+    let project = root.join("work").join("project");
+    copy_dir(Path::new(WATCH_CONFIG_FIXTURE), &project);
+    let out = root.join("watch.txt");
+    let run = Command::new(env!("CARGO_BIN_EXE_goport_watch"))
+        .arg(&out)
+        .arg("src/a.ts")
+        .args([
+            "tsconfig.json=edits/tsconfig-comments.json",
+            "src/a.ts=edits/a-2.ts",
+            "tsconfig.json=edits/tsconfig-crlf.json",
+            "src/b.ts=edits/b-2.ts",
+            "tsconfig.json=edits/tsconfig.json",
+        ])
+        .arg("--")
+        .args(tsc_args)
+        .env_remove("GOPORT_FREE_FILE_VERSIONS")
+        .current_dir(&project)
+        .output()
+        .expect("run goport_watch");
+    assert!(
+        run.status.success(),
+        "goport_watch failed ({}) in {}:\n{}\n{}",
+        run.status,
+        root.display(),
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(
+        normalize_watch_output(&read(&out)),
+        read(&project.join(expected)),
+        "watch output against tsgo ({})",
+        root.display()
+    );
+    assert_eq!(
+        read_tree(&project.join("out")),
+        read_tree(&project.join("expected-out")),
+        "outputs against tsgo ({})",
+        root.display()
     );
     fs::remove_dir_all(&root).unwrap_or_else(|error| panic!("remove {}: {error}", root.display()));
 }
