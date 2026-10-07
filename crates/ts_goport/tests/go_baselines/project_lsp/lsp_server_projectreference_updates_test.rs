@@ -176,3 +176,98 @@ child_test! {
         assert!(locations.iter().all(|location| location.uri == main_uri));
     }
 }
+
+child_test! {
+    // PORT: not in Go. Go searches each project of a references request with
+    // a query checker of that project's pool (ls/crossproject.go:46
+    // handleCrossProject, project/checkerpool.go:252 getQueryChecker), so
+    // later requests in that project see the state the search left. Here
+    // the search of `description` in the lib project instantiates the
+    // members of `EnumOptions<T>` before semanticTokens resolves the
+    // declared type, so the hover writes the mapped type argument `<T>`
+    // (checker.go:21090 instantiateSymbol, nodebuilderimpl.go:1036
+    // lookupTypeParameterNodes). On a fresh checker the form is
+    // `EnumOptions<T extends object = any>`. The port ran the search on a
+    // search thread with its own checker and showed the fresh form
+    // (lspsweep2 G2, lschk1). The hover text is Go N's
+    // (tsgo-oracle-673a5f17d713, lschk1 repro v9).
+    fn hover_after_cross_project_references_uses_the_searched_checker() {
+        const REG: &str = "import type { ArgsOptions } from '../types';\n\
+            export type Both = ArgsOptions;\n\
+            export interface EnumOptions<T extends object = any> {\n  name: string;\n  description?: string;\n}\n\
+            export function registerEnumType<T extends object = any>(enumRef: T, options?: EnumOptions<T>) {\n  \
+            if (!options || typeof options.name !== 'string') { throw new Error(''); }\n  \
+            return { ref: enumRef, description: options.description };\n}\n";
+        const TYPES: &str =
+            "export type ArgsOptions<T = any> = {\n  name?: string;\n  description?: string;\n};\n";
+        const CONFIG: &str = r#"{"compilerOptions": {"strict": true, "target": "es2020"}, "include": ["#;
+        let client = init_completion_client(
+            "/home/projects",
+            &[
+                ("/home/projects/tsconfig.json", format!(r#"{CONFIG}"types.ts"]}}"#).as_str()),
+                ("/home/projects/types.ts", TYPES),
+                ("/home/projects/lib/tsconfig.json", format!(r#"{CONFIG}"*.ts"]}}"#).as_str()),
+                ("/home/projects/lib/reg.ts", REG),
+            ],
+        );
+        let reg_uri = lsconv::file_name_to_document_uri("/home/projects/lib/reg.ts");
+        let types_uri = lsconv::file_name_to_document_uri("/home/projects/types.ts");
+        for (uri, text) in [(&reg_uri, REG), (&types_uri, TYPES)] {
+            client.send_notification(
+                &lsproto::TEXT_DOCUMENT_DID_OPEN_INFO,
+                lsproto::DidOpenTextDocumentParams {
+                    text_document: Some(lsproto::TextDocumentItem {
+                        uri: uri.clone(),
+                        language_id: lsproto::LanguageKind::TYPE_SCRIPT,
+                        text: text.to_string(),
+                        ..Default::default()
+                    }),
+                },
+            );
+        }
+
+        // References of `description` in types.ts: the lib project includes
+        // types.ts, so the search runs in both projects.
+        let (msg, _) = client.send_request(
+            &lsproto::TEXT_DOCUMENT_REFERENCES_INFO,
+            lsproto::ReferenceParams {
+                text_document: lsproto::TextDocumentIdentifier { uri: types_uri },
+                position: lsproto::Position { line: 2, character: 3 },
+                context: Some(lsproto::ReferenceContext {
+                    include_declaration: true,
+                }),
+                ..Default::default()
+            },
+        );
+        assert!(msg.error.is_none(), "{:?}", msg.error);
+
+        let (msg, _) = client.send_request(
+            &lsproto::TEXT_DOCUMENT_SEMANTIC_TOKENS_FULL_INFO,
+            lsproto::SemanticTokensParams {
+                text_document: lsproto::TextDocumentIdentifier { uri: reg_uri.clone() },
+                ..Default::default()
+            },
+        );
+        assert!(msg.error.is_none(), "{:?}", msg.error);
+
+        // Hover on `description` of `options.description` in lib/reg.ts.
+        let (msg, resp) = client.send_request(
+            &lsproto::TEXT_DOCUMENT_HOVER_INFO,
+            lsproto::HoverParams {
+                text_document: lsproto::TextDocumentIdentifier { uri: reg_uri },
+                position: lsproto::Position { line: 8, character: 50 },
+                ..Default::default()
+            },
+        );
+        assert!(msg.error.is_none(), "{:?}", msg.error);
+        let text = resp
+            .and_then(|resp| resp.hover)
+            .and_then(|hover| hover.contents.markup_content)
+            .expect("hover MarkupContent")
+            .value;
+        assert!(
+            text.contains("(property) EnumOptions<T>.description?: string | undefined"),
+            "{text}"
+        );
+    }
+}

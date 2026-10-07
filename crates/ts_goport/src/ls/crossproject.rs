@@ -11,22 +11,28 @@
 //!   1. open (dispatch thread): the item's language service, Go
 //!      `GetLanguageServiceForProjectWithFile`;
 //!   2. search: `provideSymbolsAndEntries`, the original definition locations
-//!      and `symbolAndEntriesToResp`, with no session call. Item 0 (the
-//!      default project, with the caller's language service and the default
-//!      definition) runs it on the dispatch thread. So does every item of a
-//!      request that passes no `search` function (VS references, incoming
-//!      calls). The other items of references, implementations and rename
-//!      run it on the search thread of their program (`search_thread.rs`),
-//!      in parallel, as Go runs them on goroutines;
+//!      and `symbolAndEntriesToResp`, with no session call. Every item runs
+//!      it on the dispatch thread, with a checker of its project's pool, as
+//!      Go does (the item's language service takes the pool's query checker,
+//!      Go `project/checkerpool.go:252 getQueryChecker`). Later requests in
+//!      that project get the same checker and see the state the search left
+//!      (for example `EnumOptions<T>` against
+//!      `EnumOptions<T extends object = any>` in a hover, Go
+//!      `checker.go:21090 instantiateSymbol`). Go runs the items at the same
+//!      time; here they run one at a time, in Go start order. Each project
+//!      has its own pool, so the order changes no checker's state;
 //!   3. commit (dispatch thread): for each location in search order, Go
 //!      `GetProjectsForFile` and `enqueueItem`; then the response, or the
 //!      first error.
 //!   Items get their number when they leave the queue, and commit strictly
 //!   in that order. So the enqueue calls, `results` (keys, order, winning
 //!   positions) and the first error are those of a serial run in Go start
-//!   order, whatever order the searches end in. An item that runs on the
-//!   dispatch thread opens only after every earlier item committed, so a
-//!   request with no `search` function runs as before, one item at a time.
+//!   order. An item opens only after every earlier item committed.
+//! - A `search` function runs phase 2 of the items other than item 0 on the
+//!   search thread of their program (`search_thread.rs`), in parallel. No
+//!   request passes one now: a search thread has its own checker, so the
+//!   project's pool stays cold and later requests show other type forms
+//!   than Go (lschk1). The code stays until a later change removes it.
 //! - Go `collections.SyncMap.Range` order is random. `results` is an
 //!   `IndexMap` in insertion order. Multi-project result order can differ
 //!   from Go; the oracle compares it without order.
@@ -115,11 +121,12 @@ pub type SymbolAndEntriesToResp<Req, Resp> = fn(
     SymbolEntryTransformOptions,
 ) -> Result<Resp, GoError>;
 
-/// A request whose searches in other projects run on search threads
+/// A request whose searches in other projects can run on search threads
 /// (references, implementations, rename). `to_resp` is the request's Go
 /// `symbolAndEntriesToResp` for any program view.
 /// `search_thread::start_search::<K>` is the `search` argument of
-/// `handle_cross_project` for it.
+/// `handle_cross_project` for it. No request uses it now (see the file
+/// header).
 pub trait CrossProjectSearch: 'static {
     type Req: HasTextDocumentPosition + Clone + Send + 'static;
     type Resp: Clone + Default + Send + 'static;
@@ -142,7 +149,8 @@ pub trait CrossProjectSearch: 'static {
 // `combineResults func(iter.Seq[Resp]) Resp` takes the yielded values as a
 // slice (see the file header). `search` starts phase 2 of an item on a
 // search thread (`search_thread::start_search::<K>`); with `None`, every item
-// runs on the dispatch thread.
+// runs on the dispatch thread with its project's pool checker. Every caller
+// passes `None`, which is Go's model (see the file header).
 #[allow(clippy::too_many_arguments)]
 pub fn handle_cross_project<Req, Resp>(
     default_ls: &LanguageService,

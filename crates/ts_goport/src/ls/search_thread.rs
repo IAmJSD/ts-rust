@@ -22,6 +22,15 @@
 //!   (`HostQuery`). It answers them from the item's language service while it
 //!   waits for the results (`answer_query`).
 //! - No `Rc` value and no checker crosses threads.
+//!
+//! Not used now: every request passes `None` for the `search` argument of
+//! `handle_cross_project` (lschk1). Go searches each project with a query
+//! checker of that project's pool (`project/checkerpool.go:252
+//! getQueryChecker`), so later requests in the project see the checker
+//! state the search left. A search thread has its own checker and leaves the
+//! pool cold, so later hovers and completion details showed other type forms
+//! than Go. A later change can remove this file and the `ProgramView`
+//! generics.
 
 use crate::ls::prelude::*;
 

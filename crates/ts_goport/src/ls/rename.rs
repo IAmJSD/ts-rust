@@ -90,7 +90,7 @@ impl LanguageService {
             params,
             orchestrator,
             LanguageService::symbol_and_entries_to_rename,
-            Some(start_search::<RenameSearch>),
+            None, /*search*/
             combine_rename_response,
             true,  /*isRename*/
             false, /*implementations*/
@@ -331,8 +331,9 @@ impl<P: ProgramView> LanguageService<P> {
     }
 }
 
-/// `ProvideRename` as a `CrossProjectSearch`: its searches in other projects
-/// run on search threads.
+/// `ProvideRename` as a `CrossProjectSearch`, for searches in other projects
+/// on search threads. Not used now: the searches run on each project's pool
+/// checker, as in Go (`crossproject.rs` header).
 pub struct RenameSearch;
 
 impl CrossProjectSearch for RenameSearch {
