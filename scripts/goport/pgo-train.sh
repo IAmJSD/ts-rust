@@ -15,13 +15,14 @@
 # their metadata). Each is a git checkout at a fixed commit (only the dirs that its config reads).
 # Next to it, npm installs the packages that the config reads from the project's node_modules
 # (and every @types package it reads), at the versions of the project's lock file, without
-# install scripts. <dir>/projects/<name>/node_modules links to them.
+# install scripts. <dir>/projects/<name>/node_modules links to them. npm --before gives every
+# other package the newest version of the day the list was made, so each setup gets the same tree.
 #
 # Each project runs `tsc -p <config> --noEmit`; the ones marked emit also run `tsc -p <config>`
 # with --outDir. Output, emit and build info go to <dir>/out, so the runs only read the projects.
-# Exit codes 1 and 2 are expected (some inputs have diagnostics). A run killed by a signal stops
-# the script: it writes no profile, and a release trained on part of the set looks fine but is
-# slower.
+# Exit codes 1 and 2 are expected (some inputs have diagnostics). Any other exit code stops the
+# script: a run killed by a signal writes no profile, and a release trained on part of the set
+# looks fine but is slower.
 #
 # A noembed tsc reads the lib files next to it, so each run copies <tsc> and the lib files to
 # <dir>/bin. Both sides of compare run from that path, so lib paths in the output are equal.
@@ -33,6 +34,8 @@ usage() { sed -n '2,/^set -euo/p' "$0" | sed -e '$d' -e 's/^# \{0,1\}//'; exit 2
 cmd=$1
 dir=$2
 repo="$(cd -- "$(dirname -- "$0")/../.." && pwd)"
+# The day the package lists below were taken (npm --before).
+npm_before=2026-10-07
 
 # projects: one `project` call per project. Each command defines `project` first.
 # project <name> <git url> <commit> <dirs to check out, comma-separated, or .> <config> <check|emit>
@@ -102,7 +105,7 @@ setup() {
     mkdir -p "$deps"
     echo '{ "private": true }' > "$deps/package.json"
     (cd "$deps" && npm install --ignore-scripts --no-audit --no-fund --no-package-lock --legacy-peer-deps \
-      --loglevel=error "$@")
+      --before="$npm_before" --loglevel=error "$@")
     ln -s "$deps/node_modules" "$p/node_modules"
     touch "$deps/.done"
   }
@@ -139,8 +142,8 @@ one() {
   shift 2
   (cd "$dir/projects/$name" && "$dir/bin/tsc" "$@") > "$o.out" 2> "$o.err" || rc=$?
   echo "$rc" > "$o.rc"
-  if ((rc > 128)); then
-    echo "error: tsc was killed (exit $rc) on $name $run: $*" >&2
+  if ((rc > 2)); then
+    echo "error: tsc exited $rc on $name $run: $*" >&2
     tail -5 "$o.err" >&2
     exit 1
   fi

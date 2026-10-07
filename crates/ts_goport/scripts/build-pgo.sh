@@ -153,10 +153,11 @@ if ((profdata_llvm > rustc_llvm)) && [[ "${PGO_ALLOW_LLVM_MISMATCH:-0}" != 1 ]];
 fi
 
 # Use the repository's memory-capped cargo wrapper when it exists.
-cargo_cmd="${PGO_CARGO:-}"
-if [[ -z $cargo_cmd ]]; then
-  cargo_cmd=cargo
-  [[ -x "$repo/scripts/run-cargo-capped.sh" ]] && cargo_cmd="$repo/scripts/run-cargo-capped.sh"
+cargo_cmd=(cargo)
+if [[ -n ${PGO_CARGO:-} ]]; then
+  cargo_cmd=("$PGO_CARGO")
+elif [[ -x "$repo/scripts/run-cargo-capped.sh" ]]; then
+  cargo_cmd=("$repo/scripts/run-cargo-capped.sh")
 fi
 
 profiles="$out/profiles"
@@ -185,7 +186,7 @@ build() { # build <target-subdir> <rustflags>
   echo "== build $1 ($flags)"
   # shellcheck disable=SC2086
   env CARGO_TARGET_DIR="$target" TS_CARGO_SEPARATE_TARGET=1 TS_CARGO_SCCACHE=0 RUSTFLAGS="$flags" \
-    $cargo_cmd build --profile goport --offline --locked -p ts_goport $bin_args $target_args $features \
+    "${cargo_cmd[@]}" build --profile goport --offline --locked -p ts_goport $bin_args $target_args $features \
     > "$out/build-$1.log" 2>&1 || { tail -20 "$out/build-$1.log" >&2; exit 1; }
   # With --target cargo writes the bins to <target>/<triple>/goport. Copy them
   # to <target>/goport, where they are without --target.
