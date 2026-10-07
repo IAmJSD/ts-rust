@@ -50,11 +50,15 @@ pub struct CodeFixContext<'a> {
 
 // Go: ls/codeactions.go:40 CodeAction
 // CodeAction represents a single code action fix
+// PORT: `kind` is Effect patch 011 (Go `Kind lsproto.CodeActionKind`,
+// optional; used by refactors to specify the code action kind). Go "" is
+// `None`.
 #[derive(Clone, Debug, Default)]
 pub struct CodeAction {
     pub description: String,
     pub changes: Vec<lsproto::TextEdit>,
     pub fix_id: String,
+    pub kind: Option<lsproto::CodeActionKind>,
     pub fix_all_description: String,
 }
 
@@ -148,6 +152,13 @@ impl LanguageService {
 
             let mut seen: Vec<CodeAction> = Vec::new(); // sorted for binary search dedup, dedup across all diagnostics and providers so if multiple diags produce the same codefix, only one is returned
 
+            // PORT: the extension's providers only for a program with
+            // extension options (see `crate::ext`).
+            let ext_providers: &[&'static CodeFixProvider] = match crate::ext::get() {
+                Some(ext) if program.options().ext.is_some() => ext.code_fix_providers(),
+                _ => &[],
+            };
+
             for diag in &context.diagnostics {
                 // Go: diag.Code (a nil element panics)
                 let diag = diag
@@ -160,7 +171,12 @@ impl LanguageService {
                     continue;
                 };
 
-                for provider in code_fix_providers() {
+                // Effect patch 011: check all code fix providers (built-in +
+                // the extension's).
+                for provider in code_fix_providers()
+                    .into_iter()
+                    .chain(ext_providers.iter().copied())
+                {
                     if !code_fix_provider_matches_lsp_diagnostic(provider, diag) {
                         continue;
                     }
@@ -213,6 +229,31 @@ impl LanguageService {
                 &fix_id_seen,
             )?;
             actions.extend(fix_all_actions);
+        }
+
+        // Effect patch 011: run refactor providers when the request includes
+        // refactor.* kinds or no filter.
+        // PORT: the extension is the one provider, called only for a program
+        // with extension options (see `crate::ext`).
+        if let Some(ext) = crate::ext::get()
+            && program.options().ext.is_some()
+            && should_run_refactors(params)
+        {
+            for mapped in lsconv::from_lsp_range_for_source_file(
+                &self.converters,
+                file,
+                params.range,
+                Feature::CODE_ACTIONS,
+            ) {
+                let refactor_actions =
+                    ext.refactor_actions(ctx, mapped.script, mapped.span, program, self)?;
+                for action in &refactor_actions {
+                    actions.push(convert_refactor_to_lsp_code_action(
+                        action,
+                        &params.text_document.uri,
+                    ));
+                }
+            }
         }
 
         Ok(lsproto::CommandOrCodeActionArrayOrNull {
@@ -525,6 +566,46 @@ impl LanguageService {
 // containsErrorCode checks if the error code is in the list
 pub fn contains_error_code(codes: &[i32], code: i32) -> bool {
     codes.contains(&code)
+}
+
+// Effect patch 011: shouldRunRefactors returns true when refactor providers
+// should be invoked. Refactors run when no filter is specified or when the
+// filter includes a refactor.* kind.
+fn should_run_refactors(params: &lsproto::CodeActionParams) -> bool {
+    let Some(only) = params.context.as_ref().and_then(|c| c.only.as_ref()) else {
+        return true;
+    };
+    only.iter().any(|kind| kind.0.starts_with("refactor"))
+}
+
+// Effect patch 011: convertRefactorToLSPCodeAction converts a refactor
+// CodeAction to an LSP CommandOrCodeAction.
+fn convert_refactor_to_lsp_code_action(
+    action: &CodeAction,
+    uri: &lsproto::DocumentUri,
+) -> lsproto::CommandOrCodeAction {
+    let kind = action
+        .kind
+        .clone()
+        .unwrap_or(lsproto::CodeActionKind::REFACTOR_REWRITE);
+    let mut changes: IndexMap<lsproto::DocumentUri, Vec<Option<lsproto::TextEdit>>> =
+        IndexMap::new();
+    changes.insert(
+        uri.clone(),
+        action.changes.iter().cloned().map(Some).collect(),
+    );
+    lsproto::CommandOrCodeAction {
+        code_action: Some(lsproto::CodeAction {
+            title: action.description.clone(),
+            kind: Some(kind),
+            edit: Some(lsproto::WorkspaceEdit {
+                changes: Some(changes),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
 }
 
 // Go: ls/codeactions.go:387 convertToLSPCodeAction

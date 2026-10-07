@@ -4624,6 +4624,17 @@ fn get_diagnostics_with_preceding_directives(
             }
             line -= 1;
         }
+        // Effect patch 006: never suppress the extension's own diagnostics
+        // (Effect: the 377xxx range) with @ts-expect-error/@ts-ignore. Effect
+        // has its own directive system (@effect-diagnostics) for suppression.
+        // PORT: only for a program with extension options (see `crate::ext`).
+        if ignore_diagnostic
+            && let Some(ext) = crate::ext::get()
+            && prog().options.ext.is_some()
+            && ext.unsuppressible_code(diagnostic.code)
+        {
+            ignore_diagnostic = false;
+        }
         if !ignore_diagnostic {
             filtered.push(diagnostic);
         }
@@ -4839,6 +4850,13 @@ pub fn get_diagnostics_of_any_program(
                 );
             }
         }
+    }
+    // Effect patch 009 (`FilterDiagnosticsForNoEmitOnErrorCallback`).
+    if skip_no_emit_check_for_dts_diagnostics
+        && options.ext.is_some()
+        && let Some(ext) = crate::ext::get()
+    {
+        all_diagnostics.retain(|diagnostic| ext.blocks_emit_on_error(options, diagnostic));
     }
     all_diagnostics
 }

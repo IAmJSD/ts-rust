@@ -1700,6 +1700,10 @@ pub fn compiler_options_affect_semantic_diagnostics(
     old_options: Option<&CompilerOptions>,
     new_options: Option<&CompilerOptions>,
 ) -> bool {
+    // Effect patch 028: a change of the extension options forces a recheck.
+    if old_options.and_then(|o| o.ext.as_ref()) != new_options.and_then(|o| o.ext.as_ref()) {
+        return true;
+    }
     options_have_changes(old_options, new_options, &|option| {
         option.affects_semantic_diagnostics
     })

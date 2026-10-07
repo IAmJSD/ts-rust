@@ -508,7 +508,11 @@ pub fn new_diagnostic_from_serialized(
 ) -> Diagnostic {
     // Go `Localize` resolves the key with the generated `keyToMessage`, which
     // also knows the messages that are local to this crate.
-    let message = match crate::diag::key_to_message(message_key) {
+    // PORT: Effect patch 008 merges the Effect messages into that table; here
+    // the extension resolves its own keys (see `crate::ext`).
+    let message = match crate::diag::key_to_message(message_key)
+        .or_else(|| crate::ext::get()?.message_by_key(message_key))
+    {
         Some(message) => message,
         None if message_key.is_empty() => NIL_MESSAGE,
         None => unknown_key_message(message_key),

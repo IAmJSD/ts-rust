@@ -36,6 +36,8 @@ pub mod diagnostics_loc;
 pub mod emitter;
 pub mod evaluator;
 pub mod execute;
+// Extension hooks (the Effect-TS/tsgo patch hooks). See `ext.rs`.
+pub mod ext;
 pub mod flags;
 /// The leaked bump arena of a thread (AST and checker arenas).
 pub mod leak_arena;
@@ -77,3 +79,7 @@ pub use goport_util::{fswatch, gostd, jsonrpc};
 pub mod ls;
 pub mod lsp;
 pub mod project;
+
+// The Effect language service (`@effect/tsgo`), behind the `effect` feature.
+#[cfg(feature = "effect")]
+pub mod effect;

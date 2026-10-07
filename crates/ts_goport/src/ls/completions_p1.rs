@@ -65,11 +65,32 @@ impl LanguageService {
             trigger_character,
             false, /*includeSymbols*/
         )?;
-        let mut completion_list = ensure_item_data(
-            file,
-            position,
-            CompletionList::to_lsp(completion_list_internal.as_ref()),
-        );
+        let mut completion_list = CompletionList::to_lsp(completion_list_internal.as_ref());
+        // Effect patch 022: allow the extension to add or modify completion
+        // items (only for a program with extension options, see `crate::ext`).
+        // PORT: Go passes the items and keeps the list when the callback
+        // returns none. Here the callback changes the items in place, so a
+        // callback that removes every item empties the list (Effect only adds).
+        if let Some(ext) = crate::ext::get()
+            && program.options().ext.is_some()
+        {
+            match completion_list.as_mut() {
+                Some(list) => {
+                    ext.after_completion(ctx, file, position, &mut list.items, program, self);
+                }
+                None => {
+                    let mut items = Vec::new();
+                    ext.after_completion(ctx, file, position, &mut items, program, self);
+                    if !items.is_empty() {
+                        completion_list = Some(lsproto::CompletionList {
+                            items,
+                            ..Default::default()
+                        });
+                    }
+                }
+            }
+        }
+        let mut completion_list = ensure_item_data(file, position, completion_list);
         if lsconv::Script::span_map(&file).is_some() {
             self.filter_content_mapped_auto_imports(ctx, program, file, completion_list.as_mut());
         }

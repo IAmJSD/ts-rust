@@ -156,9 +156,21 @@ pub fn emit_and_report_statistics(input: &EmitInput) -> (CompileAndEmitResult, O
         statistics = Some(program_statistics);
     }
 
-    if result.emit_result.emit_skipped && !result.diagnostics.is_empty() {
+    // Effect patch 009 (`FilterDiagnosticsForExitCodeCallback`): the
+    // extension can keep diagnostics out of the exit code.
+    // PORT: Go filters the list and tests its length; `any` gives the same.
+    let options = input.config_options();
+    let has_diagnostics_for_exit_code = match crate::ext::get() {
+        Some(ext) if options.ext.is_some() => result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| ext.counts_for_exit_code(options, diagnostic)),
+        _ => !result.diagnostics.is_empty(),
+    };
+
+    if result.emit_result.emit_skipped && has_diagnostics_for_exit_code {
         result.status = ExitStatus::DiagnosticsPresentOutputsSkipped;
-    } else if !result.diagnostics.is_empty() {
+    } else if has_diagnostics_for_exit_code {
         result.status = ExitStatus::DiagnosticsPresentOutputsGenerated;
     }
     (result, statistics)

@@ -1461,6 +1461,10 @@ pub struct BuildInfo {
     pub file_infos: Option<Vec<BuildInfoFileInfo>>,
     pub file_ids_list: Option<Vec<Vec<BuildInfoFileId>>>,
     pub options: Option<IndexMap<String, CompilerOptionsValue>>,
+    // Effect patch 028 (Go `Effect *etscore.EffectPluginOptions
+    // json:"effect,omitzero"`): the JSON text of the extension options
+    // (`crate::ext`). Go nil is `None`.
+    pub effect: Option<String>,
     pub referenced_map: Option<Vec<BuildInfoReferenceMapEntry>>,
     pub semantic_diagnostics_per_file: Option<Vec<BuildInfoSemanticDiagnostic>>,
     pub emit_diagnostics_per_file: Option<Vec<BuildInfoDiagnosticsOfFilePtr>>,
@@ -1503,6 +1507,9 @@ impl MarshalerTo for BuildInfo {
                 marshal_any(enc, v)?;
             }
             enc.push('}');
+        }
+        if let Some(effect) = &self.effect {
+            w.name("effect").push_str(effect);
         }
         w.slice_omitzero("referencedMap", self.referenced_map.as_ref())?;
         w.slice_omitzero(
@@ -1553,6 +1560,12 @@ impl UnmarshalerFrom for BuildInfo {
                     })?;
                 }
                 "options" => self.options = unmarshal_options(dec)?,
+                "effect" => {
+                    // PORT: Go `null` leaves the pointer nil.
+                    let value = dec.read_value()?;
+                    self.effect =
+                        (value != b"null").then(|| String::from_utf8_lossy(value).into_owned());
+                }
                 "referencedMap" => self.referenced_map = unmarshal_slice(dec, unmarshal_elem)?,
                 "semanticDiagnosticsPerFile" => {
                     self.semantic_diagnostics_per_file = unmarshal_slice(dec, unmarshal_elem)?;
@@ -1660,6 +1673,11 @@ impl BuildInfo {
             }
             parse_compiler_options(option, value.clone(), &mut options);
         }
+        // Effect patch 028: `options.Effect = b.Effect`.
+        options.ext = self
+            .effect
+            .as_deref()
+            .and_then(|effect| crate::ext::get()?.options_from_buildinfo(effect));
         options
     }
 

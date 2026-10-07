@@ -98,6 +98,7 @@ fn get_import_code_actions(
                 description,
                 changes: edits,
                 fix_id: IMPORT_FIX_ID.to_string(),
+                kind: None,
                 fix_all_description: crate::diagnostics_loc::message_localize(
                     diag::Add_all_missing_imports,
                     &locale::from_context(ctx),

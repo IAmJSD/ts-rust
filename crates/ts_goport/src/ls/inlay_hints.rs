@@ -43,12 +43,28 @@ impl LanguageService {
                 preferences: inlay_hint_preferences,
                 quote_preference,
                 file: projection,
-                checker: c,
+                checker: &mut *c,
                 converters: self.converters.clone(),
                 result: Vec::new(),
             };
             inlay_hint_state.visit(projection);
-            result.extend(inlay_hint_state.result);
+            let mut hints = inlay_hint_state.result;
+            // Effect patch 015: allow the extension to filter inlay hints
+            // (only for a program with extension options, see `crate::ext`).
+            if let Some(ext) = crate::ext::get()
+                && program.options().ext.is_some()
+            {
+                ext.after_inlay_hints(
+                    program,
+                    c,
+                    projection,
+                    mapped.span,
+                    &inlay_hint_preferences,
+                    &mut hints,
+                    &self.converters,
+                );
+            }
+            result.extend(hints);
         }
         Ok(lsproto::InlayHintsOrNull {
             inlay_hints: Some(result),

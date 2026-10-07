@@ -636,14 +636,21 @@ const CONTENT_MAPPER_CALL_HIERARCHY_REGISTRATION_ID: &str = "content-mapper-call
 const CONTENT_MAPPER_WILL_RENAME_FILES_REGISTRATION_ID: &str = "content-mapper-will-rename-files";
 
 // Go: server.go:352 supportedCodeActionKinds (ts#63951)
+// PORT: Effect patch 017 adds `refactor.rewrite` after `quickfix`. The LSP
+// oracle compares the initialize answer, so it is listed only when the
+// extension asks (see `crate::ext`).
 pub fn supported_code_action_kinds() -> Vec<lsproto::CodeActionKind> {
-    vec![
+    let mut kinds = vec![
         lsproto::CodeActionKind::QUICK_FIX,
         lsproto::CodeActionKind::SOURCE_ORGANIZE_IMPORTS_TS,
         lsproto::CodeActionKind::SOURCE_REMOVE_UNUSED_IMPORTS_TS,
         lsproto::CodeActionKind::SOURCE_SORT_IMPORTS_TS,
         lsproto::CodeActionKind::SOURCE_FIX_ALL_TS,
-    ]
+    ];
+    if crate::ext::get().is_some_and(|ext| ext.advertises_refactor_rewrite()) {
+        kinds.insert(1, lsproto::CodeActionKind::REFACTOR_REWRITE);
+    }
+    kinds
 }
 
 impl Server {

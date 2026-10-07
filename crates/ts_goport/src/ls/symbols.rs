@@ -28,23 +28,18 @@ impl LanguageService {
         let (_, file) = self.get_program_and_file(document_uri);
         let projections = std::iter::once(file)
             .chain(source_file_supplemental_source_files(file).iter().copied());
-        let mut symbols: Vec<DocSymbol> = Vec::new();
+        let mut symbols: Vec<lsproto::DocumentSymbol> = Vec::new();
         // PORT: Go keys `seen` by an anonymous struct {name, kind, rng}; a tuple
         // here.
         let mut seen: FxHashSet<(String, lsproto::SymbolKind, lsproto::Range)> =
             FxHashSet::default();
         for projection in projections {
             for symbol in self.get_document_symbols_for_children(ctx, projection, projection) {
-                let key = {
-                    let s = symbol.borrow();
-                    (s.name.clone(), s.kind, s.range)
-                };
-                if seen.insert(key) {
+                if seen.insert((symbol.name.clone(), symbol.kind, symbol.range)) {
                     symbols.push(symbol);
                 }
             }
         }
-        let symbols = doc_symbols_to_lsp(&symbols);
         if lsproto::get_client_capabilities(ctx)
             .text_document
             .document_symbol
@@ -72,18 +67,19 @@ impl LanguageService {
         document_uri: &lsproto::DocumentUri,
     ) -> Vec<lsproto::SymbolInformation> {
         // First get hierarchical symbols
-        let doc_symbols =
-            doc_symbols_to_lsp(&self.get_document_symbols_for_children(ctx, file, file));
+        let doc_symbols = self.get_document_symbols_for_children(ctx, file, file);
         flatten_document_symbols(&doc_symbols, document_uri)
     }
 
     // Go: ls/symbols.go:94 getDocumentSymbolsForChildren
+    // PORT: returns the lsproto values of the `DocSymbol` tree (Go
+    // `[]*lsproto.DocumentSymbol`), so the extension hook sees Go's type.
     fn get_document_symbols_for_children(
         &self,
         ctx: &Context,
         node: Node,
         file: Node,
-    ) -> Vec<DocSymbol> {
+    ) -> Vec<lsproto::DocumentSymbol> {
         // PORT: the Go closures (`addSymbolForNode`, `getSymbolsForChildren`,
         // `startNode`, `getSymbolsForNode`, `visit`) and the variables they
         // capture (`symbols`, `expandoTargets`) are `DocumentSymbolsVisitor`.
@@ -95,7 +91,16 @@ impl LanguageService {
             expando_targets: FxHashSet::default(),
         };
         node.for_each_child(|child| visitor.visit(child));
-        merge_expandos(visitor.symbols)
+        let mut symbols = doc_symbols_to_lsp(&merge_expandos(visitor.symbols));
+        // Effect patch 024: allow the extension to augment the symbol tree
+        // (only for a program with extension options, see `crate::ext`).
+        let program = self.get_program();
+        if let Some(ext) = crate::ext::get()
+            && program.options().ext.is_some()
+        {
+            ext.after_document_symbols(ctx, file, &mut symbols, program, self);
+        }
+        symbols
     }
 }
 

@@ -435,6 +435,9 @@ impl MarshalerTo for CompilerOptionsJSON<'_> {
         marshal_tristate_omitzero(enc, first, "singleThreaded", o.single_threaded)?;
         marshal_tristate_omitzero(enc, first, "quiet", o.quiet)?;
         marshal_opt_field(enc, first, "checkers", &o.checkers)?;
+        // PORT: `ext` (Effect patch 007, Go `Effect` with no json tag) is
+        // not written. Go writes `"Effect":null`; ts-rust keeps the plain
+        // tsgo answer.
         write_object_end(enc);
         Ok(())
     }

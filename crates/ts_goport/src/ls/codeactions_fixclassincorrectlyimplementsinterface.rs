@@ -98,6 +98,7 @@ fn get_code_actions_to_fix_class_incorrectly_implements_interface(
             ),
             changes,
             fix_id: FIX_CLASS_INCORRECTLY_IMPLEMENTS_INTERFACE_FIX_ID.to_string(),
+            kind: None,
             fix_all_description: crate::diagnostics_loc::message_localize(
                 diag::Implement_all_unimplemented_interfaces,
                 &locale,

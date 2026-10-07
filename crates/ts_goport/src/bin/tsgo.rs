@@ -45,6 +45,7 @@ use ts_goport::cmd::tsgo::lsp::run_lsp;
 use ts_goport::cmd::tsgo::main::notify_context;
 use ts_goport::execute::execute_tsc::{GoTsc, command_line};
 use ts_goport::execute::tsc::{EXIT_UNPORTED, System, new_os_system};
+use ts_goport::ext;
 use ts_goport::gostd::context;
 use ts_goport::prelude::*;
 
@@ -872,14 +873,31 @@ fn send_code(worker: Worker, code: i32) {
 // PORT: the arguments are the port form of the Go `osutil.Args()` bytes (see
 // `scanner_util::GO_STRING_MARKER`). The system writer writes the Go bytes
 // of the output (`GoOutput`).
+// PORT: Effect patch 001: `crate::effect::install` is the `init()` of the
+// Effect hook packages, and an extension command is Go
+// `case "--effect-cli-diagnostics"`. `--lsp` and `--api` enter their
+// `ext::Mode` (see `ts_goport::ext`).
 fn run_main(start: Instant) -> i32 {
     let args: Vec<String> = ts_goport::frontend::osutil::args()[1..].to_vec();
+    #[cfg(feature = "effect")]
+    ts_goport::effect::install();
 
     if let Some(first) = args.first() {
         match first.as_str() {
-            "--lsp" => return finish(catch_unwind(AssertUnwindSafe(|| run_lsp(&args[1..])))),
-            "--api" => return finish(catch_unwind(AssertUnwindSafe(|| run_api(&args[1..])))),
-            _ => {}
+            "--lsp" => {
+                let _mode = ext::enter_mode(ext::Mode::Lsp);
+                return finish(catch_unwind(AssertUnwindSafe(|| run_lsp(&args[1..]))));
+            }
+            "--api" => {
+                let _mode = ext::enter_mode(ext::Mode::Api);
+                return finish(catch_unwind(AssertUnwindSafe(|| run_api(&args[1..]))));
+            }
+            name => {
+                if let Some(command) = ext::get().and_then(|ext| ext.command(name)) {
+                    let rest = args[1..].to_vec();
+                    return finish(catch_unwind(AssertUnwindSafe(|| command(rest))));
+                }
+            }
         }
     }
 

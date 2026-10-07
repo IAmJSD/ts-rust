@@ -279,6 +279,7 @@ fn try_code_action(
         description,
         changes: file_changes,
         fix_id: FIX_MISSING_TYPE_ANNOTATION_ON_EXPORTS_FIX_ID.to_string(),
+        kind: None,
         fix_all_description: crate::diagnostics_loc::message_localize(
             diag::Add_all_missing_type_annotations,
             &locale::from_context(ctx),

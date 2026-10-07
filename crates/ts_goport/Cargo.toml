@@ -47,7 +47,12 @@ same-file = "=1.0.6"
 nix = { version = "=0.31.3", default-features = false, features = ["process", "signal"] }
 
 [features]
-default = ["jemalloc"]
+default = ["jemalloc", "effect"]
+# The Effect language service (src/effect, the port of Effect-TS/tsgo), on by
+# default. It acts only for a project whose tsconfig lists the
+# @effect/language-service plugin; TSGO_EFFECT=off turns it off at run time.
+# crates/ts_wasm builds without default features, so wasm has it off.
+effect = []
 # jemalloc as the global allocator of the goport binaries (default; the
 # shipped build). `--no-default-features` gives glibc malloc with its
 # tunables. See bin/goport.rs `set_malloc_tunables`.

@@ -74,7 +74,7 @@ impl LanguageService {
             };
 
             let vs_capability = caps.vs_supports_visual_studio_extensions;
-            let (quick_info, documentation, vs_documentation, quick_info_runs) = self
+            let (mut quick_info, mut documentation, vs_documentation, quick_info_runs) = self
                 .get_quick_info_and_documentation_for_symbol(
                     c,
                     symbol,
@@ -83,6 +83,28 @@ impl LanguageService {
                     Some(&vc),
                     vs_capability,
                 );
+
+            // Effect patch 012: allow the extension to enrich hover responses
+            // (only for a program with extension options, see `crate::ext`).
+            let mut range_node = range_node;
+            if let Some(ext) = crate::ext::get()
+                && program.options().ext.is_some()
+            {
+                let is_markdown = content_format == lsproto::MarkupKind::MARKDOWN;
+                if let Some(hook_range_node) = ext.after_quick_info(
+                    program,
+                    c,
+                    file,
+                    range_node,
+                    symbol,
+                    &mut quick_info,
+                    &mut documentation,
+                    is_markdown,
+                ) {
+                    range_node = hook_range_node;
+                }
+            }
+
             if quick_info.is_empty() {
                 continue;
             }

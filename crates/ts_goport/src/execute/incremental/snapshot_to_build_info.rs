@@ -34,6 +34,12 @@ pub fn snapshot_to_build_info(
     let build_info = BuildInfo {
         version: version().to_string(),
         content_mapper_identities,
+        // Effect patch 028: `Effect: snapshot.options.Effect`.
+        effect: snapshot
+            .options
+            .ext
+            .as_ref()
+            .and_then(|options| crate::ext::get()?.buildinfo_options(options)),
         ..BuildInfo::default()
     };
     let mut to = ToBuildInfo {

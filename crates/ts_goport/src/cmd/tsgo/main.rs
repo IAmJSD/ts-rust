@@ -28,12 +28,32 @@ use std::sync::{Arc, LazyLock};
 // (`gostd::stack::max_stack_size`).
 // PORT: Go `signal.NotifyContext` before `execute.CommandLine` is in
 // `bin/tsgo.rs`, which runs that path; the goport compile path has none.
+// PORT: Effect patch 001: `crate::effect::install` is the `init()` of the
+// Effect hook packages, and an extension command is Go
+// `case "--effect-cli-diagnostics"`. `--lsp` and `--api` enter their
+// `ext::Mode` (see `crate::ext`).
 pub fn run_main(args: &[String]) -> Option<i32> {
+    #[cfg(feature = "effect")]
+    crate::effect::install();
     if !args.is_empty() {
         match args[0].as_str() {
-            "--lsp" => return Some(run_on_big_stack(args[1..].to_vec(), |args| run_lsp(&args))),
-            "--api" => return Some(run_on_big_stack(args[1..].to_vec(), |args| run_api(&args))),
-            _ => {}
+            "--lsp" => {
+                return Some(run_on_big_stack(args[1..].to_vec(), |args| {
+                    let _mode = crate::ext::enter_mode(crate::ext::Mode::Lsp);
+                    run_lsp(&args)
+                }));
+            }
+            "--api" => {
+                return Some(run_on_big_stack(args[1..].to_vec(), |args| {
+                    let _mode = crate::ext::enter_mode(crate::ext::Mode::Api);
+                    run_api(&args)
+                }));
+            }
+            name => {
+                if let Some(command) = crate::ext::get().and_then(|ext| ext.command(name)) {
+                    return Some(run_on_big_stack(args[1..].to_vec(), command));
+                }
+            }
         }
     }
     None

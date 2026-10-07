@@ -186,6 +186,9 @@ pub fn command_line(
     command_line_args: &[String],
     hooks: &dyn TscCompilationHooks,
 ) -> CommandLineResult {
+    // Effect patch 009: `restore := etscore.EnterCommandLineMode(); defer restore()`.
+    let _mode = crate::ext::enter_mode(crate::ext::Mode::CommandLine);
+
     if let Some(first) = command_line_args.first() {
         match first.to_lowercase().as_str() {
             "-b" | "--b" | "-build" | "--build" => {

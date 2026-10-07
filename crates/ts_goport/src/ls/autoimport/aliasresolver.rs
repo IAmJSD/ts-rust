@@ -671,6 +671,12 @@ impl AliasResolver {
         false
     }
 
+    // Effect patch 018: IsSourceFileFromExternalLibrary implements
+    // checker.Program.
+    pub fn is_source_file_from_external_library(&self, file: Node) -> bool {
+        false
+    }
+
     // Go: ls/autoimport/aliasresolver.go:228 IsSourceFromProjectReference
     // IsSourceFromProjectReference implements checker.Program.
     pub fn is_source_from_project_reference(&self, path: &tspath::Path) -> bool {

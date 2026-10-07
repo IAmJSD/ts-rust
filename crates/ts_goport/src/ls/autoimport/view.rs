@@ -31,12 +31,15 @@ use std::cell::Cell;
 // `IndexMap<K, Vec<V>>` behind an `Rc` (Go returns the pointer). The lazy
 // Go fields (`allowedEndings`, `existingImports`, `shouldUseRequireForFixes`)
 // are `RefCell<Option<..>>` / `Cell<Option<bool>>` (`None` is Go nil).
+// PORT: `fix_transformer` is Effect patch 027 (Go `fixTransformer
+// FixTransformer`, nil is `None`).
 pub struct View {
     pub registry: Rc<Registry>,
     pub importing_file: Node,
     pub importing_file_path: tspath::Path,
     pub program: Rc<compiler::NewProgram>,
     pub preferences: modulespecifiers::UserPreferences,
+    pub fix_transformer: Option<crate::ext::FixTransformer>,
     pub project_id: ProjectID,
 
     pub allowed_endings: RefCell<Option<Vec<modulespecifiers::ModuleSpecifierEnding>>>,
@@ -84,6 +87,14 @@ pub fn new_view(
     .collect();
     let should_use_uri_style_node_core_modules =
         lsutil::should_use_uri_style_node_core_modules(importing_file, &program);
+    // Effect patch 027: the extension's fix transformer for this view (only
+    // for a program with extension options, see `crate::ext`).
+    let fix_transformer = match crate::ext::get() {
+        Some(ext) if program.options().ext.is_some() => {
+            ext.auto_import_fix_transformer(&preferences, &program, importing_file)
+        }
+        _ => None,
+    };
     View {
         registry,
         importing_file,
@@ -91,6 +102,7 @@ pub fn new_view(
         program,
         project_id,
         preferences,
+        fix_transformer,
         conditions,
         should_use_uri_style_node_core_modules,
         allowed_endings: RefCell::new(None),

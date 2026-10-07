@@ -797,6 +797,9 @@ pub struct Checker {
     pub id: u32,
     pub program: &'static GoProgram,
     pub compiler_options: &'static CompilerOptions,
+    /// Effect patch 023 (Go `EffectLinks any`): per-checker data of the
+    /// extension (`crate::ext`). Go nil is `None`.
+    pub ext_links: Option<Box<dyn std::any::Any>>,
     pub files: Vec<Node>,
     pub file_index_map: FxHashMap<Node, i32>,
     pub compare_symbols: CompareSymbolsFn,
@@ -1294,6 +1297,7 @@ impl Checker {
             id: u32::try_from(checker_index + 1).expect("checker id overflow"),
             program,
             compiler_options,
+            ext_links: None,
             files,
             file_index_map,
             compare_symbols: nil_compare_symbols_fn(),

@@ -281,6 +281,12 @@ pub struct CompilerOptions {
     pub single_threaded: Tristate,
     pub quiet: Tristate,
     pub checkers: Option<i64>,
+
+    /// Effect patch 007 (Go `Effect *etscore.EffectPluginOptions`): the
+    /// options that the extension (`crate::ext`) parsed from `plugins`. Go
+    /// nil is `None`. It has no JSON form (`options_json.rs`), and
+    /// `merge_compiler_options` leaves it to the extension.
+    pub ext: Option<crate::ext::ExtOptions>,
 }
 
 static EMPTY_COMPILER_OPTIONS: std::sync::OnceLock<CompilerOptions> = std::sync::OnceLock::new();

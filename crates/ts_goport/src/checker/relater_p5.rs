@@ -1778,6 +1778,26 @@ impl Checker {
         source: TypeId,
         target: TypeId,
     ) {
+        // Effect patch 004: collect the relation error for the extension, only
+        // for options with extension options (see `crate::ext`).
+        let error_node = r.borrow().error_node;
+        if error_node.is_some()
+            && self.compiler_options.ext.is_some()
+            && crate::ext::get().is_some()
+        {
+            let sf = get_source_file_of_node(error_node);
+            if sf.is_some() {
+                self.source_file_links
+                    .get(sf)
+                    .relation_errors
+                    .push(RelationError {
+                        source,
+                        target,
+                        error_node,
+                    });
+            }
+        }
+
         let (source_type, target_type) = self.get_type_names_for_error_display(source, target);
         let mut generalized_source = source;
         let mut generalized_source_type = source_type.clone();

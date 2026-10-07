@@ -679,7 +679,18 @@ pub struct AssertionLinks {
 
 // SourceFile links
 
+// Effect patch 005: RelationError captures a type relation error for Effect
+// diagnostics processing (see `crate::ext`).
+#[derive(Clone, Copy, Debug)]
+pub struct RelationError {
+    pub source: TypeId,
+    pub target: TypeId,
+    pub error_node: Node,
+}
+
 // Go: checker/types.go:409 SourceFileLinks
+// PORT: `relation_errors` is Effect patch 005. They are collected during type
+// checking only for options with extension options (`crate::ext`).
 #[derive(Clone, Debug, Default)]
 pub struct SourceFileLinks {
     pub type_checked: bool,
@@ -693,6 +704,7 @@ pub struct SourceFileLinks {
     pub local_jsx_factory: Node,
     pub local_jsx_fragment_factory: Node,
     pub jsx_fragment_type: TypeId,
+    pub relation_errors: Vec<RelationError>,
 }
 
 // Signature specific links

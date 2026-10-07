@@ -467,6 +467,8 @@ pub fn parse_config(
                     &mut result.options,
                     extended_config.options.as_ref(),
                     raw_as_map(extends_raw),
+                    extended_config_path,
+                    &base_path,
                 );
             }
         }
@@ -518,6 +520,8 @@ pub fn parse_config(
             &mut result.options,
             own_options.as_ref(),
             raw_as_map(&own_config.raw),
+            config_file_name,
+            &base_path,
         );
         own_config.options = Some(result.options);
     }
@@ -714,7 +718,13 @@ pub fn parse_json_config_file_content_worker(
         extended_config_cache,
     );
     if let Some(options) = parsed_config.options.as_mut() {
-        merge_compiler_options(options, existing_options, existing_options_raw);
+        merge_compiler_options(
+            options,
+            existing_options,
+            existing_options_raw,
+            config_file_name,
+            base_path,
+        );
     }
     handle_option_config_dir_template_substitution(
         parsed_config.options.as_mut(),
@@ -1053,6 +1063,15 @@ pub fn parse_json_config_file_content_worker(
             .iter()
             .flat_map(|mapper| mapper.definition.extensions.iter().cloned())
             .collect();
+    }
+
+    // Effect patch 030 (`ValidateCompilerOptionsCallback`): validate the final
+    // options, only for options with extension options (see `crate::ext`).
+    if let Some(ext) = crate::ext::get()
+        && let Some(options) = parsed_config.options.as_ref()
+        && options.ext.is_some()
+    {
+        errors.extend(ext.validate_options(options, tsconfig_to_source_file(source_file.as_ref())));
     }
 
     // Go: getFileNames(basePathForFileNames)

@@ -460,6 +460,9 @@ fn parse_compiler_options_worker(
         "noResolve" => all_options.no_resolve = parse_tristate(value),
         "paths" => all_options.paths = parse_string_map(value),
         "plugins" => {
+            // Effect patch 013: parse the extension's plugin configuration
+            // (see `crate::ext`).
+            all_options.ext = crate::ext::get().and_then(|ext| ext.parse_plugins(value));
             // Native TypeScript does not load plugins; retain them only so tools can report the incompatibility.
             // PORT: Go `core.Map` keeps a nil `[]any` (`NilList`) nil.
             if let CompilerOptionsValue::NilList = value {
@@ -678,10 +681,15 @@ pub fn parse_type_acquisition(
 // hold to have an effect, so it is `Option<&IndexMap>`. The Go merge
 // copies the `Paths` pointer, so a later in-place change of `paths` also
 // changes the source options; the Rust clone does not share it.
+// PORT: `source_config_path` and `base_path` are Effect patches 013 and
+// 025, for the extension's merge. The field list below has no `ext`: Go skips
+// the `Effect` field in its reflect merge.
 pub fn merge_compiler_options<'a>(
     target_options: &'a mut CompilerOptions,
     source_options: Option<&CompilerOptions>,
     raw_source: Option<&IndexMap<String, CompilerOptionsValue>>,
+    source_config_path: &str,
+    base_path: &str,
 ) -> &'a mut CompilerOptions {
     let Some(source_options) = source_options else {
         return target_options;
@@ -856,6 +864,20 @@ pub fn merge_compiler_options<'a>(
         checkers => "checkers",
     }
 
+    // Effect patch 013 (`MergeCompilerOptionsCallback`), only for source
+    // options with extension options (see `crate::ext`).
+    if source_options.ext.is_some()
+        && let Some(ext) = crate::ext::get()
+    {
+        ext.merge_options(
+            target_options,
+            source_options,
+            raw_source,
+            source_config_path,
+            base_path,
+        );
+    }
+
     target_options
 }
 
@@ -956,7 +978,7 @@ mod tests {
         let empty = CompilerOptionsValue::List(Vec::new());
         parse_compiler_options_worker("customConditions", &empty, &mut source);
         parse_compiler_options_worker("types", &empty, &mut source);
-        merge_compiler_options(&mut target, Some(&source), None);
+        merge_compiler_options(&mut target, Some(&source), None, "", "");
         assert_eq!(target.custom_conditions, Some(Vec::new()));
         assert_eq!(target.types, Some(Vec::new()));
         assert_eq!(target.root_dirs, None);
@@ -1005,7 +1027,7 @@ mod tests {
             types: Some(vec!["node".to_string()]),
             ..Default::default()
         };
-        merge_compiler_options(&mut target, Some(&source), None);
+        merge_compiler_options(&mut target, Some(&source), None, "", "");
         assert_eq!(target.types, Some(vec!["node".to_string()]));
     }
 }

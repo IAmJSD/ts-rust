@@ -511,6 +511,43 @@ impl Checker {
         self.is_context_sensitive(node)
     }
 
+    // Effect patch 003: GetTypeArgumentsForResolvedSignature returns the
+    // instantiated type arguments for a resolved (non-generic) signature.
+    // Returns nil if the signature has no mapper.
+    // PORT: Go nil is an empty `Vec`.
+    pub fn get_type_arguments_for_resolved_signature(&mut self, sig: SignatureId) -> Vec<TypeId> {
+        if sig.is_nil() || self.sig(sig).mapper.is_nil() {
+            return Vec::new();
+        }
+        let target = self.sig(sig).target;
+        let type_params = if target.is_some() {
+            self.sig(target).type_parameters.clone()
+        } else {
+            self.sig(sig).type_parameters.clone()
+        };
+        if type_params.is_empty() {
+            return Vec::new();
+        }
+        let mapper = self.sig(sig).mapper;
+        self.instantiate_types(&type_params, mapper)
+    }
+
+    // Effect patch 002: GetRelationErrors returns the collected relation errors
+    // for a source file. These are collected during type checking and persist
+    // until the file is re-checked.
+    // PORT: a copy of the list. They are collected only for options with
+    // extension options (`crate::ext`).
+    pub fn get_relation_errors(
+        &mut self,
+        ctx: &crate::gostd::Context,
+        sf: Node,
+    ) -> Vec<RelationError> {
+        if !self.source_file_links.get(sf).type_checked {
+            self.get_diagnostics(ctx, sf, false);
+        }
+        self.source_file_links.get(sf).relation_errors.clone()
+    }
+
     // Go: checker/exports.go:354 FillMissingTypeArguments
     pub fn fill_missing_type_arguments_exported(
         &mut self,
