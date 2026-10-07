@@ -441,7 +441,7 @@ impl FilesParser {
         let outer = set_depth_log(Some(Arc::default()));
         self.load_files(loader, tasks);
         let log = set_depth_log(outer);
-        self.set_parallel_depths(tasks, log);
+        self.set_parallel_depths(loader, tasks, log);
     }
 
     /// Go `parse`: queues the root tasks and runs the queue, with parse
@@ -824,9 +824,8 @@ impl FilesParser {
                 } else {
                     let mut edges = Vec::with_capacity(sub_tasks.len());
                     self.start_tasks(loader, &sub_tasks, lowest_depth, Some(&mut edges));
-                    let mut task = task_by_file_name.borrow_mut();
-                    let depth_edges = DepthEdges::of(loader, &task, edges);
-                    task.depth_edges = Some(Box::new(depth_edges));
+                    task_by_file_name.borrow_mut().depth_edges =
+                        Some(Box::new(DepthEdges { edges }));
                 }
             } else if relower
                 && !self.single_threaded
@@ -866,11 +865,16 @@ impl FilesParser {
     // longer when many arrivals are pending). Ties go to the first queued.
     // When the replay needs a task that the load did not load or queue,
     // the depths of the load stay.
-    fn set_parallel_depths(&mut self, roots: &[ParseTaskRef], log: Option<Arc<DepthLog>>) {
+    fn set_parallel_depths(
+        &mut self,
+        loader: &FileLoader,
+        roots: &[ParseTaskRef],
+        log: Option<Arc<DepthLog>>,
+    ) {
         if !self.depth_order_matters(roots) {
             return;
         }
-        let Some(replay) = DepthReplay::run(self, roots, log) else {
+        let Some(replay) = DepthReplay::run(self, loader, roots, log) else {
             return;
         };
         for (data, state) in replay.datas.iter().zip(&replay.states) {
@@ -1504,118 +1508,110 @@ const REPLAY_BUSY_FROM: usize = 32;
 const REPLAY_ROOT_STEP: u64 = 1_000 * REPLAY_NS;
 
 /// A task whose subtasks started in a parallel load, for the depth replay.
+// The replay data of the task's load (`ReplayLoad`) is made only when the
+// replay runs, from the file, metadata and resolutions that the task keeps:
+// most loads need no replay (`FilesParser::depth_order_matters`).
 pub(crate) struct DepthEdges {
+    /// One per subtask, in order.
+    edges: Vec<DepthEdge>,
+}
+
+/// The replay data of the load of a task (`ReplayLoad::set`).
+#[derive(Default)]
+struct ReplayLoad {
     /// The parse time of the task's file.
     parse: u64,
     /// The package.json lookups of the package scope walk for the file's
     /// metadata (`package_json_id`). Empty for a lib file or a task with no
     /// file.
-    walk: Box<[u64]>,
+    walk: Vec<u64>,
     /// The module and type reference resolutions of the file.
-    resolutions: Box<[ReplayResolution]>,
-    /// One per subtask, in order.
-    edges: Vec<DepthEdge>,
+    resolutions: Vec<ReplayResolution>,
 }
 
-impl DepthEdges {
-    /// The replay data of `task`, whose load ended, with its subtask edges.
-    /// It is made now, while the task's data is in the CPU caches.
-    fn of(loader: &FileLoader, task: &ParseTask, edges: Vec<DepthEdge>) -> Self {
-        let parse = task.file.as_ref().map_or(0, |file| {
+impl ReplayLoad {
+    /// Sets this to the replay data of `task`, whose load ended. Keeps the
+    /// buffers.
+    fn set(&mut self, loader: &FileLoader, task: &ParseTask) {
+        self.parse = task.file.as_ref().map_or(0, |file| {
             REPLAY_NODE * file.node_count as u64 + REPLAY_BYTE * file.text.len() as u64
         });
         let directory = get_directory_path(&task.normalized_file_path);
         let ancestors = replay_ancestors(&directory);
         let directory_id = ancestors
             .last()
-            .map_or(REPLAY_HASH_START, |&(_, hash)| hash);
-        let mut resolutions = Vec::with_capacity(
-            task.type_resolutions_in_file.len() + task.resolutions_in_file.len(),
-        );
-        replay_resolutions(loader, task, &directory, directory_id, &mut resolutions);
-        DepthEdges {
-            parse,
-            walk: replay_walk(loader, task, &directory, &ancestors),
-            resolutions: resolutions.into_boxed_slice(),
-            edges,
-        }
+            .map_or_else(|| replay_directory_id(""), |&(_, id)| id);
+        self.walk.clear();
+        replay_walk(loader, task, &directory, &ancestors, &mut self.walk);
+        self.resolutions.clear();
+        replay_resolutions(loader, task, directory_id, &mut self.resolutions);
     }
 }
 
-/// FNV-1a of `bytes`, continued from `hash` (`REPLAY_HASH_START` for a new
-/// one). The id of a directory is the hash of its path, so one pass over a
-/// path gives the ids of all its ancestors (`replay_walk`).
-const REPLAY_HASH_START: u64 = 0xcbf2_9ce4_8422_2325;
-
-fn replay_hash(hash: u64, bytes: &[u8]) -> u64 {
-    bytes.iter().fold(hash, |hash, &byte| {
-        (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
-    })
+/// The id of `directory` in the depth log and the replay: the hash of its
+/// path.
+fn replay_directory_id(directory: &str) -> u64 {
+    use std::hash::BuildHasher;
+    rustc_hash::FxBuildHasher.hash_one(directory)
 }
 
-/// The id of the package.json in `directory` in the depth log: the hash of
-/// the directory, with bit 0 set when the file exists.
-fn package_json_id(directory_hash: u64, exists: bool) -> u64 {
-    directory_hash & !1 | u64::from(exists)
+/// The id of the package.json in the directory with id `directory_id` in
+/// the depth log: the directory id, with bit 0 set when the file exists.
+fn package_json_id(directory_id: u64, exists: bool) -> u64 {
+    directory_id & !1 | u64::from(exists)
 }
 
-/// The package.json lookups of Go `loadSourceFileMetaData` for the file of
-/// `task` in `directory` (with its `replay_ancestors`): the package scope walk from the directory up to
-/// the directory of its package.json (`SourceFileMetaData::
+/// Adds to `out` the package.json lookups of Go `loadSourceFileMetaData`
+/// for the file of `task` in `directory`, whose `replay_ancestors` are
+/// `ancestors`: the package scope walk from the directory up to the
+/// directory of its package.json (`SourceFileMetaData::
 /// package_json_directory`), or to the root or the global cache.
 fn replay_walk(
     loader: &FileLoader,
     task: &ParseTask,
     directory: &str,
     ancestors: &[(usize, u64)],
-) -> Box<[u64]> {
+    out: &mut Vec<u64>,
+) {
     if task.file.is_none() || task.lib_file.is_some() || loader.opts.skip_module_resolution {
-        return Box::default();
+        return;
     }
-    let mut walk: smallvec::SmallVec<[u64; 16]> = smallvec::SmallVec::new();
     let found = task.metadata.package_json_directory.len();
     let global_cache = &loader.opts.typings_location;
-    for &(length, hash) in ancestors.iter().rev() {
+    for &(length, id) in ancestors.iter().rev() {
         let exists = found > 0 && length == found;
-        walk.push(package_json_id(hash, exists));
+        out.push(package_json_id(id, exists));
         if exists || directory[..length] == **global_cache {
             break;
         }
     }
-    Box::from(&walk[..])
 }
 
 /// The directory `directory` and its ancestors (Go
 /// `ForEachAncestorDirectory`), the root first: the prefixes of the path
 /// that end before a '/', the root "/", and the path. Each is (length,
-/// hash of the prefix).
+/// `replay_directory_id` of the prefix).
 fn replay_ancestors(directory: &str) -> smallvec::SmallVec<[(usize, u64); 16]> {
-    let bytes = directory.as_bytes();
     let mut ancestors = smallvec::SmallVec::new();
-    let mut hash = REPLAY_HASH_START;
-    for (i, &byte) in bytes.iter().enumerate() {
-        if byte == b'/' && i > 0 {
-            ancestors.push((i, hash));
-        }
-        hash = replay_hash(hash, &[byte]);
-        if byte == b'/' && i == 0 {
-            ancestors.push((1, hash));
+    for (i, byte) in directory.bytes().enumerate() {
+        if byte == b'/' {
+            let length = i.max(1);
+            ancestors.push((length, replay_directory_id(&directory[..length])));
         }
     }
     if ancestors
         .last()
-        .is_none_or(|&(length, _)| length < bytes.len())
+        .is_none_or(|&(length, _)| length < directory.len())
     {
-        ancestors.push((bytes.len(), hash));
+        ancestors.push((directory.len(), replay_directory_id(directory)));
     }
     ancestors
 }
 
 /// Adds to `out` the module and type reference resolutions of the file of
-/// `task` in `directory` (whose id is `directory_id`), one per name and
-/// mode: its type reference
-/// directives, then its imports and module augmentations, as Go resolves
-/// them (`resolve_type_reference_directives`,
+/// `task`, whose directory has the id `directory_id`, one per name and
+/// mode: its type reference directives, then its imports and module
+/// augmentations, as Go resolves them (`resolve_type_reference_directives`,
 /// `resolve_imports_and_module_augmentations`). In each group they come in
 /// the order of the cache, not of the file, because reading the import
 /// names of a parse costs more than the replay. The time of a load does not
@@ -1623,7 +1619,6 @@ fn replay_ancestors(directory: &str) -> smallvec::SmallVec<[(usize, u64); 16]> {
 fn replay_resolutions(
     loader: &FileLoader,
     task: &ParseTask,
-    directory: &str,
     directory_id: u64,
     out: &mut Vec<ReplayResolution>,
 ) {
@@ -1656,10 +1651,7 @@ fn replay_resolutions(
     let containing_directory = if containing_file == task.normalized_file_path {
         directory_id
     } else {
-        replay_hash(
-            REPLAY_HASH_START,
-            get_directory_path(containing_file).as_bytes(),
-        )
+        replay_directory_id(&get_directory_path(containing_file))
     };
     let key = ReplayKey {
         type_reference: true,
@@ -1794,43 +1786,49 @@ impl DepthKey<'_> {
 /// here when its log ends (`set_depth_log`).
 #[derive(Default)]
 pub(crate) struct DepthLog {
-    found: Mutex<DepthLookupsFound>,
+    /// What each thread found, in the order in which their logs ended.
+    found: Mutex<Vec<DepthLookupsFound>>,
 }
 
-/// The lookups of a load, or of one thread of it.
+/// The lookups of one thread of a load. They are only appended: the
+/// replay makes its maps of them, and most loads need no replay.
 #[derive(Default)]
 struct DepthLookupsFound {
-    /// The lookups of each resolution by its key (`DepthKey::id`). A key
-    /// keeps the lookups of its first resolution: they do not depend on the
-    /// thread or on the state of the caches.
-    resolutions: FxHashMap<u64, DepthLookups>,
-    /// The text length of each package.json that a resolver read, by its
-    /// id with no exists bit.
-    package_json_sizes: FxHashMap<u64, u32>,
-}
-
-impl DepthLookupsFound {
-    fn add(&mut self, other: DepthLookupsFound) {
-        for (key, lookups) in other.resolutions {
-            self.resolutions.entry(key).or_insert(lookups);
-        }
-        for (id, size) in other.package_json_sizes {
-            self.package_json_sizes.entry(id).or_insert(size);
-        }
-    }
+    /// The resolutions that ran, in order, with their key (`DepthKey::id`).
+    /// The replay keeps the first of a key (`ReplayCaches::of`): its
+    /// lookups do not depend on the thread or on the state of the caches.
+    resolutions: Vec<(u64, DepthLookups)>,
+    /// The package.json lookups of `resolutions` (`DepthLookups::
+    /// package_jsons`).
+    package_jsons: Vec<u64>,
+    /// The text length of each package.json that a resolver read, with its
+    /// id with no exists bit, in read order.
+    package_json_sizes: Vec<(u64, u32)>,
 }
 
 /// The lookups of one resolution: those that Go's trace of it lists.
-#[derive(Default)]
+#[derive(Clone, Copy, Default)]
 struct DepthLookups {
     /// File probes that found no file, and that found the file.
-    missing: u64,
-    found: u64,
-    /// The package.json lookups in a directory that exists, in order
-    /// (`package_json_id`), except those of the package scope walk from the
-    /// containing directory: the walk for the file's metadata made them, so
-    /// Go's cache knows them.
-    package_jsons: smallvec::SmallVec<[u64; 2]>,
+    missing: u32,
+    found: u32,
+    /// The range of its package.json lookups in a list of them
+    /// (`DepthLookupsFound::package_jsons`, `ReplayCaches::
+    /// package_json_lookups`). They are the lookups in a directory that
+    /// exists, in order (`package_json_id`), except those of the package
+    /// scope walk from the containing directory: the walk for the file's
+    /// metadata made them, so Go's cache knows them.
+    package_jsons: (u32, u32),
+}
+
+/// A resolution that runs on a thread with a depth log.
+#[derive(Default)]
+struct DepthOpen {
+    missing: u32,
+    found: u32,
+    package_jsons: Vec<u64>,
+    /// The containing directory of the resolution.
+    directory: String,
 }
 
 /// The depth log of a thread: what it found, and the resolutions that run
@@ -1838,12 +1836,12 @@ struct DepthLookups {
 struct DepthLogThread {
     log: Arc<DepthLog>,
     found: DepthLookupsFound,
-    /// The resolutions that run now, with their containing directory: the
-    /// first `open` entries. The others keep their buffers for the next.
-    stack: Vec<(DepthLookups, String)>,
+    /// The resolutions that run now: the first `open` entries. The others
+    /// keep their buffers for the next.
+    stack: Vec<DepthOpen>,
     open: usize,
     /// The last containing directory of `depth_note_resolution_end`, and
-    /// its id (`replay_hash`).
+    /// its id (`replay_directory_id`).
     directory: String,
     directory_id: u64,
 }
@@ -1864,7 +1862,7 @@ fn set_depth_log(log: Option<Arc<DepthLog>>) -> Option<Arc<DepthLog>> {
         directory_id: 0,
     });
     let old = DEPTH_LOG.with(|cell| cell.replace(thread))?;
-    lock(&old.log.found).add(old.found);
+    lock(&old.log.found).push(old.found);
     Some(old.log)
 }
 
@@ -1879,14 +1877,14 @@ pub(crate) fn depth_note_resolution_start(containing_directory: &str) {
     DEPTH_LOG.with(|thread| {
         if let Some(thread) = thread.borrow_mut().as_mut() {
             if thread.open == thread.stack.len() {
-                thread.stack.push(Default::default());
+                thread.stack.push(DepthOpen::default());
             }
-            let (lookups, directory) = &mut thread.stack[thread.open];
-            lookups.missing = 0;
-            lookups.found = 0;
-            lookups.package_jsons.clear();
-            directory.clear();
-            directory.push_str(containing_directory);
+            let open = &mut thread.stack[thread.open];
+            open.missing = 0;
+            open.found = 0;
+            open.package_jsons.clear();
+            open.directory.clear();
+            open.directory.push_str(containing_directory);
             thread.open += 1;
         }
     });
@@ -1903,15 +1901,23 @@ pub(crate) fn depth_note_resolution_end(key: DepthKey<'_>) {
             return;
         }
         thread.open -= 1;
-        let lookups = std::mem::take(&mut thread.stack[thread.open].0);
+        let open = &thread.stack[thread.open];
         if thread.directory != key.containing_directory {
             thread.directory.clear();
             thread.directory.push_str(key.containing_directory);
-            thread.directory_id =
-                replay_hash(REPLAY_HASH_START, key.containing_directory.as_bytes());
+            thread.directory_id = replay_directory_id(key.containing_directory);
         }
-        let id = key.id(thread.directory_id);
-        thread.found.resolutions.entry(id).or_insert(lookups);
+        let found = &mut thread.found;
+        let start = found.package_jsons.len() as u32;
+        found.package_jsons.extend_from_slice(&open.package_jsons);
+        let lookups = DepthLookups {
+            missing: open.missing,
+            found: open.found,
+            package_jsons: (start, found.package_jsons.len() as u32),
+        };
+        found
+            .resolutions
+            .push((key.id(thread.directory_id), lookups));
     });
 }
 
@@ -1919,12 +1925,12 @@ pub(crate) fn depth_note_resolution_end(key: DepthKey<'_>) {
 pub(crate) fn depth_note_file_probe(found: bool) {
     DEPTH_LOG.with(|thread| {
         if let Some(thread) = thread.borrow_mut().as_mut()
-            && let Some((lookups, _)) = thread.open.checked_sub(1).map(|i| &mut thread.stack[i])
+            && let Some(open) = thread.open.checked_sub(1).map(|i| &mut thread.stack[i])
         {
             if found {
-                lookups.found += 1;
+                open.found += 1;
             } else {
-                lookups.missing += 1;
+                open.missing += 1;
             }
         }
     });
@@ -1946,25 +1952,27 @@ pub(crate) fn depth_note_package_json(directory: &str, exists: bool, size: Optio
         let Some(thread) = thread.as_mut() else {
             return;
         };
-        let open = thread.open.checked_sub(1).map(|i| &mut thread.stack[i]);
-        // A lookup of the package scope walk from the containing directory
-        // (an ancestor's package.json) is not logged.
-        let scope = open
-            .as_ref()
-            .is_some_and(|(_, containing)| is_ancestor_directory(directory, containing));
-        if scope && size.is_none() {
+        // A resolution logs its lookups, except those of the package scope
+        // walk from its containing directory (an ancestor's package.json).
+        // A lookup outside a resolution is of the walk for a file's
+        // metadata. Each read logs the text length.
+        let open = thread
+            .open
+            .checked_sub(1)
+            .map(|i| &mut thread.stack[i])
+            .filter(|open| !is_ancestor_directory(directory, &open.directory));
+        if open.is_none() && size.is_none() {
             return;
         }
-        let id = package_json_id(replay_hash(REPLAY_HASH_START, directory.as_bytes()), exists);
-        if !scope && let Some((lookups, _)) = open {
-            lookups.package_jsons.push(id);
+        let id = package_json_id(replay_directory_id(directory), exists);
+        if let Some(open) = open {
+            open.package_jsons.push(id);
         }
         if let Some(size) = size {
             thread
                 .found
                 .package_json_sizes
-                .entry(id & !1)
-                .or_insert(u32::try_from(size).unwrap_or(u32::MAX));
+                .push((id & !1, u32::try_from(size).unwrap_or(u32::MAX)));
         }
     });
 }
@@ -1977,6 +1985,9 @@ pub(crate) fn depth_note_package_json(directory: &str, exists: bool, size: Optio
 struct ReplayCaches {
     /// By resolution key: its lookups and the time from which Go knows it.
     resolutions: FxHashMap<u64, ReplayKnown<DepthLookups>>,
+    /// The package.json lookups of `resolutions` (`DepthLookups::
+    /// package_jsons`).
+    package_json_lookups: Vec<u64>,
     /// By package.json id (no exists bit): its text length and the time from
     /// which Go knows it.
     package_jsons: FxHashMap<u64, ReplayKnown<u32>>,
@@ -1985,6 +1996,8 @@ struct ReplayCaches {
     walks: FxHashMap<u64, u64>,
     /// The end of the program's first package.json parse.
     first_parse_end: Option<u64>,
+    /// The buffers of `load`.
+    load: ReplayLoad,
 }
 
 /// A cache entry in replay time: `known` is the end of its first lookup
@@ -2004,36 +2017,45 @@ impl<T> ReplayKnown<T> {
 }
 
 impl ReplayCaches {
+    /// The caches with what the threads of the load found (`log`), the
+    /// first of each key in the order of the threads.
     fn of(log: Option<Arc<DepthLog>>) -> Self {
-        let found = log.map_or_else(Default::default, |log| {
-            std::mem::take(&mut *lock(&log.found))
-        });
-        ReplayCaches {
-            resolutions: found
-                .resolutions
-                .into_iter()
-                .map(|(key, lookups)| (key, ReplayKnown::new(lookups)))
-                .collect(),
-            package_jsons: found
-                .package_json_sizes
-                .into_iter()
-                .map(|(id, size)| (id, ReplayKnown::new(size)))
-                .collect(),
-            walks: FxHashMap::default(),
-            first_parse_end: None,
+        let founds = log.map_or_else(Vec::new, |log| std::mem::take(&mut *lock(&log.found)));
+        let mut caches = ReplayCaches::default();
+        for found in founds {
+            let offset = caches.package_json_lookups.len() as u32;
+            caches.package_json_lookups.extend(found.package_jsons);
+            for (key, lookups) in found.resolutions {
+                caches.resolutions.entry(key).or_insert_with(|| {
+                    let (start, end) = lookups.package_jsons;
+                    ReplayKnown::new(DepthLookups {
+                        package_jsons: (start + offset, end + offset),
+                        ..lookups
+                    })
+                });
+            }
+            for (id, size) in found.package_json_sizes {
+                caches
+                    .package_jsons
+                    .entry(id)
+                    .or_insert_with(|| ReplayKnown::new(size));
+            }
         }
+        caches
     }
 
-    /// The time of the load of `load` that starts at `start`: in Go's
+    /// The time of the load of `task` that starts at `start`: in Go's
     /// order, the fixed time, the package scope walk, the parse, then each
     /// resolution. A walk of a directory whose walk ended costs nothing:
     /// Go's cache knows each of its package.json files.
-    fn load(&mut self, load: &DepthEdges, start: u64) -> u64 {
+    fn load(&mut self, loader: &FileLoader, task: &ParseTask, start: u64) -> u64 {
+        let mut load = std::mem::take(&mut self.load);
+        load.set(loader, task);
         let mut now = start + REPLAY_FILE;
         if let Some(&first) = load.walk.first() {
             let walked = self.walks.entry(first & !1).or_insert(u64::MAX);
             if *walked > now {
-                for &id in &*load.walk {
+                for &id in &load.walk {
                     now += replay_package_json(
                         &mut self.package_jsons,
                         &mut self.first_parse_end,
@@ -2046,9 +2068,10 @@ impl ReplayCaches {
             }
         }
         now += load.parse;
-        for &resolution in &*load.resolutions {
+        for &resolution in &load.resolutions {
             now += self.resolution(resolution, now);
         }
+        self.load = load;
         now - start
     }
 
@@ -2068,10 +2091,12 @@ impl ReplayCaches {
         if resolution.external {
             now += REPLAY_EXTERNAL_RESOLUTION;
         }
-        for &id in &entry.value.package_jsons {
+        let (from, to) = entry.value.package_jsons;
+        for &id in &self.package_json_lookups[from as usize..to as usize] {
             now += replay_package_json(&mut self.package_jsons, &mut self.first_parse_end, id, now);
         }
-        now += REPLAY_MISSING_FILE * entry.value.missing + REPLAY_FOUND_FILE * entry.value.found;
+        now += REPLAY_MISSING_FILE * u64::from(entry.value.missing)
+            + REPLAY_FOUND_FILE * u64::from(entry.value.found);
         entry.known = entry.known.min(now);
         now - start
     }
@@ -2159,6 +2184,7 @@ impl DepthReplay {
     /// did not load or queue.
     fn run(
         parser: &FilesParser,
+        loader: &FileLoader,
         roots: &[ParseTaskRef],
         log: Option<Arc<DepthLog>>,
     ) -> Option<Self> {
@@ -2238,7 +2264,7 @@ impl DepthReplay {
                     }
                     return None;
                 };
-                let end = time + caches.load(load, time);
+                let end = time + caches.load(loader, &task, time);
                 let dispatch = REPLAY_DISPATCH
                     + REPLAY_BUSY_DISPATCH * pending.saturating_sub(REPLAY_BUSY_FROM) as u64;
                 // The last queued subtask runs next on the P (runnext). When
