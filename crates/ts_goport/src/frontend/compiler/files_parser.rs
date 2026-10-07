@@ -1413,8 +1413,9 @@ impl FilesParser {
 //   `REPLAY_PACKAGE_JSON` are model values. A fit of the measurements gives
 //   0 µs and 12.6 µs (resolutions, scope walks), 5.9 µs, and 46 µs (scope
 //   walks) for them.
-// - `REPLAY_FIRST_PARSE` charges the program's first package.json parse and
-//   its first realpath as one cost.
+// - `REPLAY_FIRST_PARSE` is one charge for the program's first package.json
+//   parse and its first realpath. The first parse is often in a package
+//   scope walk, with no realpath.
 // On hosts with 4 or fewer Ps (partly 8), Go's answers move toward the
 // runnext chain, and no fixed time can follow that.
 //
@@ -2062,7 +2063,10 @@ impl DepthReplay {
                     + REPLAY_BUSY_DISPATCH * pending.saturating_sub(REPLAY_BUSY_FROM) as u64;
                 // The last queued subtask runs next on the P (runnext). When
                 // it is not in the program (an elided JS file), it returns
-                // at once, and the P runs the first subtask it queued.
+                // at once, and the first queued subtask runs next: the P's
+                // queue head, or a P that steals it. The study's Go runs
+                // agree with this rule in one of the two queue orders it
+                // tried (depthgo2 c, `elided-last` shapes).
                 let edges = &load.edges;
                 let next = if edges
                     .last()
