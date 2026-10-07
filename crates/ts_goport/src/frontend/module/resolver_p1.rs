@@ -16,6 +16,9 @@
 //! - Go `*ResolvedModule` results are owned values. The resolver caches
 //!   hold them as `Rc`.
 
+use crate::frontend::compiler::files_parser::{
+    DepthKey, depth_note_resolution_end, depth_note_resolution_start,
+};
 use crate::frontend::prelude::*;
 use crate::gostd::GoError;
 use std::sync::Arc;
@@ -455,6 +458,7 @@ impl DefaultResolver {
         }
 
         self.caches.start_package_json_log();
+        depth_note_resolution_start();
         let compiler_options =
             get_compiler_options_with_redirect(&self.compiler_options, redirected_reference);
 
@@ -488,6 +492,14 @@ impl DefaultResolver {
             from_config,
             from_inferred_types_containing_file,
         ));
+        depth_note_resolution_end(DepthKey {
+            type_reference: true,
+            containing_directory: &cache_key.containing_directory,
+            name: &cache_key.type_reference_name,
+            mode: cache_key.resolution_mode,
+            redirect: &cache_key.redirect_config_name,
+            from_inferred_types_file: from_inferred_types_containing_file,
+        });
 
         if let Some(trace_builder) = &trace_builder {
             trace_builder
@@ -610,6 +622,7 @@ impl DefaultResolver {
         let cache_key = ModuleResolutionCacheKey::from_parts(key_parts);
 
         self.caches.start_package_json_log();
+        depth_note_resolution_start();
         let compiler_options =
             get_compiler_options_with_redirect(&self.compiler_options, redirected_reference);
         if let Some(trace_builder) = &trace_builder {
@@ -678,6 +691,14 @@ impl DefaultResolver {
             }
         }
 
+        depth_note_resolution_end(DepthKey {
+            type_reference: false,
+            containing_directory,
+            name: module_name,
+            mode: resolution_mode,
+            redirect: &redirect_config_name,
+            from_inferred_types_file: false,
+        });
         let final_result = Arc::new(self.try_resolve_from_typings_location(
             module_name,
             containing_directory,
