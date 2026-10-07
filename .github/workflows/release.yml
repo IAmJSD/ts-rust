@@ -8,8 +8,12 @@
 # (npm/README.md, "Trusted publishing"). Pull requests that change the release files, and a manual
 # run, do everything but the release and the publish.
 #
-# These builds are the plain shipped profile (fat LTO), without the PGO and BOLT of
-# crates/ts_goport/scripts/build-release.sh, which needs a host with BOLT and the project inputs.
+# The tsc is a PGO build of the shipped profile (fat LTO), trained on each platform:
+# crates/ts_goport/scripts/build-pgo.sh with the training set of scripts/goport/pgo-train.sh (7
+# projects at fixed commits). The job also builds the plain tsc, and fails unless the PGO tsc gives
+# the same stdout, stderr, exit code and emitted files as the plain tsc on that set. No BOLT
+# (build-release.sh has it): BOLT refuses the static Linux bin (build-bolt.sh), its Mach-O support
+# is experimental, and macOS has no perf branch sampling for its profile.
 # Linux is static musl and non-PIE, so it starts on any x86-64 Linux, Alpine too (npm/README.md,
 # "Linux libc").
 name: Release
@@ -23,7 +27,9 @@ on:
       - ".github/workflows/release.yml"
       - "npm/**"
       - "scripts/goport/npm-pack.sh"
+      - "scripts/goport/pgo-train.sh"
       - "crates/ts_goport/scripts/copy-libs.sh"
+      - "crates/ts_goport/scripts/build-pgo.sh"
       - "LICENSE"
       - "NOTICE.md"
       - "licenses/**"
@@ -83,9 +89,13 @@ jobs:
       - uses: actions/checkout@v5
         with:
           persist-credentials: false
-      - run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --target ${{ matrix.target }}
+      # llvm-tools: the llvm-profdata of this rustc's LLVM (build-pgo.sh checks it).
+      - run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --target ${{ matrix.target }} --component llvm-tools
       - if: runner.os == 'Linux'
         run: sudo apt-get update -q && sudo apt-get install -yq musl-tools
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
       - uses: Swatinem/rust-cache@v2
         with:
           key: release-${{ matrix.target }}
@@ -93,19 +103,38 @@ jobs:
       # As build-release.sh: the musl build compiles jemalloc with musl-gcc, links static with no PIE,
       # and has bin/tsgo.rs JEMALLOC_CONF built in, so the tsc does not exec itself at start. No
       # GOPORT_BUILD_VERSION: the tsc reports the TypeScript version, which typesVersions matching
-      # reads (npm/README.md, "tsc-rs releases").
+      # reads (npm/README.md, "tsc-rs releases"). Both builds below use this environment.
+      - name: Build environment
+        if: runner.os == 'Linux'
+        run: |
+          conf=$(sed -n 's/^const JEMALLOC_CONF: &str = "\([^"]*\)";$/\1/p' crates/ts_goport/src/bin/tsgo.rs | head -1)
+          [[ -n $conf ]] || { echo "::error::no JEMALLOC_CONF in bin/tsgo.rs"; exit 1; }
+          echo "JEMALLOC_SYS_WITH_MALLOC_CONF=$conf" >> "$GITHUB_ENV"
+          echo "CC_x86_64_unknown_linux_musl=musl-gcc" >> "$GITHUB_ENV"
+      # The plain tsc: the reference of the PGO check below.
       - name: Build
         run: |
-          if [[ $RUNNER_OS == Linux ]]; then
-            export CC_x86_64_unknown_linux_musl=musl-gcc
-            export RUSTFLAGS="-C target-feature=+crt-static -C relocation-model=static"
-            JEMALLOC_SYS_WITH_MALLOC_CONF=$(sed -n 's/^const JEMALLOC_CONF: &str = "\([^"]*\)";$/\1/p' crates/ts_goport/src/bin/tsgo.rs | head -1)
-            [[ -n $JEMALLOC_SYS_WITH_MALLOC_CONF ]] || { echo "::error::no JEMALLOC_CONF in bin/tsgo.rs"; exit 1; }
-            export JEMALLOC_SYS_WITH_MALLOC_CONF
-          fi
+          [[ $RUNNER_OS != Linux ]] || export RUSTFLAGS="-C target-feature=+crt-static -C relocation-model=static"
           cargo build --profile goport --locked -p ts_goport --bin tsgo --features noembed --target ${{ matrix.target }}
+          mkdir -p "$RUNNER_TEMP/plain"
+          cp "target/${{ matrix.target }}/goport/tsgo" "$RUNNER_TEMP/plain/tsc"
+      - name: PGO training set
+        run: scripts/goport/pgo-train.sh setup "$RUNNER_TEMP/train"
+      # The same build with -Cprofile-generate, the training set, then -Cprofile-use. PGO_LINK=static
+      # gives the RUSTFLAGS of the plain Linux build. Separate target dirs (not cached).
+      - name: PGO build
+        env:
+          PGO_TARGET: ${{ matrix.target }}
+          PGO_BINS: tsgo
+          PGO_CARGO: cargo
+          CARGO_FEATURES: --features noembed
+        run: |
+          [[ $RUNNER_OS != Linux ]] || export PGO_LINK=static
+          PGO_TRAIN="scripts/goport/pgo-train.sh run $RUNNER_TEMP/train" crates/ts_goport/scripts/build-pgo.sh "$RUNNER_TEMP/pgo"
           mkdir -p "$RUNNER_TEMP/out"
-          cp "target/${{ matrix.target }}/goport/tsgo" "$RUNNER_TEMP/out/tsc"
+          cp "$RUNNER_TEMP/pgo/target-use/goport/tsgo" "$RUNNER_TEMP/out/tsc"
+      - name: Check the PGO tsc against the plain tsc
+        run: scripts/goport/pgo-train.sh compare "$RUNNER_TEMP/train" "$RUNNER_TEMP/plain/tsc" "$RUNNER_TEMP/out/tsc"
       - name: Check the tsc
         run: |
           out="$RUNNER_TEMP/out"
