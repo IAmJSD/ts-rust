@@ -867,6 +867,9 @@ impl FilesParser {
     // When the replay needs a task that the load did not load or queue,
     // the depths of the load stay.
     fn set_parallel_depths(&mut self, roots: &[ParseTaskRef], log: Option<Arc<DepthLog>>) {
+        if !self.depth_order_matters(roots) {
+            return;
+        }
         let Some(replay) = DepthReplay::run(self, roots, log) else {
             return;
         };
@@ -879,6 +882,47 @@ impl FilesParser {
                 }
             }
         }
+    }
+
+    /// True when the order of a parallel load can change a depth that
+    /// matters: some file has arrivals in two depth classes (each depth up
+    /// to `max_depth`, or deeper). Else every order gives the depths of the
+    /// load: a file starts its subtasks at a depth of the class of its
+    /// lowest depth, so each arrival stays in its class, and only the class
+    /// decides whether an elided file loads and whether a file is found
+    /// searching node_modules (depth > 0).
+    fn depth_order_matters(&self, roots: &[ParseTaskRef]) -> bool {
+        let deepest = self.max_depth.saturating_add(1);
+        let mut classes: Vec<Option<i32>> = vec![None; self.task_data_by_path.len()];
+        let mut differs = |data: u32, depth: i32| {
+            let class = depth.min(deepest);
+            *classes[data as usize].get_or_insert(class) != class
+        };
+        for root in roots {
+            let root = root.borrow();
+            let Some(data) = self.task_data_by_path.get(&root.path) else {
+                return true;
+            };
+            if differs(data.borrow().index, i32::from(root.increase_depth)) {
+                return true;
+            }
+        }
+        for data in self.task_data_by_path.values() {
+            let data = data.borrow();
+            for task in data.tasks.values() {
+                if let Some(load) = &task.borrow().depth_edges {
+                    for edge in &load.edges {
+                        if differs(
+                            edge.data,
+                            data.lowest_depth + i32::from(edge.increase_depth),
+                        ) {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        false
     }
 
     // Go: filesparser.go:330 (*filesParser).getProcessedFiles
@@ -1467,7 +1511,7 @@ pub(crate) struct DepthEdges {
     /// metadata (`package_json_id`). Empty for a lib file or a task with no
     /// file.
     walk: Box<[u64]>,
-    /// The module and type reference resolutions of the file, in Go's order.
+    /// The module and type reference resolutions of the file.
     resolutions: Box<[ReplayResolution]>,
     /// One per subtask, in order.
     edges: Vec<DepthEdge>,
@@ -1475,187 +1519,199 @@ pub(crate) struct DepthEdges {
 
 impl DepthEdges {
     /// The replay data of `task`, whose load ended, with its subtask edges.
+    /// It is made now, while the task's data is in the CPU caches.
     fn of(loader: &FileLoader, task: &ParseTask, edges: Vec<DepthEdge>) -> Self {
         let parse = task.file.as_ref().map_or(0, |file| {
             REPLAY_NODE * file.node_count as u64 + REPLAY_BYTE * file.text.len() as u64
         });
+        let directory = get_directory_path(&task.normalized_file_path);
+        let mut resolutions = Vec::with_capacity(
+            task.type_resolutions_in_file.len() + task.resolutions_in_file.len(),
+        );
+        replay_resolutions(loader, task, &directory, &mut resolutions);
         DepthEdges {
             parse,
-            walk: replay_walk(loader, task),
-            resolutions: replay_resolutions(loader, task),
+            walk: replay_walk(loader, task, &directory),
+            resolutions: resolutions.into_boxed_slice(),
             edges,
         }
     }
 }
 
+/// FNV-1a of `bytes`, continued from `hash` (`REPLAY_HASH_START` for a new
+/// one). The id of a directory is the hash of its path, so one pass over a
+/// path gives the ids of all its ancestors (`replay_walk`).
+const REPLAY_HASH_START: u64 = 0xcbf2_9ce4_8422_2325;
+
+fn replay_hash(hash: u64, bytes: &[u8]) -> u64 {
+    bytes.iter().fold(hash, |hash, &byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
+    })
+}
+
+/// The id of the package.json in `directory` in the depth log: the hash of
+/// the directory, with bit 0 set when the file exists.
+fn package_json_id(directory_hash: u64, exists: bool) -> u64 {
+    directory_hash & !1 | u64::from(exists)
+}
+
 /// The package.json lookups of Go `loadSourceFileMetaData` for the file of
-/// `task`: the package scope walk from its directory up to the directory of
-/// its package.json (`SourceFileMetaData::package_json_directory`).
-fn replay_walk(loader: &FileLoader, task: &ParseTask) -> Box<[u64]> {
+/// `task` in `directory`: the package scope walk from the directory up to
+/// the directory of its package.json (`SourceFileMetaData::
+/// package_json_directory`), or to the root or the global cache.
+fn replay_walk(loader: &FileLoader, task: &ParseTask, directory: &str) -> Box<[u64]> {
     if task.file.is_none() || task.lib_file.is_some() || loader.opts.skip_module_resolution {
         return Box::default();
     }
-    let found = &task.metadata.package_json_directory;
-    let mut walk = Vec::new();
-    for_each_ancestor_directory_stopping_at_global_cache(
-        &loader.opts.typings_location,
-        &get_directory_path(&task.normalized_file_path),
-        |directory| {
-            let exists = !found.is_empty() && directory == found;
-            walk.push(package_json_id(
-                &combine_paths(directory, &["package.json"]),
-                exists,
-            ));
-            ((), exists)
-        },
-    );
-    walk.into_boxed_slice()
+    let ancestors = replay_ancestors(directory);
+    let mut walk: smallvec::SmallVec<[u64; 16]> = smallvec::SmallVec::new();
+    let found = task.metadata.package_json_directory.len();
+    let global_cache = &loader.opts.typings_location;
+    for &(length, hash) in ancestors.iter().rev() {
+        let exists = found > 0 && length == found;
+        walk.push(package_json_id(hash, exists));
+        if exists || directory[..length] == **global_cache {
+            break;
+        }
+    }
+    Box::from(&walk[..])
 }
 
-/// The resolution modes of a `ModeAwareCache` key.
-const REPLAY_MODES: [ResolutionMode; 3] =
-    [ModuleKind::NONE, ModuleKind::COMMON_JS, ModuleKind::ES_NEXT];
-
-/// The module and type reference resolutions of the file of `task` in Go's
-/// order: its type reference directives, then its synthetic imports,
-/// imports and module augmentations (`resolve_type_reference_directives`,
-/// `resolve_imports_and_module_augmentations`). The inferred types file has
-/// its automatic type directives by name. Each later use of a name is one
-/// lookup of its first key, which Go's cache then knows.
-fn replay_resolutions(loader: &FileLoader, task: &ParseTask) -> Box<[ReplayResolution]> {
-    let mut out = Vec::new();
-    if task.is_for_automatic_type_directive {
-        let directory = get_directory_path(&task.normalized_file_path);
-        let mut keys: Vec<_> = task.type_resolutions_in_file.iter().collect();
-        keys.sort_unstable_by(|(a, _), (b, _)| (&a.name, a.mode).cmp(&(&b.name, b.mode)));
-        for (key, resolution) in keys {
-            let key = DepthKey {
-                type_reference: true,
-                containing_directory: &directory,
-                name: &key.name,
-                mode: key.mode,
-                redirect: "",
-                from_inferred_types_file: true,
-            };
-            out.push(ReplayResolution::new(
-                key,
-                &resolution.resolved_file_name,
-                resolution.is_external_library_import,
-            ));
+/// The directory `directory` and its ancestors (Go
+/// `ForEachAncestorDirectory`), the root first: the prefixes of the path
+/// that end before a '/', the root "/", and the path. Each is (length,
+/// hash of the prefix).
+fn replay_ancestors(directory: &str) -> smallvec::SmallVec<[(usize, u64); 16]> {
+    let bytes = directory.as_bytes();
+    let mut ancestors = smallvec::SmallVec::new();
+    let mut hash = REPLAY_HASH_START;
+    for (i, &byte) in bytes.iter().enumerate() {
+        if byte == b'/' && i > 0 {
+            ancestors.push((i, hash));
         }
-        return out.into_boxed_slice();
+        hash = replay_hash(hash, &[byte]);
+        if byte == b'/' && i == 0 {
+            ancestors.push((1, hash));
+        }
+    }
+    if ancestors
+        .last()
+        .is_none_or(|&(length, _)| length < bytes.len())
+    {
+        ancestors.push((bytes.len(), hash));
+    }
+    ancestors
+}
+
+/// Adds to `out` the module and type reference resolutions of the file of
+/// `task` in `directory`, one per name and mode: its type reference
+/// directives, then its imports and module augmentations, as Go resolves
+/// them (`resolve_type_reference_directives`,
+/// `resolve_imports_and_module_augmentations`). In each group they come in
+/// the order of the cache, not of the file, because reading the import
+/// names of a parse costs more than the replay. The time of a load does not
+/// depend on that order, only the times at which its keys become known.
+fn replay_resolutions(
+    loader: &FileLoader,
+    task: &ParseTask,
+    directory: &str,
+    out: &mut Vec<ReplayResolution>,
+) {
+    if task.is_for_automatic_type_directive {
+        let key = ReplayKey {
+            type_reference: true,
+            directory: replay_hash(REPLAY_HASH_START, directory.as_bytes()),
+            mode: RESOLUTION_MODE_NONE,
+            redirect: "",
+            from_inferred_types_file: true,
+        };
+        replay_file_resolutions(task, key, out);
+        return;
     }
     let Some(file) = &task.file else {
-        return Box::default();
+        return;
     };
-    let (redirect, containing_file) = loader
-        .project_reference_file_mapper
-        .borrow()
-        .get_redirect_for_resolution(&new_has_file_name(file.file_name(), file.path()));
-    let directory = get_directory_path(&containing_file);
-    let key = DepthKey {
+    // With no project references, a file resolves from itself.
+    let mapper = loader.project_reference_file_mapper.borrow();
+    let (redirect, containing_file) = if mapper.config_to_project_reference.is_empty() {
+        (None, String::new())
+    } else {
+        mapper.get_redirect_for_resolution(&new_has_file_name(file.file_name(), file.path()))
+    };
+    let containing_file = if containing_file.is_empty() {
+        file.file_name()
+    } else {
+        &containing_file
+    };
+    let containing_directory = if containing_file == task.normalized_file_path {
+        std::borrow::Cow::Borrowed(directory)
+    } else {
+        std::borrow::Cow::Owned(get_directory_path(containing_file))
+    };
+    let key = ReplayKey {
         type_reference: true,
-        containing_directory: &directory,
-        name: "",
+        directory: replay_hash(REPLAY_HASH_START, containing_directory.as_bytes()),
         mode: RESOLUTION_MODE_NONE,
         redirect: redirect
             .as_deref()
             .map_or("", |redirect| redirect.config_name()),
         from_inferred_types_file: containing_file.ends_with(INFERRED_TYPES_CONTAINING_FILE),
     };
-    let mut seen = FxHashSet::default();
-    for reference in &file.type_reference_directives {
-        add_replay_resolutions(
-            &mut out,
-            &mut seen,
-            &task.type_resolutions_in_file,
-            DepthKey {
-                name: &reference.file_name,
+    replay_file_resolutions(task, key, out);
+}
+
+/// `replay_resolutions` with the key of the file (no name or mode).
+fn replay_file_resolutions(task: &ParseTask, key: ReplayKey<'_>, out: &mut Vec<ReplayResolution>) {
+    for (name, resolution) in &task.type_resolutions_in_file {
+        out.push(ReplayResolution::new(
+            ReplayKey {
+                mode: name.mode,
                 ..key
-            },
-            |r| (&r.resolved_file_name, r.is_external_library_import),
-        );
+            }
+            .id(&name.name),
+            &resolution.resolved_file_name,
+            resolution.is_external_library_import,
+        ));
     }
-    let key = DepthKey {
+    let key = ReplayKey {
         type_reference: false,
         from_inferred_types_file: false,
         ..key
     };
-    let helpers = task
-        .import_helpers_import_specifier
-        .is_some()
-        .then_some(crate::checker::types::EXTERNAL_HELPERS_MODULE_NAME_TEXT);
-    let jsx = task
-        .jsx_runtime_import_specifier
-        .as_ref()
-        .map(|jsx| jsx.module_reference.as_str());
-    let imports = file.imports.iter().map(|import| import.text());
-    let augmentations = file
-        .module_augmentations
-        .iter()
-        .filter(|augmentation| augmentation.kind() == SyntaxKind::StringLiteral)
-        .map(|augmentation| augmentation.text());
-    for name in helpers
-        .into_iter()
-        .chain(jsx)
-        .chain(imports)
-        .chain(augmentations)
-    {
-        add_replay_resolutions(
-            &mut out,
-            &mut seen,
-            &task.resolutions_in_file,
-            DepthKey { name, ..key },
-            |r| (&r.resolved_file_name, r.is_external_library_import),
-        );
-    }
-    out.into_boxed_slice()
-}
-
-/// Adds to `out` the resolutions of `key.name` in `cache`, one per mode.
-/// A name that `seen` has is one lookup of its first key.
-fn add_replay_resolutions<'a, V>(
-    out: &mut Vec<ReplayResolution>,
-    seen: &mut FxHashSet<(bool, &'a str)>,
-    cache: &ModeAwareCache<V>,
-    key: DepthKey<'a>,
-    result: impl Fn(&V) -> (&str, bool),
-) {
-    if key.name.is_empty() {
-        return;
-    }
-    let first = seen.insert((key.type_reference, key.name));
-    for mode in REPLAY_MODES {
-        if let Some(value) = cache.get(&(key.name, mode) as &dyn ModeAwareKey) {
-            let (resolved_file_name, external) = result(value);
-            out.push(ReplayResolution::new(
-                DepthKey { mode, ..key },
-                resolved_file_name,
-                external,
-            ));
-            if !first {
-                return;
+    for (name, resolution) in &task.resolutions_in_file {
+        out.push(ReplayResolution::new(
+            ReplayKey {
+                mode: name.mode,
+                ..key
             }
-        }
+            .id(&name.name),
+            &resolution.resolved_file_name,
+            resolution.is_external_library_import,
+        ));
     }
 }
 
 /// A resolution of a file in the depth replay.
 #[derive(Clone, Copy)]
 struct ReplayResolution {
-    /// `DepthKey::id` of the resolution.
+    /// The id of its cache key (`ReplayKey::id`).
     key: u64,
     /// The result is a file in node_modules: a node_modules search found
     /// it, or its path has a node_modules directory.
     external: bool,
 }
 
+/// A search for a node_modules directory in a path.
+static NODE_MODULES: std::sync::LazyLock<memchr::memmem::Finder<'static>> =
+    std::sync::LazyLock::new(|| memchr::memmem::Finder::new(b"/node_modules/"));
+
 impl ReplayResolution {
-    fn new(key: DepthKey<'_>, resolved_file_name: &str, external_library_import: bool) -> Self {
+    fn new(key: u64, resolved_file_name: &str, external_library_import: bool) -> Self {
         ReplayResolution {
-            key: key.id(),
+            key,
             external: !resolved_file_name.is_empty()
-                && (external_library_import || resolved_file_name.contains("/node_modules/")),
+                && (external_library_import
+                    || NODE_MODULES.find(resolved_file_name.as_bytes()).is_some()),
         }
     }
 }
@@ -1673,25 +1729,42 @@ pub(crate) struct DepthKey<'a> {
     pub from_inferred_types_file: bool,
 }
 
-impl DepthKey<'_> {
-    fn id(&self) -> u64 {
-        use std::hash::BuildHasher;
-        rustc_hash::FxBuildHasher.hash_one((
-            self.type_reference,
-            self.containing_directory,
-            self.name,
-            self.mode,
-            self.redirect,
-            self.from_inferred_types_file,
-        ))
+/// `DepthKey` with the hash of its directory, and no name.
+#[derive(Clone, Copy)]
+struct ReplayKey<'a> {
+    type_reference: bool,
+    directory: u64,
+    mode: ResolutionMode,
+    redirect: &'a str,
+    from_inferred_types_file: bool,
+}
+
+impl ReplayKey<'_> {
+    /// The id of the key with `name`.
+    fn id(&self, name: &str) -> u64 {
+        let hash = replay_hash(self.directory, &[0xff]);
+        let hash = replay_hash(hash, name.as_bytes());
+        let hash = replay_hash(hash, &[0xff]);
+        let hash = replay_hash(hash, &self.mode.0.to_le_bytes());
+        let hash = replay_hash(hash, self.redirect.as_bytes());
+        replay_hash(
+            hash,
+            &[u8::from(self.type_reference) | u8::from(self.from_inferred_types_file) << 1],
+        )
     }
 }
 
-/// The id of the package.json file at `path` in the depth log: a hash of
-/// the path, with bit 0 set when the file exists.
-fn package_json_id(path: &str, exists: bool) -> u64 {
-    use std::hash::BuildHasher;
-    rustc_hash::FxBuildHasher.hash_one(path) & !1 | u64::from(exists)
+impl DepthKey<'_> {
+    fn id(&self) -> u64 {
+        ReplayKey {
+            type_reference: self.type_reference,
+            directory: replay_hash(REPLAY_HASH_START, self.containing_directory.as_bytes()),
+            mode: self.mode,
+            redirect: self.redirect,
+            from_inferred_types_file: self.from_inferred_types_file,
+        }
+        .id(self.name)
+    }
 }
 
 // depthgo2 c: the lookups of the module and type reference resolutions of a
@@ -1702,17 +1775,35 @@ fn package_json_id(path: &str, exists: bool) -> u64 {
 // PORT: not in Go. Go makes the lookups; the replay charges each one by the
 // state of Go's caches in replay time (`ReplayCaches`).
 
-/// The lookups of the resolutions of one parallel load. The loader's thread
-/// and its parse workers write it (`set_depth_log`).
+/// The lookups of the resolutions of one parallel load. Each thread of the
+/// load (the loader's and its parse workers) logs its own and adds them
+/// here when its log ends (`set_depth_log`).
 #[derive(Default)]
 pub(crate) struct DepthLog {
+    found: Mutex<DepthLookupsFound>,
+}
+
+/// The lookups of a load, or of one thread of it.
+#[derive(Default)]
+struct DepthLookupsFound {
     /// The lookups of each resolution by its key (`DepthKey::id`). A key
     /// keeps the lookups of its first resolution: they do not depend on the
     /// thread or on the state of the caches.
-    resolutions: Mutex<FxHashMap<u64, DepthLookups>>,
+    resolutions: FxHashMap<u64, DepthLookups>,
     /// The text length of each package.json that a resolver read, by its
-    /// path id with no exists bit.
-    package_json_sizes: Mutex<FxHashMap<u64, u32>>,
+    /// id with no exists bit.
+    package_json_sizes: FxHashMap<u64, u32>,
+}
+
+impl DepthLookupsFound {
+    fn add(&mut self, other: DepthLookupsFound) {
+        for (key, lookups) in other.resolutions {
+            self.resolutions.entry(key).or_insert(lookups);
+        }
+        for (id, size) in other.package_json_sizes {
+            self.package_json_sizes.entry(id).or_insert(size);
+        }
+    }
 }
 
 /// The lookups of one resolution: those that Go's trace of it lists.
@@ -1722,30 +1813,35 @@ struct DepthLookups {
     missing: u64,
     found: u64,
     /// The package.json lookups in a directory that exists, in order
-    /// (`package_json_id`).
-    package_jsons: Vec<u64>,
+    /// (`package_json_id`), except those of the package scope walk from the
+    /// containing directory: the walk for the file's metadata made them, so
+    /// Go's cache knows them.
+    package_jsons: smallvec::SmallVec<[u64; 2]>,
 }
 
-/// The depth log of a thread, with the resolutions that run on it now.
+/// The depth log of a thread: what it found, and the resolutions that run
+/// on it now, with the ids of their containing directory and its ancestors.
 struct DepthLogThread {
     log: Arc<DepthLog>,
-    open: Vec<DepthLookups>,
+    found: DepthLookupsFound,
+    open: Vec<(DepthLookups, smallvec::SmallVec<[u64; 16]>)>,
 }
 
 thread_local! {
     static DEPTH_LOG: RefCell<Option<DepthLogThread>> = const { RefCell::new(None) };
 }
 
-/// Sets the depth log of this thread. Returns the one it had.
+/// Sets the depth log of this thread. Returns the one it had, with what
+/// this thread found added to it.
 fn set_depth_log(log: Option<Arc<DepthLog>>) -> Option<Arc<DepthLog>> {
-    DEPTH_LOG
-        .with(|thread| {
-            thread.replace(log.map(|log| DepthLogThread {
-                log,
-                open: Vec::new(),
-            }))
-        })
-        .map(|thread| thread.log)
+    let thread = log.map(|log| DepthLogThread {
+        log,
+        found: DepthLookupsFound::default(),
+        open: Vec::new(),
+    });
+    let old = DEPTH_LOG.with(|cell| cell.replace(thread))?;
+    lock(&old.log.found).add(old.found);
+    Some(old.log)
 }
 
 /// The depth log of this thread.
@@ -1753,11 +1849,16 @@ fn depth_log() -> Option<Arc<DepthLog>> {
     DEPTH_LOG.with(|thread| thread.borrow().as_ref().map(|thread| thread.log.clone()))
 }
 
-/// A resolution starts: its cache had no answer.
-pub(crate) fn depth_note_resolution_start() {
+/// A resolution from `containing_directory` starts: its cache had no
+/// answer.
+pub(crate) fn depth_note_resolution_start(containing_directory: &str) {
     DEPTH_LOG.with(|thread| {
         if let Some(thread) = thread.borrow_mut().as_mut() {
-            thread.open.push(DepthLookups::default());
+            let ancestors = replay_ancestors(containing_directory)
+                .into_iter()
+                .map(|(_, hash)| hash & !1)
+                .collect();
+            thread.open.push((DepthLookups::default(), ancestors));
         }
     });
 }
@@ -1769,10 +1870,8 @@ pub(crate) fn depth_note_resolution_end(key: DepthKey<'_>) {
         let Some(thread) = thread.as_mut() else {
             return;
         };
-        if let Some(lookups) = thread.open.pop() {
-            lock(&thread.log.resolutions)
-                .entry(key.id())
-                .or_insert(lookups);
+        if let Some((lookups, _)) = thread.open.pop() {
+            thread.found.resolutions.entry(key.id()).or_insert(lookups);
         }
     });
 }
@@ -1780,7 +1879,7 @@ pub(crate) fn depth_note_resolution_end(key: DepthKey<'_>) {
 /// A file probe of a resolution (Go `tryFileLookup`).
 pub(crate) fn depth_note_file_probe(found: bool) {
     DEPTH_LOG.with(|thread| {
-        if let Some(lookups) = thread
+        if let Some((lookups, _)) = thread
             .borrow_mut()
             .as_mut()
             .and_then(|thread| thread.open.last_mut())
@@ -1794,82 +1893,109 @@ pub(crate) fn depth_note_file_probe(found: bool) {
     });
 }
 
-/// A package.json lookup of Go `getPackageJsonInfo` in a directory that
-/// exists. `size`: the text length, when this lookup read the file.
-pub(crate) fn depth_note_package_json(path: &str, exists: bool, size: Option<usize>) {
+/// A lookup of Go `getPackageJsonInfo` of the package.json in `directory`,
+/// which exists. `size`: the text length, when this lookup read the file.
+pub(crate) fn depth_note_package_json(directory: &str, exists: bool, size: Option<usize>) {
     DEPTH_LOG.with(|thread| {
         let mut thread = thread.borrow_mut();
         let Some(thread) = thread.as_mut() else {
             return;
         };
-        let id = package_json_id(path, exists);
+        let id = package_json_id(replay_hash(REPLAY_HASH_START, directory.as_bytes()), exists);
         if let Some(size) = size {
-            lock(&thread.log.package_json_sizes)
+            thread
+                .found
+                .package_json_sizes
                 .entry(id & !1)
                 .or_insert(u32::try_from(size).unwrap_or(u32::MAX));
         }
-        if let Some(lookups) = thread.open.last_mut() {
+        if let Some((lookups, ancestors)) = thread.open.last_mut()
+            && !ancestors.contains(&(id & !1))
+        {
             lookups.package_jsons.push(id);
         }
     });
 }
 
-/// The lookups of a load's resolutions (`DepthLog`), for the replay.
-struct ReplayLookups {
-    resolutions: FxHashMap<u64, DepthLookups>,
-    sizes: FxHashMap<u64, u32>,
-}
-
-impl ReplayLookups {
-    fn of(log: Option<Arc<DepthLog>>) -> Self {
-        let (resolutions, sizes) = log.map_or_else(Default::default, |log| {
-            (
-                std::mem::take(&mut *lock(&log.resolutions)),
-                std::mem::take(&mut *lock(&log.package_json_sizes)),
-            )
-        });
-        ReplayLookups { resolutions, sizes }
-    }
-}
-
-/// Go's resolution and package.json caches in replay time (depthgo2 c): an
-/// entry is known from the end of its first lookup. A lookup that starts
-/// earlier does the work again, as two goroutines that miss the same entry
-/// both do.
+/// Go's resolution and package.json caches in replay time (depthgo2 c), with
+/// the lookups of each resolution (`DepthLog`). An entry is known from the
+/// end of its first lookup. A lookup that starts earlier does the work
+/// again, as two goroutines that miss the same entry both do.
 #[derive(Default)]
 struct ReplayCaches {
-    /// The time from which Go knows each resolution key, and each
-    /// package.json path (an id with no exists bit).
-    resolutions: FxHashMap<u64, u64>,
-    package_jsons: FxHashMap<u64, u64>,
+    /// By resolution key: its lookups and the time from which Go knows it.
+    resolutions: FxHashMap<u64, ReplayKnown<DepthLookups>>,
+    /// By package.json id (no exists bit): its text length and the time from
+    /// which Go knows it.
+    package_jsons: FxHashMap<u64, ReplayKnown<u32>>,
+    /// By the id of a file's directory (no exists bit): the end of the first
+    /// package scope walk from it.
+    walks: FxHashMap<u64, u64>,
     /// The end of the program's first package.json parse.
     first_parse_end: Option<u64>,
 }
 
-/// True when `map` knows `key` at `now`.
-fn replay_known(map: &FxHashMap<u64, u64>, key: u64, now: u64) -> bool {
-    map.get(&key).is_some_and(|&from| from <= now)
+/// A cache entry in replay time: `known` is the end of its first lookup
+/// (`u64::MAX` before one).
+struct ReplayKnown<T> {
+    value: T,
+    known: u64,
 }
 
-/// The first lookup of `key` that ends ends at `end`.
-fn replay_mark(map: &mut FxHashMap<u64, u64>, key: u64, end: u64) {
-    map.entry(key)
-        .and_modify(|from| *from = (*from).min(end))
-        .or_insert(end);
+impl<T> ReplayKnown<T> {
+    fn new(value: T) -> Self {
+        ReplayKnown {
+            value,
+            known: u64::MAX,
+        }
+    }
 }
 
 impl ReplayCaches {
-    /// The time of a load of `load` that starts at `start`: in Go's order,
-    /// the fixed time, the package scope walk, the parse, then each
-    /// resolution.
-    fn load(&mut self, lookups: &ReplayLookups, load: &DepthEdges, start: u64) -> u64 {
+    fn of(log: Option<Arc<DepthLog>>) -> Self {
+        let found = log.map_or_else(Default::default, |log| {
+            std::mem::take(&mut *lock(&log.found))
+        });
+        ReplayCaches {
+            resolutions: found
+                .resolutions
+                .into_iter()
+                .map(|(key, lookups)| (key, ReplayKnown::new(lookups)))
+                .collect(),
+            package_jsons: found
+                .package_json_sizes
+                .into_iter()
+                .map(|(id, size)| (id, ReplayKnown::new(size)))
+                .collect(),
+            walks: FxHashMap::default(),
+            first_parse_end: None,
+        }
+    }
+
+    /// The time of the load of `load` that starts at `start`: in Go's
+    /// order, the fixed time, the package scope walk, the parse, then each
+    /// resolution. A walk of a directory whose walk ended costs nothing:
+    /// Go's cache knows each of its package.json files.
+    fn load(&mut self, load: &DepthEdges, start: u64) -> u64 {
         let mut now = start + REPLAY_FILE;
-        for &id in &*load.walk {
-            now += self.package_json(lookups, id, now);
+        if let Some(&first) = load.walk.first() {
+            let walked = self.walks.entry(first & !1).or_insert(u64::MAX);
+            if *walked > now {
+                for &id in &*load.walk {
+                    now += replay_package_json(
+                        &mut self.package_jsons,
+                        &mut self.first_parse_end,
+                        id,
+                        now,
+                    );
+                }
+                let walked = self.walks.entry(first & !1).or_insert(u64::MAX);
+                *walked = (*walked).min(now);
+            }
         }
         now += load.parse;
         for &resolution in &*load.resolutions {
-            now += self.resolution(lookups, resolution, now);
+            now += self.resolution(resolution, now);
         }
         now - start
     }
@@ -1877,50 +2003,53 @@ impl ReplayCaches {
     /// The time of a resolution that starts at `start`: its package.json
     /// lookups in order, then its file probes. A resolution that the log
     /// does not have (its answer came from an earlier load or a resolve-ahead
-    /// worker) has none.
-    fn resolution(
-        &mut self,
-        lookups: &ReplayLookups,
-        resolution: ReplayResolution,
-        start: u64,
-    ) -> u64 {
-        if replay_known(&self.resolutions, resolution.key, start) {
+    /// worker) has no lookups.
+    fn resolution(&mut self, resolution: ReplayResolution, start: u64) -> u64 {
+        let entry = self
+            .resolutions
+            .entry(resolution.key)
+            .or_insert_with(|| ReplayKnown::new(DepthLookups::default()));
+        if entry.known <= start {
             return REPLAY_CACHED_RESOLUTION;
         }
         let mut now = start + REPLAY_RESOLUTION;
         if resolution.external {
             now += REPLAY_EXTERNAL_RESOLUTION;
         }
-        if let Some(found) = lookups.resolutions.get(&resolution.key) {
-            for &id in &found.package_jsons {
-                now += self.package_json(lookups, id, now);
-            }
-            now += REPLAY_MISSING_FILE * found.missing + REPLAY_FOUND_FILE * found.found;
+        for &id in &entry.value.package_jsons {
+            now += replay_package_json(&mut self.package_jsons, &mut self.first_parse_end, id, now);
         }
-        replay_mark(&mut self.resolutions, resolution.key, now);
+        now += REPLAY_MISSING_FILE * entry.value.missing + REPLAY_FOUND_FILE * entry.value.found;
+        entry.known = entry.known.min(now);
         now - start
     }
+}
 
-    /// The time of the package.json lookup `id` at `now`.
-    fn package_json(&mut self, lookups: &ReplayLookups, id: u64, now: u64) -> u64 {
-        let path = id & !1;
-        if replay_known(&self.package_jsons, path, now) {
-            return 0;
-        }
-        let mut time = REPLAY_MISSING_PACKAGE_JSON;
-        if id & 1 != 0 {
-            let size = lookups.sizes.get(&path).copied().unwrap_or(0);
-            time = REPLAY_PACKAGE_JSON + REPLAY_PACKAGE_JSON_BYTE * u64::from(size);
-            if self.first_parse_end.is_none_or(|end| now < end) {
-                time += REPLAY_FIRST_PARSE;
-                if self.first_parse_end.is_none_or(|end| now + time < end) {
-                    self.first_parse_end = Some(now + time);
-                }
+/// The time of the package.json lookup `id` at `now`.
+fn replay_package_json(
+    package_jsons: &mut FxHashMap<u64, ReplayKnown<u32>>,
+    first_parse_end: &mut Option<u64>,
+    id: u64,
+    now: u64,
+) -> u64 {
+    let entry = package_jsons
+        .entry(id & !1)
+        .or_insert_with(|| ReplayKnown::new(0));
+    if entry.known <= now {
+        return 0;
+    }
+    let mut time = REPLAY_MISSING_PACKAGE_JSON;
+    if id & 1 != 0 {
+        time = REPLAY_PACKAGE_JSON + REPLAY_PACKAGE_JSON_BYTE * u64::from(entry.value);
+        if first_parse_end.is_none_or(|end| now < end) {
+            time += REPLAY_FIRST_PARSE;
+            if first_parse_end.is_none_or(|end| now + time < end) {
+                *first_parse_end = Some(now + time);
             }
         }
-        replay_mark(&mut self.package_jsons, path, now + time);
-        time
     }
+    entry.known = entry.known.min(now + time);
+    time
 }
 
 /// A subtask in the depth replay.
@@ -2006,8 +2135,7 @@ impl DepthReplay {
             states,
             max_depth: parser.max_depth,
         };
-        let lookups = ReplayLookups::of(log);
-        let mut caches = ReplayCaches::default();
+        let mut caches = ReplayCaches::of(log);
         // Arrivals by (time, push order); the third part indexes `arrivals`.
         // An arrival that changes nothing (`has_no_effect`) is not queued,
         // but one at a file in the program is pending until its time
@@ -2058,7 +2186,7 @@ impl DepthReplay {
                     }
                     return None;
                 };
-                let end = time + caches.load(&lookups, load, time);
+                let end = time + caches.load(load, time);
                 let dispatch = REPLAY_DISPATCH
                     + REPLAY_BUSY_DISPATCH * pending.saturating_sub(REPLAY_BUSY_FROM) as u64;
                 // The last queued subtask runs next on the P (runnext). When

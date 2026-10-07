@@ -458,7 +458,7 @@ impl DefaultResolver {
         }
 
         self.caches.start_package_json_log();
-        depth_note_resolution_start();
+        depth_note_resolution_start(&containing_directory);
         let compiler_options =
             get_compiler_options_with_redirect(&self.compiler_options, redirected_reference);
 
@@ -622,7 +622,7 @@ impl DefaultResolver {
         let cache_key = ModuleResolutionCacheKey::from_parts(key_parts);
 
         self.caches.start_package_json_log();
-        depth_note_resolution_start();
+        depth_note_resolution_start(containing_directory);
         let compiler_options =
             get_compiler_options_with_redirect(&self.compiler_options, redirected_reference);
         if let Some(trace_builder) = &trace_builder {

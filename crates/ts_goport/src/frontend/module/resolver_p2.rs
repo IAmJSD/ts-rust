@@ -1007,7 +1007,7 @@ impl ResolutionState<'_> {
                     diag::File_0_exists_according_to_earlier_cached_lookups,
                     package_json_path
                 );
-                depth_note_package_json(&package_json_path, true, None);
+                depth_note_package_json(package_directory, true, None);
                 return Some(existing.with_package_directory(package_directory));
             } else {
                 if existing.directory_exists {
@@ -1016,7 +1016,7 @@ impl ResolutionState<'_> {
                         diag::File_0_does_not_exist_according_to_earlier_cached_lookups,
                         package_json_path
                     );
-                    depth_note_package_json(&package_json_path, false, None);
+                    depth_note_package_json(package_directory, false, None);
                 }
                 return None;
             }
@@ -1032,7 +1032,7 @@ impl ResolutionState<'_> {
             let parseable = parsed.is_ok();
             let package_json_content = parsed.unwrap_or_default();
             trace_write!(self, diag::Found_package_json_at_0, package_json_path);
-            depth_note_package_json(&package_json_path, true, Some(contents.len()));
+            depth_note_package_json(package_directory, true, Some(contents.len()));
             let result = Rc::new(InfoCacheEntry {
                 package_directory: package_directory.to_string(),
                 directory_exists: true,
@@ -1052,7 +1052,7 @@ impl ResolutionState<'_> {
         } else {
             if directory_exists {
                 trace_write!(self, diag::File_0_does_not_exist, package_json_path);
-                depth_note_package_json(&package_json_path, false, None);
+                depth_note_package_json(package_directory, false, None);
             }
             let stored = self.resolver.caches.package_json_info_cache.set(
                 &package_json_path,
